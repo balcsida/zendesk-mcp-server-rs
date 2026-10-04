@@ -1,7 +1,36 @@
-use anyhow::Result;
+use anyhow::{Result, bail};
 use serde_json::{Map, Value, json};
 
 use super::*;
+
+/// The article shape `get_article`, `create_article` and `update_article` return.
+fn article_detail(article: &Value) -> Value {
+    let mut out = pick(
+        article,
+        &[
+            "id",
+            "title",
+            "body",
+            "author_id",
+            "section_id",
+            "locale",
+            "source_locale",
+            "html_url",
+            "created_at",
+            "updated_at",
+            "edited_at",
+            "position",
+            "vote_sum",
+            "vote_count",
+            "label_names",
+        ],
+        &["label_names"],
+    );
+    for key in ["draft", "promoted"] {
+        out[key] = article.get(key).cloned().unwrap_or(json!(false));
+    }
+    out
+}
 
 impl ZendeskClient {
     pub async fn get_all_articles(&self) -> Result<Value> {
@@ -152,35 +181,165 @@ impl ZendeskClient {
         async {
             let path = format!("{}/articles/{article_id}.json", help_center_path(locale));
             let data = self.api_get(&path, &[]).await?;
-            let article = data.get("article").cloned().unwrap_or(json!({}));
-            let mut out = pick(
-                &article,
+            Ok(article_detail(data.get("article").unwrap_or(&Value::Null)))
+        }
+        .await
+        .map_err(ctx(format!("Failed to get article {article_id}")))
+    }
+
+    pub async fn list_categories(&self, locale: Option<&str>) -> Result<Value> {
+        async {
+            let path = format!("{}/categories.json", help_center_path(locale));
+            let categories = self.get_paged(&path, "categories").await?;
+            Ok(pick_all(
+                &json!({ "categories": categories }),
+                "categories",
                 &[
                     "id",
-                    "title",
-                    "body",
-                    "author_id",
-                    "section_id",
+                    "name",
+                    "description",
                     "locale",
-                    "source_locale",
-                    "html_url",
-                    "created_at",
-                    "updated_at",
-                    "edited_at",
                     "position",
-                    "vote_sum",
-                    "vote_count",
-                    "label_names",
+                    "html_url",
+                    "updated_at",
                 ],
-                &["label_names"],
+                &[],
+            ))
+        }
+        .await
+        .map_err(ctx("Failed to list categories"))
+    }
+
+    pub async fn list_sections(
+        &self,
+        category_id: Option<u64>,
+        locale: Option<&str>,
+    ) -> Result<Value> {
+        async {
+            let category = category_id
+                .map(|id| format!("/categories/{id}"))
+                .unwrap_or_default();
+            let path = format!("{}{category}/sections.json", help_center_path(locale));
+            let sections = self.get_paged(&path, "sections").await?;
+            Ok(pick_all(
+                &json!({ "sections": sections }),
+                "sections",
+                &[
+                    "id",
+                    "name",
+                    "description",
+                    "category_id",
+                    "parent_section_id",
+                    "locale",
+                    "position",
+                    "html_url",
+                    "updated_at",
+                ],
+                &[],
+            ))
+        }
+        .await
+        .map_err(ctx("Failed to list sections"))
+    }
+
+    /// Every locale version of an article, without bodies.
+    pub async fn list_article_translations(&self, article_id: u64) -> Result<Value> {
+        async {
+            let translations = self
+                .get_paged(
+                    &format!("help_center/articles/{article_id}/translations.json"),
+                    "translations",
+                )
+                .await?;
+            let mut out = pick_all(
+                &json!({ "translations": translations }),
+                "translations",
+                &["id", "locale", "title", "html_url", "updated_at"],
+                &[],
             );
-            for key in ["draft", "promoted"] {
-                out[key] = article.get(key).cloned().unwrap_or(json!(false));
+            for (t, raw) in out.as_array_mut().into_iter().flatten().zip(&translations) {
+                for key in ["draft", "outdated"] {
+                    t[key] = raw.get(key).cloned().unwrap_or(json!(false));
+                }
             }
             Ok(out)
         }
         .await
-        .map_err(ctx(format!("Failed to get article {article_id}")))
+        .map_err(ctx(format!(
+            "Failed to list translations of article {article_id}"
+        )))
+    }
+
+    /// Creates an article in `section_id`. `article` holds the article fields; a Markdown
+    /// `body` is converted to HTML.
+    pub async fn create_article(
+        &self,
+        section_id: u64,
+        mut article: Map<String, Value>,
+        notify_subscribers: bool,
+    ) -> Result<Value> {
+        async {
+            article.retain(|_, v| !v.is_null());
+            if let Some(body) = article.get("body").and_then(Value::as_str) {
+                article.insert("body".into(), markdown_to_html(body).into());
+            }
+            let data = self
+                .api_post(
+                    &format!("help_center/sections/{section_id}/articles.json"),
+                    &json!({"article": article, "notify_subscribers": notify_subscribers}),
+                )
+                .await?;
+            Ok(article_detail(object(&data, "article")?))
+        }
+        .await
+        .map_err(ctx(format!(
+            "Failed to create article in section {section_id}"
+        )))
+    }
+
+    /// Updates one locale's `translation` (title, body, draft; needs `locale`) and/or the
+    /// article's own `article` fields, then returns the refreshed article.
+    pub async fn update_article(
+        &self,
+        article_id: u64,
+        locale: Option<&str>,
+        mut translation: Map<String, Value>,
+        mut article: Map<String, Value>,
+    ) -> Result<Value> {
+        async {
+            translation.retain(|_, v| !v.is_null());
+            article.retain(|_, v| !v.is_null());
+            if translation.is_empty() && article.is_empty() {
+                bail!("Nothing to update: give at least one field to change");
+            }
+            let locale = locale.filter(|l| !l.is_empty());
+            if !translation.is_empty() && locale.is_none() {
+                bail!("locale is required to change title, body or draft");
+            }
+            if let Some(body) = translation.get("body").and_then(Value::as_str) {
+                translation.insert("body".into(), markdown_to_html(body).into());
+            }
+            if let Some(locale) = locale
+                && !translation.is_empty()
+            {
+                let path = format!(
+                    "help_center/articles/{article_id}/translations/{}.json",
+                    help_center_path(Some(locale)).trim_start_matches("help_center/")
+                );
+                self.api_put(&path, &json!({ "translation": translation }))
+                    .await?;
+            }
+            if !article.is_empty() {
+                self.api_put(
+                    &format!("help_center/articles/{article_id}.json"),
+                    &json!({ "article": article }),
+                )
+                .await?;
+            }
+            self.get_article(article_id, locale).await
+        }
+        .await
+        .map_err(ctx(format!("Failed to update article {article_id}")))
     }
 }
 
@@ -226,5 +385,153 @@ mod tests {
         let out = c.list_articles(None, None, 1, 25).await.unwrap();
         assert_eq!(out["count"], 0);
         assert_eq!(out["has_more"], false);
+    }
+
+    #[tokio::test]
+    async fn navigation_listings_use_locale_and_category_paths() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/help_center/fr/categories.json"))
+            .respond_with(json_page(
+                "categories",
+                json!([{"id": 1, "name": "c", "locale": "fr", "url": "u"}]),
+                None,
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/help_center/categories/1/sections.json"))
+            .respond_with(json_page(
+                "sections",
+                json!([{"id": 2, "name": "s", "category_id": 1, "parent_section_id": null}]),
+                None,
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/help_center/sections.json"))
+            .respond_with(json_page("sections", json!([]), None))
+            .mount(&server)
+            .await;
+        let c = client(&server);
+        let cats = c.list_categories(Some("fr")).await.unwrap();
+        assert_eq!(cats[0]["name"], "c");
+        assert!(cats[0].get("url").is_none());
+        let secs = c.list_sections(Some(1), None).await.unwrap();
+        assert_eq!(secs[0]["category_id"], 1);
+        assert_eq!(c.list_sections(None, None).await.unwrap(), json!([]));
+    }
+
+    #[tokio::test]
+    async fn article_translations_omit_bodies_and_default_flags() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/help_center/articles/9/translations.json"))
+            .respond_with(json_page(
+                "translations",
+                json!([{"id": 1, "locale": "en-us", "title": "t", "draft": true, "body": "<p>x</p>"},
+                       {"id": 2, "locale": "fr", "title": "u", "outdated": true}]),
+                None,
+            ))
+            .mount(&server)
+            .await;
+        let out = client(&server).list_article_translations(9).await.unwrap();
+        assert_eq!(out[0]["draft"], true);
+        assert_eq!(out[0]["outdated"], false);
+        assert_eq!(out[1]["outdated"], true);
+        assert!(out[0].get("body").is_none());
+    }
+
+    #[tokio::test]
+    async fn create_article_posts_html_body_and_returns_article() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v2/help_center/sections/4/articles.json"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({"article": {
+                "id": 77, "title": "T", "draft": true, "section_id": 4
+            }})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let article = serde_json::from_value(json!({
+            "title": "T", "body": "**hi**", "locale": "en-us", "draft": true,
+            "label_names": ["a"], "user_segment_id": null
+        }))
+        .unwrap();
+        let out = client(&server)
+            .create_article(4, article, false)
+            .await
+            .unwrap();
+        assert_eq!(out["id"], 77);
+        assert_eq!(out["draft"], true);
+        let requests = server.received_requests().await.unwrap();
+        let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert!(
+            body["article"]["body"]
+                .as_str()
+                .unwrap()
+                .contains("<strong>hi</strong>")
+        );
+        assert_eq!(body["article"]["draft"], true);
+        assert_eq!(body["article"]["label_names"], json!(["a"]));
+        assert!(body["article"].get("user_segment_id").is_none());
+        assert_eq!(body["notify_subscribers"], false);
+    }
+
+    #[tokio::test]
+    async fn update_article_splits_translation_and_metadata_puts() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/api/v2/help_center/articles/9/translations/fr.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"translation": {}})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/api/v2/help_center/articles/9.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"article": {}})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/help_center/fr/articles/9.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"article": {
+                "id": 9, "title": "New", "draft": false
+            }})))
+            .mount(&server)
+            .await;
+        let c = client(&server);
+        let map = |v: Value| v.as_object().unwrap().clone();
+        let out = c
+            .update_article(
+                9,
+                Some("fr"),
+                map(json!({"title": "New", "draft": false})),
+                map(json!({"promoted": true})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out["title"], "New");
+        let requests = server.received_requests().await.unwrap();
+        let bodies: Vec<Value> = requests
+            .iter()
+            .filter(|r| r.method.as_str() == "PUT")
+            .map(|r| serde_json::from_slice(&r.body).unwrap())
+            .collect();
+        assert_eq!(
+            bodies[0],
+            json!({"translation": {"title": "New", "draft": false}})
+        );
+        assert_eq!(bodies[1], json!({"article": {"promoted": true}}));
+        let err = c
+            .update_article(9, None, map(json!({"title": "x"})), Map::new())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("locale is required"), "{err}");
+        let err = c
+            .update_article(9, Some("fr"), Map::new(), Map::new())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Nothing to update"), "{err}");
     }
 }

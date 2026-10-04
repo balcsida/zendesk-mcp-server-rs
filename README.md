@@ -940,6 +940,55 @@ Get a Help Center article by ID.
 
 Returns the article with id, title, body, author_id, section_id, locale, html_url, timestamps, draft and promoted status, position, voting statistics and label names.
 
+#### list_categories
+
+List Help Center categories (the top level of the knowledge base) as `{id, name, description, locale, position, html_url, updated_at}`. Returns every page.
+
+- `locale` (string, optional): For example `en-us`, `fr`, `es` (defaults to the help center's default locale)
+
+#### list_sections
+
+List Help Center sections as `{id, name, description, category_id, parent_section_id, locale, position, html_url, updated_at}`. Returns every page.
+
+- `category_id` (integer, optional): Only list the sections in this category
+- `locale` (string, optional): For example `en-us`, `fr`, `es` (defaults to the help center's default locale)
+
+#### list_article_translations
+
+List every locale version of an article with its draft and outdated state, as `{id, locale, title, draft, outdated, html_url, updated_at}`. Bodies are not included: use `get_article` with a `locale` for the text.
+
+- `article_id` (integer)
+
+#### create_article
+
+Create a Help Center article. It is a draft unless `draft` is false. Publish later with `update_article` and `draft` false. Returns the article in the `get_article` shape.
+
+- `section_id` (integer)
+- `title` (string)
+- `body` (string): Markdown or HTML
+- `locale` (string): For example `en-us`; must be enabled for the help center
+- `permission_group_id` (integer, optional): Who can edit and publish the article (defaults to the admins group)
+- `user_segment_id` (integer, optional): Who can view the article (omit to make it visible to everyone)
+- `label_names` (array of strings, optional)
+- `draft` (boolean, optional): Defaults to true
+- `notify_subscribers` (boolean, optional): Defaults to false
+
+#### update_article
+
+Edit the text of one locale and/or the article's metadata. Set `draft` to false to publish, true to unpublish. Returns the updated article in the `get_article` shape.
+
+- `article_id` (integer)
+- `locale` (string, optional): Required with `title`, `body` or `draft`
+- `title` (string, optional)
+- `body` (string, optional): Markdown or HTML
+- `draft` (boolean, optional)
+- `section_id` (integer, optional): Move the article to this section
+- `promoted` (boolean, optional)
+- `position` (integer, optional)
+- `label_names` (array of strings, optional): Replaces the article's labels
+- `user_segment_id` (integer, optional)
+- `permission_group_id` (integer, optional)
+
 ### Metrics and SLAs
 
 #### get_ticket_metrics
