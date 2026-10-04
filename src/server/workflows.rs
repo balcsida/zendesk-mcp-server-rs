@@ -4,11 +4,13 @@ use super::*;
 struct ExecuteViewParams {
     /// The view ID to execute
     view_id: u64,
+    /// Page number
     #[serde(default = "page_1")]
     page: u64,
+    /// Number of tickets per page (max 100)
     #[serde(default = "per_page_25")]
     per_page: u64,
-    /// Column to sort by, e.g. created_at or updated_at (see Zendesk's view columns)
+    /// Column to sort by, e.g. created_at or updated_at; subject and submitter columns are not supported
     sort_by: Option<String>,
     /// asc or desc
     sort_order: Option<String>,
@@ -16,6 +18,7 @@ struct ExecuteViewParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct ListMacrosParams {
+    /// Only active macros (defaults to true)
     #[serde(default = "default_true")]
     active_only: bool,
 }
@@ -171,7 +174,7 @@ impl ZendeskServer {
     }
 
     #[tool(
-        description = "Preview the result of applying a macro to a ticket (does not save changes)",
+        description = "PREVIEW ONLY, saves nothing. Use execute_macro to apply the macro. Shows the ticket changes and comment the macro would make.",
         annotations(read_only_hint = true)
     )]
     async fn apply_macro(&self, Parameters(p): Parameters<ApplyMacroParams>) -> CallToolResult {
@@ -243,7 +246,7 @@ impl ZendeskServer {
     }
 
     #[tool(
-        description = "Find tickets that breached SLA within a specified time period",
+        description = "Find tickets that breached SLA within the last days_back days. Admin-only: reads Zendesk's incremental export, limited to 10 requests per minute, and scans every metric event in the window, so keep days_back small.",
         annotations(read_only_hint = true)
     )]
     async fn get_sla_breaches(

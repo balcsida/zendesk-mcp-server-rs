@@ -338,7 +338,7 @@ impl ZendeskServer {
     }
 
     #[tool(
-        description = "Get account settings: active_features (such as custom_objects_activated, business_hours, allow_ccs) and the brands, tickets, agents, localization, limits, routing and users defaults. Tells you which other tools apply to this account.",
+        description = "Get account settings: active_features (such as on_hold_status, business_hours, allow_ccs) and the brands, tickets, agents, localization, limits, routing and users defaults. Tells you which features are on; for custom objects, try list_custom_objects and treat 403 or 404 as 'not available'.",
         annotations(read_only_hint = true)
     )]
     async fn get_account_settings(&self) -> CallToolResult {

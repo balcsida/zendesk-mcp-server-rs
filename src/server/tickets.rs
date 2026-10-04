@@ -49,16 +49,18 @@ struct CreateTicketParams {
     subject: String,
     /// Ticket description
     description: String,
+    /// The user who requested the ticket
     requester_id: Option<u64>,
     /// Requester as {name, email}; the end user is created if needed. Not together with requester_id.
     requester: Option<RequesterParams>,
+    /// The agent to assign the ticket to
     assignee_id: Option<u64>,
-    /// low, normal, high, urgent
-    priority: Option<String>,
-    /// problem, incident, question, task
+    priority: Option<TicketPriority>,
     #[serde(rename = "type")]
-    ticket_type: Option<String>,
+    ticket_type: Option<TicketType>,
+    /// Tags to put on the ticket
     tags: Option<Vec<String>>,
+    /// Custom field values as [{"id": 1, "value": "x"}]
     custom_fields: Option<Vec<serde_json::Map<String, Value>>>,
     /// The group to assign the ticket to
     group_id: Option<u64>,
@@ -116,11 +118,11 @@ struct CreateCommentParams {
     ticket_id: u64,
     /// The comment text. Markdown, plain text, and HTML are all accepted.
     comment: String,
-    /// Whether the comment should be public
+    /// Whether the comment is public; a public comment is emailed to the requester, false makes it an internal note
     #[serde(default = "default_true")]
     public: bool,
-    /// Also set the ticket status in the same update: new, open, pending, hold, solved
-    status: Option<String>,
+    /// Also set the ticket status in the same update
+    status: Option<TicketStatus>,
     /// Upload tokens from upload_attachment to attach to the comment
     upload_tokens: Option<Vec<String>>,
 }
@@ -135,16 +137,20 @@ struct AttachmentParams {
 struct UpdateTicketParams {
     /// The ID of the ticket to update
     ticket_id: u64,
+    /// New ticket subject
     subject: Option<String>,
-    /// new, open, pending, on-hold, solved, closed
-    status: Option<String>,
-    /// low, normal, high, urgent
-    priority: Option<String>,
+    status: Option<TicketStatus>,
+    priority: Option<TicketPriority>,
+    /// New ticket type
     #[serde(rename = "type")]
-    ticket_type: Option<String>,
+    ticket_type: Option<TicketType>,
+    /// The agent to assign the ticket to
     assignee_id: Option<u64>,
+    /// The user who requested the ticket
     requester_id: Option<u64>,
+    /// Replaces ALL tags on the ticket; use update_ticket_tags to add or remove individual tags
     tags: Option<Vec<String>>,
+    /// Custom field values as [{"id": 1, "value": "x"}]
     custom_fields: Option<Vec<serde_json::Map<String, Value>>>,
     /// ISO8601 datetime
     due_at: Option<String>,
@@ -175,9 +181,8 @@ struct SearchParams {
     /// Results per page (max 100)
     #[serde(default = "per_page_25")]
     per_page: u64,
-    /// relevance, updated_at, created_at, priority, status, ticket_type
-    #[serde(default = "sort_by_relevance")]
-    sort_by: String,
+    /// updated_at, created_at, priority, status, ticket_type (omit to sort by relevance)
+    sort_by: Option<String>,
     /// asc or desc
     #[serde(default = "sort_desc")]
     sort_order: String,
@@ -207,8 +212,10 @@ struct MergeTicketsParams {
     target_id: u64,
     /// Tickets to merge from
     source_ids: Vec<u64>,
+    /// Comment added to the target ticket; private unless target_comment_is_public is true
     #[serde(default = "default_target_comment")]
     target_comment: String,
+    /// Comment added to each source ticket; private unless source_comment_is_public is true
     #[serde(default = "default_source_comment")]
     source_comment: String,
     /// Whether the comment on the target ticket is public (Zendesk defaults to private)
@@ -232,6 +239,7 @@ struct UserTicketsParams {
     role: String,
     #[serde(default = "page_1")]
     page: u64,
+    /// Number of tickets per page (max 100)
     #[serde(default = "per_page_25")]
     per_page: u64,
 }
@@ -304,8 +312,8 @@ impl ZendeskServer {
                     .requester
                     .map(|r| json!({"name": r.name, "email": r.email})),
                 assignee_id: p.assignee_id,
-                priority: p.priority,
-                ticket_type: p.ticket_type,
+                priority: p.priority.map(|v| v.as_str().to_string()),
+                ticket_type: p.ticket_type.map(|v| v.as_str().to_string()),
                 tags: p.tags,
                 custom_fields: p
                     .custom_fields
@@ -353,7 +361,7 @@ impl ZendeskServer {
     }
 
     #[tool(
-        description = "Create a new comment on an existing Zendesk ticket. Set status to also change the ticket status in the same call, e.g. reply and set it pending. Returns the new comment's id.",
+        description = "Create a new comment on an existing Zendesk ticket. Public by default, which emails the requester; set public=false for an internal note. Set status to also change the ticket status in the same call, e.g. reply and set it pending. Returns the new comment's id.",
         annotations(destructive_hint = false)
     )]
     async fn create_ticket_comment(
@@ -366,7 +374,7 @@ impl ZendeskServer {
                     p.ticket_id,
                     &p.comment,
                     p.public,
-                    p.status.as_deref(),
+                    p.status.map(TicketStatus::as_str),
                     &p.upload_tokens.unwrap_or_default(),
                 )
                 .await?;
@@ -376,7 +384,7 @@ impl ZendeskServer {
     }
 
     #[tool(
-        description = "Fetch a Zendesk ticket attachment by its content_url and return the file as base64-encoded data. Use the attachment URLs returned by get_ticket_comments.",
+        description = "Fetch a Zendesk ticket attachment by its content_url and return it as an image. Images only (JPEG, PNG, GIF, WebP, up to 10 MB); other types are rejected. Use the attachment URLs returned by get_ticket_comments.",
         annotations(read_only_hint = true)
     )]
     async fn get_ticket_attachment(
@@ -385,11 +393,7 @@ impl ZendeskServer {
     ) -> CallToolResult {
         self.call(|c| async move {
             let a = c.get_ticket_attachment(&p.content_url).await?;
-            if a.content_type.starts_with("image/") {
-                Ok(ContentBlock::image(a.data_base64, a.content_type))
-            } else {
-                json_block(&json!({ "content_type": a.content_type, "data_base64": a.data_base64 }))
-            }
+            Ok(ContentBlock::image(a.data_base64, a.content_type))
         })
         .await
     }
@@ -422,9 +426,9 @@ impl ZendeskServer {
                 }
             };
             set("subject", p.subject.map(Value::from));
-            set("status", p.status.map(Value::from));
-            set("priority", p.priority.map(Value::from));
-            set("type", p.ticket_type.map(Value::from));
+            set("status", p.status.map(|v| v.as_str().into()));
+            set("priority", p.priority.map(|v| v.as_str().into()));
+            set("type", p.ticket_type.map(|v| v.as_str().into()));
             set("assignee_id", p.assignee_id.map(Value::from));
             set("requester_id", p.requester_id.map(Value::from));
             set("tags", p.tags.map(Value::from));
@@ -449,13 +453,19 @@ impl ZendeskServer {
     }
 
     #[tool(
-        description = "Search Zendesk using Zendesk Query Language (ZQL). Searches tickets, users, and organizations. Example queries: 'type:ticket status:open priority:urgent', 'type:ticket assignee:me', 'type:user email:john@example.com'",
+        description = "Search Zendesk using Zendesk Query Language (ZQL). Searches tickets, users, organizations and groups, one page at a time; Zendesk returns at most 1,000 results per query. Example queries: 'type:ticket status:open priority:urgent', 'type:ticket assignee:me', 'type:user email:john@example.com'",
         annotations(read_only_hint = true)
     )]
     async fn search(&self, Parameters(p): Parameters<SearchParams>) -> CallToolResult {
         self.call_json(|c| async move {
-            c.search(&p.query, p.page, p.per_page, &p.sort_by, &p.sort_order)
-                .await
+            c.search(
+                &p.query,
+                p.page,
+                p.per_page,
+                p.sort_by.as_deref(),
+                &p.sort_order,
+            )
+            .await
         })
         .await
     }
@@ -525,7 +535,7 @@ impl ZendeskServer {
     }
 
     #[tool(
-        description = "Permanently delete a Zendesk ticket. Use with caution.",
+        description = "Soft-delete a Zendesk ticket. It is recoverable for 30 days with restore_deleted_ticket (see list_deleted_tickets). Needs permission to delete tickets.",
         annotations(destructive_hint = true)
     )]
     async fn delete_ticket(&self, Parameters(p): Parameters<TicketIdParams>) -> CallToolResult {

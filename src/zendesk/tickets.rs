@@ -236,13 +236,6 @@ impl ZendeskClient {
         upload_tokens: &[String],
     ) -> Result<Value> {
         async {
-            if let Some(status) = status
-                && !["new", "open", "pending", "hold", "solved"].contains(&status)
-            {
-                bail!(
-                    "Invalid status '{status}'. Allowed: [\"new\", \"open\", \"pending\", \"hold\", \"solved\"]"
-                );
-            }
             let mut body = json!({"ticket": {"comment": {
                 "html_body": markdown_to_html(comment),
                 "public": public,
@@ -460,24 +453,23 @@ impl ZendeskClient {
         query: &str,
         page: u64,
         per_page: u64,
-        sort_by: &str,
+        sort_by: Option<&str>,
         sort_order: &str,
     ) -> Result<Value> {
         async {
             let per_page = per_page.min(100);
-            let data = self
-                .api_get(
-                    "search.json",
-                    &[
-                        ("query", &query),
-                        ("page", &page),
-                        ("per_page", &per_page),
-                        ("sort_by", &sort_by),
-                        ("sort_order", &sort_order),
-                        ("include", &"tickets(users)"),
-                    ],
-                )
-                .await?;
+            let mut params: Vec<(&str, &(dyn Display + Sync))> = vec![
+                ("query", &query),
+                ("page", &page),
+                ("per_page", &per_page),
+                ("sort_order", &sort_order),
+                ("include", &"tickets(users)"),
+            ];
+            // Zendesk sorts by relevance when sort_by is absent.
+            if let Some(sort_by) = &sort_by {
+                params.push(("sort_by", sort_by));
+            }
+            let data = self.api_get("search.json", &params).await?;
             let names = side_loaded_user_names(&data);
             let results = data
                 .get("results")
@@ -1378,12 +1370,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn post_comment_rejects_unknown_status() {
-        let err = offline_client()
-            .post_comment(3, "x", true, Some("closed"), &[])
+    async fn search_omits_sort_by_unless_given() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/search.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"results": []})))
+            .mount(&server)
+            .await;
+        let c = client(&server);
+        c.search("type:ticket", 1, 25, None, "desc").await.unwrap();
+        c.search("type:ticket", 1, 25, Some("updated_at"), "desc")
             .await
-            .unwrap_err();
-        assert!(err.to_string().contains("Invalid status 'closed'"), "{err}");
+            .unwrap();
+        let requests = server.received_requests().await.unwrap();
+        let sort_by = |i: usize| {
+            requests[i]
+                .url
+                .query_pairs()
+                .find(|(k, _)| k == "sort_by")
+                .map(|(_, v)| v.to_string())
+        };
+        assert_eq!(sort_by(0), None);
+        assert_eq!(sort_by(1).as_deref(), Some("updated_at"));
     }
 
     #[tokio::test]

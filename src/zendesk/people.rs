@@ -749,7 +749,7 @@ mod tests {
             .and(path("/api/v2/account/settings.json"))
             .respond_with(
                 ResponseTemplate::new(200).set_body_json(json!({"settings": {
-                    "active_features": {"custom_objects_activated": true},
+                    "active_features": {"on_hold_status": true},
                     "tickets": {"allow_ccs": true}, "user": {"tagging": true},
                     "billing": {"secret": 1}
                 }})),
@@ -757,7 +757,7 @@ mod tests {
             .mount(&server)
             .await;
         let out = client(&server).get_account_settings().await.unwrap();
-        assert_eq!(out["active_features"]["custom_objects_activated"], true);
+        assert_eq!(out["active_features"]["on_hold_status"], true);
         assert_eq!(out["users"], json!({"tagging": true}));
         assert!(out["routing"].is_null());
         assert!(out.get("billing").is_none());

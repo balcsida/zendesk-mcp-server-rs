@@ -7,8 +7,10 @@ struct SearchArticlesParams {
     /// Optional locale filter (e.g., 'en-us', 'fr', 'es')
     locale: Option<String>,
     /// Only articles in this category ID
+    #[serde(alias = "category_id")]
     category: Option<u64>,
     /// Only articles in this section ID
+    #[serde(alias = "section_id")]
     section: Option<u64>,
     /// Only articles with these labels (sent comma-separated)
     label_names: Option<Vec<String>>,

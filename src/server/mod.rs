@@ -74,11 +74,13 @@ pub struct ZendeskServer {
 const KB_TTL: Duration = Duration::from_secs(3600);
 const KB_URI: &str = "zendesk://knowledge-base";
 
-const INSTRUCTIONS: &str = "Zendesk server. Tool families: tickets and comments; search (ZQL) with count_tickets; users and organizations; views, macros and triggers; custom objects; Help Center articles; SLA data.
+const INSTRUCTIONS: &str = "Zendesk server. Tool families: tickets and comments; search (ZQL) with count_tickets; users, organizations, groups, brands and account settings; views, macros and triggers; custom objects; Help Center articles; SLA data; deleted and suspended tickets; satisfaction ratings.
 
-Conventions: list tools page with page/per_page or page_size/after_cursor and report has_more. Bulk tools return a job; follow it with get_job_status. Attachments: get_ticket_comments gives content_url for get_ticket_attachment; upload_attachment gives tokens to attach to comments.
+Conventions: list tools page with page/per_page or page_size/after_cursor and report has_more. update_tickets_bulk and merge_tickets return a job result; follow it with get_job_status. update_ticket's tags replace the whole list; use update_ticket_tags to add or remove tags. Attachments: get_ticket_comments gives content_url for get_ticket_attachment; upload_attachment gives tokens to attach to comments.
 
-Cautions: delete_ticket, merge_tickets, mark_ticket_as_spam, redact_comment_text and update_tickets_bulk are destructive and flagged as such. apply_macro only previews; execute_macro saves. create_article makes drafts.";
+Admin-only: get_sla_breaches, list_satisfaction_ratings, list_suspended_tickets.
+
+Cautions: delete_ticket, merge_tickets, mark_ticket_as_spam, redact_comment_text, make_comment_private and update_tickets_bulk are destructive and flagged as such. apply_macro only previews; execute_macro saves. create_article makes drafts.";
 
 const TICKET_ANALYSIS_TEMPLATE: &str = "
 You are a helpful Zendesk support analyst. You've been asked to analyze ticket #{ticket_id}.
@@ -154,9 +156,6 @@ pub(super) fn per_page_25() -> u64 {
 pub(super) fn sort_by_created_at() -> String {
     "created_at".into()
 }
-pub(super) fn sort_by_relevance() -> String {
-    "relevance".into()
-}
 pub(super) fn sort_desc() -> String {
     "desc".into()
 }
@@ -180,6 +179,73 @@ pub(super) fn default_target_comment() -> String {
 }
 pub(super) fn default_source_comment() -> String {
     "This ticket has been merged.".into()
+}
+
+/// The `status` of a ticket.
+#[derive(Debug, Clone, Copy, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum TicketStatus {
+    New,
+    Open,
+    Pending,
+    Hold,
+    Solved,
+    Closed,
+}
+
+impl TicketStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            TicketStatus::New => "new",
+            TicketStatus::Open => "open",
+            TicketStatus::Pending => "pending",
+            TicketStatus::Hold => "hold",
+            TicketStatus::Solved => "solved",
+            TicketStatus::Closed => "closed",
+        }
+    }
+}
+
+/// The urgency of a ticket.
+#[derive(Debug, Clone, Copy, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum TicketPriority {
+    Low,
+    Normal,
+    High,
+    Urgent,
+}
+
+impl TicketPriority {
+    fn as_str(self) -> &'static str {
+        match self {
+            TicketPriority::Low => "low",
+            TicketPriority::Normal => "normal",
+            TicketPriority::High => "high",
+            TicketPriority::Urgent => "urgent",
+        }
+    }
+}
+
+/// The kind of a ticket.
+#[derive(Debug, Clone, Copy, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum TicketType {
+    Problem,
+    Incident,
+    Question,
+    Task,
+}
+
+impl TicketType {
+    fn as_str(self) -> &'static str {
+        match self {
+            TicketType::Problem => "problem",
+            TicketType::Incident => "incident",
+            TicketType::Question => "question",
+            TicketType::Task => "task",
+        }
+    }
 }
 
 /// MCP sends prompt arguments as strings; accept an integer too.
@@ -553,6 +619,76 @@ mod tests {
         "get_custom_object_record",
     ];
 
+    /// Every tool that only reads.
+    const READ_ONLY: [&str; 56] = [
+        "get_ticket",
+        "list_categories",
+        "list_sections",
+        "list_article_translations",
+        "get_view_counts",
+        "get_macro",
+        "search_macros",
+        "list_triggers",
+        "get_trigger",
+        "get_tickets",
+        "get_ticket_comments",
+        "get_ticket_attachment",
+        "search",
+        "search_all_tickets",
+        "get_user",
+        "get_current_user",
+        "search_users",
+        "list_views",
+        "execute_view",
+        "list_ticket_fields",
+        "get_organization",
+        "search_organizations",
+        "get_tickets_bulk",
+        "list_groups",
+        "list_macros",
+        "apply_macro",
+        "get_user_tickets",
+        "list_ticket_forms",
+        "search_articles",
+        "list_articles",
+        "get_article",
+        "get_ticket_metrics",
+        "get_ticket_audits",
+        "get_linked_incidents",
+        "get_sla_breaches",
+        "get_sla_policies",
+        "get_job_status",
+        "count_tickets",
+        "get_ticket_collaborators",
+        "search_problem_tickets",
+        "get_organization_tickets",
+        "list_custom_statuses",
+        "list_satisfaction_ratings",
+        "list_deleted_tickets",
+        "list_suspended_tickets",
+        "get_users_bulk",
+        "get_user_identities",
+        "get_user_organizations",
+        "list_organization_users",
+        "get_group_members",
+        "list_brands",
+        "get_account_settings",
+        "list_custom_objects",
+        "get_custom_object",
+        "search_custom_object_records",
+        "get_custom_object_record",
+    ];
+
+    /// Every tool that deletes, merges, redacts or otherwise cannot be undone.
+    const DESTRUCTIVE: [&str; 6] = [
+        "delete_ticket",
+        "merge_tickets",
+        "redact_comment_text",
+        "mark_ticket_as_spam",
+        "update_tickets_bulk",
+        "make_comment_private",
+    ];
+
     fn server() -> ZendeskServer {
         ZendeskServer::new(
             Credentials::Bearer {
@@ -578,24 +714,85 @@ mod tests {
     }
 
     #[test]
-    fn every_tool_is_annotated_and_delete_is_destructive() {
-        let tools = server().tool_router.list_all();
-        let hints = |name: &str| {
-            tools
-                .iter()
-                .find(|t| t.name == name)
-                .and_then(|t| t.annotations.clone())
-                .unwrap_or_else(|| panic!("{name} has no annotations"))
-        };
-        for tool in &tools {
+    fn annotations_follow_the_taxonomy() {
+        for name in READ_ONLY.iter().chain(&DESTRUCTIVE) {
+            assert!(TOOLS.contains(name), "{name} is not a tool");
+        }
+        for name in DESTRUCTIVE {
+            assert!(!READ_ONLY.contains(&name), "{name} is in both lists");
+        }
+        for tool in server().tool_router.list_all() {
+            let name = tool.name.as_ref();
+            let hints = tool
+                .annotations
+                .as_ref()
+                .unwrap_or_else(|| panic!("{name} has no annotations"));
+            if READ_ONLY.contains(&name) {
+                assert_eq!(hints.read_only_hint, Some(true), "{name}");
+            } else if DESTRUCTIVE.contains(&name) {
+                assert_eq!(hints.destructive_hint, Some(true), "{name}");
+            } else {
+                assert_ne!(hints.read_only_hint, Some(true), "{name}");
+                assert_eq!(hints.destructive_hint, Some(false), "{name}");
+            }
+        }
+    }
+
+    #[test]
+    fn readme_and_instructions_name_only_real_tools() {
+        let readme = include_str!("../../README.md");
+        for name in TOOLS {
             assert!(
-                tool.annotations.is_some(),
-                "{} has no annotations",
-                tool.name
+                readme.contains(&format!("#### {name}\n")),
+                "README has no entry for {name}"
             );
         }
-        assert_eq!(hints("delete_ticket").destructive_hint, Some(true));
-        assert_eq!(hints("get_ticket").read_only_hint, Some(true));
+        // Tokens that start like a tool name; parameter names such as per_page are not.
+        const VERBS: [&str; 16] = [
+            "get_", "list_", "search_", "create_", "update_", "delete_", "apply_", "execute_",
+            "merge_", "mark_", "make_", "redact_", "restore_", "recover_", "upload_", "count_",
+        ];
+        for token in INSTRUCTIONS.split(|c: char| !(c.is_ascii_lowercase() || c == '_')) {
+            if token.contains('_') && VERBS.iter().any(|v| token.starts_with(v)) {
+                assert!(
+                    TOOLS.contains(&token),
+                    "INSTRUCTIONS names unknown tool {token}"
+                );
+            }
+        }
+        assert!(INSTRUCTIONS.split_whitespace().count() < 200);
+    }
+
+    #[test]
+    fn ticket_enums_are_closed_sets_in_the_schemas() {
+        let tools = server().tool_router.list_all();
+        let schema = |name: &str| {
+            let tool = tools.iter().find(|t| t.name == name).unwrap();
+            serde_json::to_string(&tool.input_schema).unwrap()
+        };
+        for name in ["create_ticket", "update_ticket", "update_tickets_bulk"] {
+            let text = schema(name);
+            assert!(text.contains("\"urgent\""), "{name}");
+            assert!(text.contains("\"incident\""), "{name}");
+        }
+        for name in [
+            "update_ticket",
+            "update_tickets_bulk",
+            "create_ticket_comment",
+        ] {
+            let text = schema(name);
+            assert!(
+                text.contains("\"hold\"") && !text.contains("on-hold"),
+                "{name}"
+            );
+        }
+        assert!(serde_json::from_value::<TicketStatus>(json!("on-hold")).is_err());
+        assert_eq!(
+            serde_json::from_value::<TicketStatus>(json!("hold"))
+                .unwrap()
+                .as_str(),
+            "hold"
+        );
     }
 
     #[test]

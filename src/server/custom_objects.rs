@@ -34,7 +34,7 @@ struct CustomObjectRecordParams {
 #[tool_router(router = custom_objects_router, vis = "pub(super)")]
 impl ZendeskServer {
     #[tool(
-        description = "List the custom objects of the account (key, title, title_pluralized, description, created_at, updated_at). Custom objects are account-defined record types (products, orders, assets) linked to tickets through lookup fields; check active_features.custom_objects_activated in get_account_settings.",
+        description = "List the custom objects of the account (key, title, title_pluralized, description, created_at, updated_at). Custom objects are account-defined record types (products, orders, assets) linked to tickets through lookup fields. If the account has no custom objects this fails with 403 or 404; treat that as 'not available'.",
         annotations(read_only_hint = true)
     )]
     async fn list_custom_objects(&self) -> CallToolResult {
@@ -55,7 +55,7 @@ impl ZendeskServer {
     }
 
     #[tool(
-        description = "List or search the records of a custom object, one cursor page at a time. With neither query nor filter it lists records; query is a text search that covers text fields only; use filter for other field types. Returns records, count, has_more and after_cursor.",
+        description = "List or search the records of a custom object, one cursor page at a time. With neither query nor filter it lists records; query is a text search that covers text fields only; use filter for other field types. Returns records, count, has_more and after_cursor. Non-admin agents may get 403 on listing or text search for objects with cascading permissions and must use filter.",
         annotations(read_only_hint = true)
     )]
     async fn search_custom_object_records(

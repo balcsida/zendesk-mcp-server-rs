@@ -61,13 +61,11 @@ struct SpamParams {
 struct UpdateTicketsBulkParams {
     /// IDs of the tickets to update (1 to 100)
     ticket_ids: Vec<u64>,
-    /// new, open, pending, hold, solved
-    status: Option<String>,
-    /// low, normal, high, urgent
-    priority: Option<String>,
-    /// problem, incident, question, task
+    status: Option<TicketStatus>,
+    priority: Option<TicketPriority>,
     #[serde(rename = "type")]
-    ticket_type: Option<String>,
+    ticket_type: Option<TicketType>,
+    /// The agent to assign the tickets to
     assignee_id: Option<u64>,
     /// The group to assign the tickets to
     group_id: Option<u64>,
@@ -144,7 +142,7 @@ impl ZendeskServer {
 
     #[tool(
         description = "Make a public ticket comment private. One-way: a private comment cannot be made public again.",
-        annotations(destructive_hint = false, idempotent_hint = true)
+        annotations(destructive_hint = true, idempotent_hint = true)
     )]
     async fn make_comment_private(
         &self,
@@ -172,7 +170,7 @@ impl ZendeskServer {
     }
 
     #[tool(
-        description = "Mark a ticket as spam AND suspend its requester",
+        description = "Mark a ticket as spam AND suspend its requester. No tool here lifts that suspension.",
         annotations(destructive_hint = true)
     )]
     async fn mark_ticket_as_spam(&self, Parameters(p): Parameters<SpamParams>) -> CallToolResult {
@@ -184,7 +182,7 @@ impl ZendeskServer {
     }
 
     #[tool(
-        description = "Apply the same change to up to 100 tickets at once. Waits up to 30 seconds for Zendesk's background job; if it is still pending, call get_job_status with the returned id.",
+        description = "Apply the same change to up to 100 tickets at once. Waits up to 30 seconds for Zendesk's background job; if it is still pending, call get_job_status with the returned id. At most 30 jobs may be queued at once.",
         annotations(destructive_hint = true)
     )]
     async fn update_tickets_bulk(
@@ -198,9 +196,9 @@ impl ZendeskServer {
                     fields.insert(key.to_string(), v);
                 }
             };
-            set("status", p.status.map(Value::from));
-            set("priority", p.priority.map(Value::from));
-            set("type", p.ticket_type.map(Value::from));
+            set("status", p.status.map(|v| v.as_str().into()));
+            set("priority", p.priority.map(|v| v.as_str().into()));
+            set("type", p.ticket_type.map(|v| v.as_str().into()));
             set("assignee_id", p.assignee_id.map(Value::from));
             set("group_id", p.group_id.map(Value::from));
             set("custom_status_id", p.custom_status_id.map(Value::from));
