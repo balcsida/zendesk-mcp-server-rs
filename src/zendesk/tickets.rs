@@ -3,6 +3,35 @@ use serde_json::{Map, Value, json};
 
 use super::*;
 
+/// Tickets of a list response with `requester_name`/`assignee_name` from the side-loaded users.
+fn ticket_rows(data: &Value) -> Vec<Value> {
+    let names = side_loaded_user_names(data);
+    data.get("tickets")
+        .and_then(Value::as_array)
+        .map_or(&[][..], |a| a)
+        .iter()
+        .map(|t| {
+            let mut out = pick(
+                t,
+                &[
+                    "id",
+                    "subject",
+                    "status",
+                    "priority",
+                    "description",
+                    "created_at",
+                    "updated_at",
+                    "requester_id",
+                    "assignee_id",
+                ],
+                &[],
+            );
+            out["custom_fields"] = t.get("custom_fields").cloned().unwrap_or_else(|| json!([]));
+            with_user_names(out, t, &names)
+        })
+        .collect()
+}
+
 impl ZendeskClient {
     pub async fn get_ticket(&self, ticket_id: u64) -> Result<Value> {
         async {
@@ -247,33 +276,7 @@ impl ZendeskClient {
                     ],
                 )
                 .await?;
-            let names = side_loaded_user_names(&data);
-            let tickets: Vec<Value> = data
-                .get("tickets")
-                .and_then(Value::as_array)
-                .map_or(&[][..], |a| a)
-                .iter()
-                .map(|t| {
-                    let mut out = pick(
-                        t,
-                        &[
-                            "id",
-                            "subject",
-                            "status",
-                            "priority",
-                            "description",
-                            "created_at",
-                            "updated_at",
-                            "requester_id",
-                            "assignee_id",
-                        ],
-                        &[],
-                    );
-                    out["custom_fields"] =
-                        t.get("custom_fields").cloned().unwrap_or_else(|| json!([]));
-                    with_user_names(out, t, &names)
-                })
-                .collect();
+            let tickets = ticket_rows(&data);
             let has_next = !data["next_page"].is_null();
             let has_previous = !data["previous_page"].is_null() && page > 1;
             Ok(json!({
@@ -639,6 +642,138 @@ impl ZendeskClient {
             "Failed to get linked incidents for ticket {ticket_id}"
         )))
     }
+
+    /// Size a result set: `search/count` for a ZQL `query`, `tickets/count` otherwise.
+    pub async fn count_tickets(&self, query: Option<&str>) -> Result<Value> {
+        async {
+            match query.filter(|q| !q.is_empty()) {
+                Some(query) => {
+                    let data = self
+                        .api_get("search/count.json", &[("query", &query)])
+                        .await?;
+                    Ok(json!({
+                        "count": data["count"],
+                        "refreshed_at": null,
+                        "query": query,
+                    }))
+                }
+                None => {
+                    let data = self.api_get("tickets/count.json", &[]).await?;
+                    Ok(json!({
+                        "count": data["count"]["value"],
+                        "refreshed_at": data["count"]["refreshed_at"],
+                        "query": null,
+                    }))
+                }
+            }
+        }
+        .await
+        .map_err(ctx("Failed to count tickets"))
+    }
+
+    /// Followers and email CCs of a ticket; both need the CCs and followers feature.
+    pub async fn get_ticket_collaborators(&self, ticket_id: u64) -> Result<Value> {
+        async {
+            let keys = ["id", "name", "email", "role"];
+            let followers = self
+                .api_get(&format!("tickets/{ticket_id}/followers.json"), &[])
+                .await?;
+            let email_ccs = self
+                .api_get(&format!("tickets/{ticket_id}/email_ccs.json"), &[])
+                .await?;
+            Ok(json!({
+                "followers": pick_all(&followers, "users", &keys, &[]),
+                "email_ccs": pick_all(&email_ccs, "users", &keys, &[]),
+            }))
+        }
+        .await
+        .map_err(ctx(format!(
+            "Failed to get collaborators for ticket {ticket_id}"
+        )))
+    }
+
+    /// Problem tickets whose subject contains `text`, or the 100 most recently updated.
+    pub async fn search_problem_tickets(&self, text: Option<&str>) -> Result<Value> {
+        async {
+            let data = match text.filter(|t| !t.is_empty()) {
+                Some(text) => {
+                    self.api_post("problems/autocomplete.json", &json!({ "text": text }))
+                        .await?
+                }
+                None => {
+                    self.api_get("problems.json", &[("per_page", &100u64)])
+                        .await?
+                }
+            };
+            let tickets = pick_all(&data, "tickets", &TICKET_SUMMARY_KEYS, &[]);
+            Ok(json!({ "count": tickets.as_array().map_or(0, Vec::len), "tickets": tickets }))
+        }
+        .await
+        .map_err(ctx("Failed to search problem tickets"))
+    }
+
+    pub async fn get_organization_tickets(
+        &self,
+        organization_id: u64,
+        page: u64,
+        per_page: u64,
+    ) -> Result<Value> {
+        async {
+            let per_page = per_page.min(100);
+            let data = self
+                .api_get(
+                    &format!("organizations/{organization_id}/tickets.json"),
+                    &[
+                        ("page", &page),
+                        ("per_page", &per_page),
+                        ("include", &"users"),
+                    ],
+                )
+                .await?;
+            let tickets = ticket_rows(&data);
+            Ok(json!({
+                "count": tickets.len(),
+                "tickets": tickets,
+                "page": page,
+                "per_page": per_page,
+                "has_more": !data["next_page"].is_null(),
+            }))
+        }
+        .await
+        .map_err(ctx(format!(
+            "Failed to get tickets for organization {organization_id}"
+        )))
+    }
+
+    /// Adds then removes specific tags; returns the ticket's tags after the last call.
+    pub async fn update_ticket_tags(
+        &self,
+        ticket_id: u64,
+        add: &[String],
+        remove: &[String],
+    ) -> Result<Value> {
+        async {
+            if add.is_empty() && remove.is_empty() {
+                bail!("Give at least one tag to add or remove");
+            }
+            if remove.iter().any(|t| t.contains(',')) {
+                bail!("Tags to remove must not contain commas");
+            }
+            let path = format!("tickets/{ticket_id}/tags.json");
+            let mut data = Value::Null;
+            if !add.is_empty() {
+                data = self.api_put(&path, &json!({ "tags": add })).await?;
+            }
+            if !remove.is_empty() {
+                data = self
+                    .api_delete_json(&path, &[("tags", &remove.join(","))])
+                    .await?;
+            }
+            Ok(json!({ "tags": data.get("tags").cloned().unwrap_or(json!([])) }))
+        }
+        .await
+        .map_err(ctx(format!("Failed to update tags on ticket {ticket_id}")))
+    }
 }
 
 #[cfg(test)]
@@ -647,6 +782,142 @@ mod tests {
     use crate::zendesk::test_support::*;
     use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+    #[tokio::test]
+    async fn count_tickets_uses_search_count_with_a_query_and_tickets_count_without() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/search/count.json"))
+            .and(query_param("query", "type:ticket status:open"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"count": 6})))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/tickets/count.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"count": {"value": 102, "refreshed_at": "2020-04-06T02:18:17Z"}}),
+            ))
+            .mount(&server)
+            .await;
+        let c = client(&server);
+        assert_eq!(
+            c.count_tickets(Some("type:ticket status:open"))
+                .await
+                .unwrap(),
+            json!({"count": 6, "refreshed_at": null, "query": "type:ticket status:open"})
+        );
+        assert_eq!(
+            c.count_tickets(None).await.unwrap(),
+            json!({"count": 102, "refreshed_at": "2020-04-06T02:18:17Z", "query": null})
+        );
+    }
+
+    #[tokio::test]
+    async fn collaborators_combine_followers_and_email_ccs() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/tickets/4/followers.json"))
+            .respond_with(json_page(
+                "users",
+                json!([{"id": 1, "name": "A", "email": "a@x.com", "role": "agent", "extra": 1}]),
+                None,
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/tickets/4/email_ccs.json"))
+            .respond_with(json_page("users", json!([{"id": 2, "name": "B"}]), None))
+            .mount(&server)
+            .await;
+        let out = client(&server).get_ticket_collaborators(4).await.unwrap();
+        assert_eq!(
+            out,
+            json!({
+                "followers": [{"id": 1, "name": "A", "email": "a@x.com", "role": "agent"}],
+                "email_ccs": [{"id": 2, "name": "B", "email": null, "role": null}],
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn problem_search_posts_text_and_listing_gets_one_page_of_100() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v2/problems/autocomplete.json"))
+            .respond_with(json_page(
+                "tickets",
+                json!([{"id": 33, "subject": "fire"}]),
+                None,
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/problems.json"))
+            .and(query_param("per_page", "100"))
+            .respond_with(json_page("tickets", json!([{"id": 1}, {"id": 2}]), None))
+            .mount(&server)
+            .await;
+        let c = client(&server);
+        let found = c.search_problem_tickets(Some("fire")).await.unwrap();
+        assert_eq!(found["count"], 1);
+        assert_eq!(found["tickets"][0]["id"], 33);
+        assert_eq!(c.search_problem_tickets(None).await.unwrap()["count"], 2);
+        let requests = server.received_requests().await.unwrap();
+        let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body, json!({"text": "fire"}));
+    }
+
+    #[tokio::test]
+    async fn organization_tickets_have_names_and_paging() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/organizations/8/tickets.json"))
+            .and(query_param("include", "users"))
+            .and(query_param("per_page", "100"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "tickets": [{"id": 1, "subject": "s", "requester_id": 5}],
+                "users": [{"id": 5, "name": "Req"}],
+                "next_page": "https://x/next",
+            })))
+            .mount(&server)
+            .await;
+        let out = client(&server)
+            .get_organization_tickets(8, 1, 500)
+            .await
+            .unwrap();
+        assert_eq!(out["count"], 1);
+        assert_eq!(out["tickets"][0]["requester_name"], "Req");
+        assert_eq!(out["per_page"], 100);
+        assert_eq!(out["has_more"], true);
+    }
+
+    #[tokio::test]
+    async fn tag_update_puts_added_tags_then_deletes_removed_ones_by_query() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/api/v2/tickets/3/tags.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"tags": ["a", "b"]})))
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/api/v2/tickets/3/tags.json"))
+            .and(query_param("tags", "b,c"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"tags": ["a"]})))
+            .mount(&server)
+            .await;
+        let c = client(&server);
+        let out = c
+            .update_ticket_tags(3, &["a".into()], &["b".into(), "c".into()])
+            .await
+            .unwrap();
+        assert_eq!(out, json!({"tags": ["a"]}));
+        let requests = server.received_requests().await.unwrap();
+        let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body, json!({"tags": ["a"]}));
+        let err = c.update_ticket_tags(3, &[], &[]).await.unwrap_err();
+        assert!(err.to_string().contains("at least one tag"), "{err}");
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
 
     #[tokio::test]
     async fn bulk_fetch_splits_150_ids_into_two_requests() {

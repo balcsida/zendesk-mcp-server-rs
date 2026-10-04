@@ -408,6 +408,17 @@ impl ZendeskClient {
         json_or_null(resp).await
     }
 
+    /// DELETE with query `params` for endpoints that answer with a body.
+    pub(super) async fn api_delete_json(
+        &self,
+        path: &str,
+        params: &[(&str, &(dyn Display + Sync))],
+    ) -> Result<Value> {
+        let url = self.url(path, params)?;
+        let resp = self.send(|| self.http.delete(url.clone())).await?;
+        json_or_null(resp).await
+    }
+
     pub(super) async fn api_delete(&self, path: &str) -> Result<()> {
         let url = self.url(path, &[])?;
         self.send(|| self.http.delete(url.clone())).await?;
@@ -491,7 +502,6 @@ impl ZendeskClient {
     }
 
     /// One page of a cursor-paginated listing; `page_size` is capped at 100.
-    #[allow(dead_code)] // only tests call it until a cursor-paginated tool lands
     pub(super) async fn get_cursor_page(
         &self,
         path: &str,

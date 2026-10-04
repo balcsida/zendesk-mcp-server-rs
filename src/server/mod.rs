@@ -164,6 +164,9 @@ pub(super) fn default_true() -> bool {
 pub(super) fn days_back_7() -> u64 {
     7
 }
+pub(super) fn days_back_30() -> u64 {
+    30
+}
 pub(super) fn default_target_comment() -> String {
     "Merged from related tickets.".into()
 }
@@ -449,7 +452,7 @@ async fn shutdown_signal() {
 mod tests {
     use super::*;
 
-    const TOOLS: [&str; 34] = [
+    const TOOLS: [&str; 41] = [
         "get_ticket",
         "create_ticket",
         "get_tickets",
@@ -484,6 +487,13 @@ mod tests {
         "get_sla_breaches",
         "get_sla_policies",
         "get_job_status",
+        "count_tickets",
+        "get_ticket_collaborators",
+        "search_problem_tickets",
+        "get_organization_tickets",
+        "update_ticket_tags",
+        "list_custom_statuses",
+        "list_satisfaction_ratings",
     ];
 
     fn server() -> ZendeskServer {
@@ -497,7 +507,7 @@ mod tests {
     }
 
     #[test]
-    fn lists_exactly_the_34_tools() {
+    fn lists_exactly_the_41_tools() {
         let mut names: Vec<String> = server()
             .tool_router
             .list_all()

@@ -1,7 +1,21 @@
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use serde_json::{Map, Value, json};
 
 use super::*;
+
+const SATISFACTION_SCORES: [&str; 11] = [
+    "offered",
+    "unoffered",
+    "received",
+    "received_with_comment",
+    "received_without_comment",
+    "good",
+    "good_with_comment",
+    "good_without_comment",
+    "bad",
+    "bad_with_comment",
+    "bad_without_comment",
+];
 
 impl ZendeskClient {
     pub async fn list_views(&self) -> Result<Value> {
@@ -203,6 +217,92 @@ impl ZendeskClient {
         .await
         .map_err(ctx("Failed to get SLA policies"))
     }
+
+    /// Custom ticket statuses; `status` on a ticket is only the category.
+    pub async fn list_custom_statuses(&self, active_only: bool) -> Result<Value> {
+        async {
+            let params: &[(&str, &(dyn Display + Sync))] = if active_only {
+                &[("active", &true)]
+            } else {
+                &[]
+            };
+            let data = self.api_get("custom_statuses.json", params).await?;
+            Ok(pick_all(
+                &data,
+                "custom_statuses",
+                &[
+                    "id",
+                    "status_category",
+                    "agent_label",
+                    "end_user_label",
+                    "description",
+                    "active",
+                    "default",
+                ],
+                &[],
+            ))
+        }
+        .await
+        .map_err(ctx("Failed to list custom statuses"))
+    }
+
+    /// One page of satisfaction ratings from the last `days_back` days, optionally
+    /// filtered by `score`.
+    pub async fn list_satisfaction_ratings(
+        &self,
+        score: Option<&str>,
+        days_back: u64,
+        page: u64,
+        per_page: u64,
+    ) -> Result<Value> {
+        async {
+            if let Some(score) = score
+                && !SATISFACTION_SCORES.contains(&score)
+            {
+                bail!("Invalid score '{score}'. Allowed: {SATISFACTION_SCORES:?}");
+            }
+            let days = i64::try_from(days_back.min(MAX_DAYS_BACK))?;
+            let start = chrono::Duration::try_days(days)
+                .and_then(|d| chrono::Utc::now().checked_sub_signed(d))
+                .ok_or_else(|| anyhow!("days_back {days_back} is out of range"))?
+                .timestamp();
+            let per_page = per_page.min(100);
+            let mut params: Vec<(&str, &(dyn Display + Sync))> = vec![
+                ("start_time", &start),
+                ("page", &page),
+                ("per_page", &per_page),
+            ];
+            if let Some(score) = &score {
+                params.push(("score", score));
+            }
+            let data = self.api_get("satisfaction_ratings.json", &params).await?;
+            let ratings = pick_all(
+                &data,
+                "satisfaction_ratings",
+                &[
+                    "id",
+                    "score",
+                    "comment",
+                    "reason",
+                    "reason_id",
+                    "ticket_id",
+                    "requester_id",
+                    "assignee_id",
+                    "group_id",
+                    "created_at",
+                    "updated_at",
+                ],
+                &[],
+            );
+            Ok(json!({
+                "count": ratings.as_array().map_or(0, Vec::len),
+                "ratings": ratings,
+                "has_more": !data["next_page"].is_null(),
+            }))
+        }
+        .await
+        .map_err(ctx("Failed to list satisfaction ratings"))
+    }
 }
 
 #[cfg(test)]
@@ -236,6 +336,68 @@ mod tests {
         assert_eq!(out[0]["title"], "a");
         assert!(out[0].get("extra").is_none());
         assert_eq!(out[1]["id"], 2);
+    }
+
+    #[tokio::test]
+    async fn custom_statuses_are_trimmed_and_filtered_to_active() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/custom_statuses.json"))
+            .and(query_param("active", "true"))
+            .respond_with(json_page(
+                "custom_statuses",
+                json!([{"id": 1, "status_category": "open", "agent_label": "A", "active": true,
+                        "default": false, "raw_agent_label": "x"}]),
+                None,
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let out = client(&server).list_custom_statuses(true).await.unwrap();
+        assert_eq!(
+            out[0],
+            json!({"id": 1, "status_category": "open", "agent_label": "A", "end_user_label": null,
+                   "description": null, "active": true, "default": false})
+        );
+    }
+
+    #[tokio::test]
+    async fn satisfaction_ratings_send_score_and_start_time() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/satisfaction_ratings.json"))
+            .and(query_param("score", "bad_with_comment"))
+            .and(query_param("per_page", "100"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "satisfaction_ratings": [{"id": 1, "score": "bad", "ticket_id": 9, "url": "u"}],
+                "next_page": "https://x/next",
+            })))
+            .mount(&server)
+            .await;
+        let c = client(&server);
+        let out = c
+            .list_satisfaction_ratings(Some("bad_with_comment"), 30, 1, 500)
+            .await
+            .unwrap();
+        assert_eq!(out["count"], 1);
+        assert_eq!(out["has_more"], true);
+        assert_eq!(out["ratings"][0]["ticket_id"], 9);
+        assert!(out["ratings"][0].get("url").is_none());
+        let requests = server.received_requests().await.unwrap();
+        let start: i64 = requests[0]
+            .url
+            .query_pairs()
+            .find(|(k, _)| k == "start_time")
+            .unwrap()
+            .1
+            .parse()
+            .unwrap();
+        assert!((chrono::Utc::now().timestamp() - 30 * 86_400 - start).abs() < 60);
+        let err = c
+            .list_satisfaction_ratings(Some("great"), 30, 1, 25)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Invalid score 'great'"), "{err}");
     }
 
     #[tokio::test]

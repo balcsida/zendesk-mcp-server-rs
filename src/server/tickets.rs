@@ -232,6 +232,39 @@ struct UserTicketsParams {
     per_page: u64,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct CountTicketsParams {
+    /// ZQL query, e.g. 'type:ticket status:open'; leave out to count all tickets
+    query: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct SearchProblemTicketsParams {
+    /// Text the problem ticket's subject contains; leave out to list the most recently updated problems
+    text: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct OrganizationTicketsParams {
+    /// The organization ID
+    organization_id: u64,
+    #[serde(default = "page_1")]
+    page: u64,
+    /// Number of tickets per page (max 100)
+    #[serde(default = "per_page_25")]
+    per_page: u64,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct UpdateTicketTagsParams {
+    /// The ID of the ticket
+    ticket_id: u64,
+    /// Tags to add
+    add: Option<Vec<String>>,
+    /// Tags to remove (no commas)
+    remove: Option<Vec<String>>,
+}
+
 #[tool_router(router = ticket_router, vis = "pub(super)")]
 impl ZendeskServer {
     #[tool(
@@ -517,5 +550,72 @@ impl ZendeskServer {
     async fn get_job_status(&self, Parameters(p): Parameters<JobStatusParams>) -> CallToolResult {
         self.call_json(|c| async move { c.get_job_status(&p.job_id).await })
             .await
+    }
+
+    #[tool(
+        description = "Count tickets: all tickets, or those matching a ZQL query (include type:ticket, since a search counts users and organizations too). A cheap way to size a result set before searching. Counts above 100,000 are approximate and refreshed daily.",
+        annotations(read_only_hint = true)
+    )]
+    async fn count_tickets(&self, Parameters(p): Parameters<CountTicketsParams>) -> CallToolResult {
+        self.call_json(|c| async move { c.count_tickets(p.query.as_deref()).await })
+            .await
+    }
+
+    #[tool(
+        description = "List the followers and email CCs of a ticket (id, name, email, role). Requires the CCs and followers feature; update_ticket changes them.",
+        annotations(read_only_hint = true)
+    )]
+    async fn get_ticket_collaborators(
+        &self,
+        Parameters(p): Parameters<TicketIdParams>,
+    ) -> CallToolResult {
+        self.call_json(|c| async move { c.get_ticket_collaborators(p.ticket_id).await })
+            .await
+    }
+
+    #[tool(
+        description = "Find problem tickets, by text in the subject or, without text, the 100 most recently updated. Use it to find a problem to link incidents to via update_ticket's problem_id.",
+        annotations(read_only_hint = true)
+    )]
+    async fn search_problem_tickets(
+        &self,
+        Parameters(p): Parameters<SearchProblemTicketsParams>,
+    ) -> CallToolResult {
+        self.call_json(|c| async move { c.search_problem_tickets(p.text.as_deref()).await })
+            .await
+    }
+
+    #[tool(
+        description = "List the tickets of an organization with pagination, like get_tickets, with requester and assignee names",
+        annotations(read_only_hint = true)
+    )]
+    async fn get_organization_tickets(
+        &self,
+        Parameters(p): Parameters<OrganizationTicketsParams>,
+    ) -> CallToolResult {
+        self.call_json(|c| async move {
+            c.get_organization_tickets(p.organization_id, p.page, p.per_page)
+                .await
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Add and/or remove specific tags on a ticket and return its current tags. Unlike update_ticket's tags, which replaces the whole list, this changes only the tags given.",
+        annotations(destructive_hint = false, idempotent_hint = true)
+    )]
+    async fn update_ticket_tags(
+        &self,
+        Parameters(p): Parameters<UpdateTicketTagsParams>,
+    ) -> CallToolResult {
+        self.call_json(|c| async move {
+            c.update_ticket_tags(
+                p.ticket_id,
+                &p.add.unwrap_or_default(),
+                &p.remove.unwrap_or_default(),
+            )
+            .await
+        })
+        .await
     }
 }

@@ -542,6 +542,40 @@ Get tickets for a user by role.
 - `page` (integer, optional): Defaults to 1
 - `per_page` (integer, optional): Defaults to 25
 
+#### count_tickets
+
+Count all tickets, or those matching a ZQL query: a cheap way to size a result set before searching. Returns `count`, `refreshed_at` (only for the unfiltered count) and `query`. Counts above 100,000 are approximate and refreshed daily.
+
+- `query` (string, optional): ZQL query; include `type:ticket`, since a search also counts users and organizations
+
+#### get_ticket_collaborators
+
+List the followers and email CCs of a ticket as `{id, name, email, role}`. Requires the CCs and followers feature; `update_ticket` changes them.
+
+- `ticket_id` (integer)
+
+#### search_problem_tickets
+
+Find problem tickets to link incidents to via `update_ticket`'s `problem_id`. Returns `count` and `tickets` (id, subject, status, priority, requester_id, assignee_id, group_id and timestamps).
+
+- `text` (string, optional): Text the subject contains; without it, one page of the 100 most recently updated problems
+
+#### get_organization_tickets
+
+List the tickets of an organization, in the same shape as `get_tickets` (with `requester_name` and `assignee_name`).
+
+- `organization_id` (integer)
+- `page` (integer, optional): Defaults to 1
+- `per_page` (integer, optional): Max 100 (defaults to 25)
+
+#### update_ticket_tags
+
+Add and/or remove specific tags on a ticket and return its current tags. Unlike `update_ticket`'s `tags`, which replaces the whole list, this changes only the tags given.
+
+- `ticket_id` (integer)
+- `add` (array of strings, optional): Tags to add
+- `remove` (array of strings, optional): Tags to remove (no commas). At least one of `add` and `remove` is required.
+
 ### Search
 
 #### search
@@ -620,6 +654,12 @@ List all ticket fields (system and custom) with their types and valid options. N
 #### list_ticket_forms
 
 List all ticket forms and their associated field IDs. No inputs.
+
+#### list_custom_statuses
+
+List custom ticket statuses with `id`, `status_category`, `agent_label`, `end_user_label`, `description`, `active` and `default`. Maps the `custom_status_id` on tickets to labels; a ticket's `status` is only the category.
+
+- `active_only` (boolean, optional): Only active statuses (defaults to true)
 
 #### list_groups
 
@@ -705,3 +745,12 @@ Find tickets that breached SLA within a time period.
 #### get_sla_policies
 
 Get all SLA policies with their metric targets per priority level. No inputs.
+
+#### list_satisfaction_ratings
+
+List CSAT satisfaction ratings with `score`, `comment`, `reason`, `reason_id`, ticket, requester, assignee and group IDs and timestamps. Admin-only: agents get 403.
+
+- `score` (string, optional): `offered`, `unoffered`, `received`, `received_with_comment`, `received_without_comment`, `good`, `good_with_comment`, `good_without_comment`, `bad`, `bad_with_comment` or `bad_without_comment`
+- `days_back` (integer, optional): Only ratings from the last N days (defaults to 30)
+- `page` (integer, optional): Defaults to 1
+- `per_page` (integer, optional): Max 100 (defaults to 25)

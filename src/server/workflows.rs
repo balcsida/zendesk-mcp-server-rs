@@ -60,6 +60,27 @@ struct SlaBreachesParams {
     metric: Option<SlaMetric>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ListCustomStatusesParams {
+    /// Only active statuses (defaults to true)
+    #[serde(default = "default_true")]
+    active_only: bool,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct SatisfactionRatingsParams {
+    /// offered, unoffered, received, received_with_comment, received_without_comment, good, good_with_comment, good_without_comment, bad, bad_with_comment, bad_without_comment
+    score: Option<String>,
+    /// Only ratings from the last N days (default 30)
+    #[serde(default = "days_back_30")]
+    days_back: u64,
+    #[serde(default = "page_1")]
+    page: u64,
+    /// Ratings per page (max 100)
+    #[serde(default = "per_page_25")]
+    per_page: u64,
+}
+
 #[tool_router(router = workflows_router, vis = "pub(super)")]
 impl ZendeskServer {
     #[tool(
@@ -150,5 +171,32 @@ impl ZendeskServer {
     async fn get_sla_policies(&self) -> CallToolResult {
         self.call_json(|c| async move { c.get_sla_policies().await })
             .await
+    }
+
+    #[tool(
+        description = "List the custom ticket statuses with their labels and status category. Maps the custom_status_id on tickets to labels; a ticket's 'status' is only the category.",
+        annotations(read_only_hint = true)
+    )]
+    async fn list_custom_statuses(
+        &self,
+        Parameters(p): Parameters<ListCustomStatusesParams>,
+    ) -> CallToolResult {
+        self.call_json(|c| async move { c.list_custom_statuses(p.active_only).await })
+            .await
+    }
+
+    #[tool(
+        description = "List CSAT satisfaction ratings (score, comment, reason, ticket and agent IDs) from the last days_back days, optionally filtered by score. Admin-only: agents get 403.",
+        annotations(read_only_hint = true)
+    )]
+    async fn list_satisfaction_ratings(
+        &self,
+        Parameters(p): Parameters<SatisfactionRatingsParams>,
+    ) -> CallToolResult {
+        self.call_json(|c| async move {
+            c.list_satisfaction_ratings(p.score.as_deref(), p.days_back, p.page, p.per_page)
+                .await
+        })
+        .await
     }
 }
