@@ -1093,7 +1093,9 @@ async fn auth_sso_browser_interactive(subdomain: &str, auth_url: &str) -> Result
     let local_url = server.auth_url();
     println!("\nOpening browser for Zendesk login...");
     println!("If the browser doesn't open, visit: {local_url}\n");
-    open_in_default_browser(&local_url);
+    if !open_in_private_window(&local_url) {
+        open_in_default_browser(&local_url);
+    }
     println!("Waiting for authentication...");
     println!("Or paste the callback URL here and press Enter:");
     println!("(Press Ctrl+C to cancel)\n");

@@ -206,6 +206,11 @@ needed. Use it when you cannot register an OAuth client in Admin Center.
 If `ZENDESK_SUBDOMAIN` is already set, `mobile-auth` uses it directly instead of
 prompting (the subdomain is printed, since it is not a secret).
 
+SSO sign-in (from `mobile-auth`, or when the server starts with no saved token) opens a
+private/incognito window in Chrome, Firefox or Edge where one of those browsers is
+installed, so the mobile OAuth cookies stay separate from the operator's normal
+Zendesk session. It falls back to the system default browser otherwise.
+
 The access token has no refresh token, so sign in again when it expires.
 
 The token is saved to `~/.config/zendesk-mcp/mobile_token.json` (under
