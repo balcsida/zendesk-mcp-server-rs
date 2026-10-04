@@ -9,7 +9,7 @@ impl ZendeskClient {
             let data = self
                 .api_get(
                     &format!("tickets/{ticket_id}.json"),
-                    &[("include", &"users")],
+                    &[("include", &"users,groups,comment_count")],
                 )
                 .await?;
             let ticket = object(&data, "ticket")?;
@@ -26,23 +26,65 @@ impl ZendeskClient {
                     "requester_id",
                     "assignee_id",
                     "organization_id",
+                    "type",
+                    "tags",
+                    "group_id",
+                    "due_at",
+                    "ticket_form_id",
+                    "brand_id",
+                    "custom_status_id",
+                    "problem_id",
+                    "has_incidents",
+                    "is_public",
+                    "external_id",
+                    "followup_ids",
+                    "email_cc_ids",
+                    "follower_ids",
+                    "comment_count",
+                    "satisfaction_rating",
                 ],
-                &[],
+                &["tags"],
             );
+            out["channel"] = ticket["via"]["channel"].clone();
             out["custom_fields"] = custom_fields(ticket);
             out = with_user_names(out, ticket, &side_loaded_user_names(&data));
+            let group_name = ticket
+                .get("group_id")
+                .and_then(Value::as_u64)
+                .and_then(|id| {
+                    data.get("groups")?
+                        .as_array()?
+                        .iter()
+                        .find(|g| g.get("id").and_then(Value::as_u64) == Some(id))?
+                        .get("name")
+                        .cloned()
+                });
+            out["group_name"] = group_name.unwrap_or(Value::Null);
             Ok(out)
         }
         .await
         .map_err(ctx(format!("Failed to get ticket {ticket_id}")))
     }
 
-    pub async fn get_ticket_comments(&self, ticket_id: u64) -> Result<Value> {
+    /// `sort_order` must be `asc` or `desc`.
+    pub async fn get_ticket_comments(&self, ticket_id: u64, sort_order: &str) -> Result<Value> {
         async {
-            let comments = self
-                .get_paged(&format!("tickets/{ticket_id}/comments.json"), "comments")
+            if !["asc", "desc"].contains(&sort_order) {
+                bail!("Invalid sort_order '{sort_order}'. Allowed: [\"asc\", \"desc\"]");
+            }
+            let pages = self
+                .get_pages(
+                    &format!("tickets/{ticket_id}/comments.json"),
+                    &[("include", &"users"), ("sort_order", &sort_order)],
+                )
                 .await?;
-            let out = comments.iter().map(|c| {
+            let names: std::collections::HashMap<u64, String> =
+                pages.iter().flat_map(side_loaded_user_names).collect();
+            let comments = pages
+                .iter()
+                .filter_map(|p| p.get("comments").and_then(Value::as_array))
+                .flatten();
+            let out = comments.map(|c| {
                 let mut out = pick(
                     c,
                     &[
@@ -61,6 +103,13 @@ impl ZendeskClient {
                     &["id", "file_name", "content_url", "content_type", "size"],
                     &[],
                 );
+                if let Some(name) = c
+                    .get("author_id")
+                    .and_then(Value::as_u64)
+                    .and_then(|id| names.get(&id))
+                {
+                    out["author_name"] = json!(name);
+                }
                 out
             });
             Ok(Value::Array(out.collect()))
@@ -146,20 +195,35 @@ impl ZendeskClient {
         })
     }
 
+    /// `status`, when given, is set in the same update: new, open, pending, hold or solved.
     pub async fn post_comment(
         &self,
         ticket_id: u64,
         comment: &str,
         public: bool,
+        status: Option<&str>,
     ) -> Result<String> {
-        let body = json!({"ticket": {"comment": {
-            "html_body": markdown_to_html(comment),
-            "public": public,
-        }}});
-        self.api_put(&format!("tickets/{ticket_id}.json"), &body)
-            .await
-            .map_err(ctx(format!("Failed to post comment on ticket {ticket_id}")))?;
-        Ok(comment.to_string())
+        async {
+            if let Some(status) = status
+                && !["new", "open", "pending", "hold", "solved"].contains(&status)
+            {
+                bail!(
+                    "Invalid status '{status}'. Allowed: [\"new\", \"open\", \"pending\", \"hold\", \"solved\"]"
+                );
+            }
+            let mut body = json!({"ticket": {"comment": {
+                "html_body": markdown_to_html(comment),
+                "public": public,
+            }}});
+            if let Some(status) = status {
+                body["ticket"]["status"] = json!(status);
+            }
+            self.api_put(&format!("tickets/{ticket_id}.json"), &body)
+                .await?;
+            Ok(comment.to_string())
+        }
+        .await
+        .map_err(ctx(format!("Failed to post comment on ticket {ticket_id}")))
     }
 
     pub async fn get_tickets(
@@ -230,11 +294,37 @@ impl ZendeskClient {
 
     pub async fn create_ticket(&self, ticket: CreateTicket) -> Result<Value> {
         async {
+            if ticket.requester.is_some() && ticket.requester_id.is_some() {
+                bail!("Give either requester or requester_id, not both");
+            }
+            let mut comment = json!({"body": ticket.description});
+            if let Some(public) = ticket.public {
+                comment["public"] = json!(public);
+            }
             let mut body = json!({
                 "subject": ticket.subject,
-                "comment": {"body": ticket.description},
+                "comment": comment,
+            });
+            let email_ccs = ticket.email_ccs.map(|emails| {
+                emails
+                    .into_iter()
+                    .map(|e| json!({"user_email": e, "action": "put"}))
+                    .collect::<Vec<_>>()
             });
             let optional = [
+                ("requester", ticket.requester),
+                ("group_id", ticket.group_id.map(Value::from)),
+                ("ticket_form_id", ticket.ticket_form_id.map(Value::from)),
+                ("brand_id", ticket.brand_id.map(Value::from)),
+                ("problem_id", ticket.problem_id.map(Value::from)),
+                (
+                    "via_followup_source_id",
+                    ticket.via_followup_source_id.map(Value::from),
+                ),
+                ("custom_status_id", ticket.custom_status_id.map(Value::from)),
+                ("due_at", ticket.due_at.map(Value::from)),
+                ("external_id", ticket.external_id.map(Value::from)),
+                ("email_ccs", email_ccs.map(Value::from)),
                 ("requester_id", ticket.requester_id.map(Value::from)),
                 ("assignee_id", ticket.assignee_id.map(Value::from)),
                 ("priority", ticket.priority.map(Value::from)),
@@ -258,10 +348,16 @@ impl ZendeskClient {
 
     /// `fields` are the ticket attributes to set (subject, status, priority, type,
     /// assignee_id, requester_id, tags, custom_fields, due_at, ...). Null values are skipped.
+    /// `safe_update: true` requires `updated_stamp`; Zendesk answers 409 on a collision.
     pub async fn update_ticket(&self, ticket_id: u64, fields: Map<String, Value>) -> Result<Value> {
         async {
             let fields: Map<String, Value> =
                 fields.into_iter().filter(|(_, v)| !v.is_null()).collect();
+            if fields.get("safe_update") == Some(&json!(true))
+                && !fields.get("updated_stamp").is_some_and(Value::is_string)
+            {
+                bail!("safe_update requires updated_stamp (the ticket's current updated_at)");
+            }
             let data = self
                 .api_put(
                     &format!("tickets/{ticket_id}.json"),
@@ -425,7 +521,7 @@ impl ZendeskClient {
         .map_err(ctx(format!("Failed to merge tickets into {target_id}")))
     }
 
-    /// `role` must be one of `requested`, `assigned`, `ccd`.
+    /// `role` must be one of `requested`, `assigned`, `ccd`, `followed`.
     pub async fn get_user_tickets(
         &self,
         user_id: u64,
@@ -434,8 +530,10 @@ impl ZendeskClient {
         per_page: u64,
     ) -> Result<Value> {
         async {
-            if !["requested", "assigned", "ccd"].contains(&role) {
-                bail!("Invalid role '{role}'. Allowed: [\"assigned\", \"ccd\", \"requested\"]");
+            if !["requested", "assigned", "ccd", "followed"].contains(&role) {
+                bail!(
+                    "Invalid role '{role}'. Allowed: [\"assigned\", \"ccd\", \"followed\", \"requested\"]"
+                );
             }
             let per_page = per_page.min(100);
             let data = self
@@ -643,6 +741,12 @@ mod tests {
                 "id": 7, "subject": "s", "description": "d", "status": "open",
                 "priority": null, "created_at": "c", "updated_at": "u",
                 "requester_id": 1, "assignee_id": null, "organization_id": 3,
+                "type": null, "tags": [], "group_id": null, "due_at": null,
+                "ticket_form_id": null, "brand_id": null, "custom_status_id": null,
+                "problem_id": null, "has_incidents": null, "is_public": null,
+                "external_id": null, "followup_ids": null, "email_cc_ids": null,
+                "follower_ids": null, "comment_count": null, "channel": null,
+                "satisfaction_rating": null, "group_name": null,
                 "custom_fields": [{"id": 9, "value": "x"}]
             })
         );
@@ -653,7 +757,7 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/v2/tickets/7.json"))
-            .and(query_param("include", "users"))
+            .and(query_param("include", "users,groups,comment_count"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "ticket": {
                     "id": 7, "subject": "s", "description": "d", "status": "open",
@@ -670,6 +774,31 @@ mod tests {
         let out = client(&server).get_ticket(7).await.unwrap();
         assert_eq!(out["requester_name"], "Alice");
         assert_eq!(out["assignee_name"], "Bob");
+    }
+
+    #[tokio::test]
+    async fn get_ticket_adds_group_name_channel_and_extra_fields() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/tickets/7.json"))
+            .and(query_param("include", "users,groups,comment_count"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ticket": {
+                    "id": 7, "group_id": 4, "type": "incident", "tags": ["a", "b"],
+                    "via": {"channel": "email"}, "comment_count": 3, "is_public": true,
+                    "email_cc_ids": [8], "satisfaction_rating": {"score": "good"}
+                },
+                "groups": [{"id": 3, "name": "Other"}, {"id": 4, "name": "Support"}]
+            })))
+            .mount(&server)
+            .await;
+        let out = client(&server).get_ticket(7).await.unwrap();
+        assert_eq!(out["group_name"], "Support");
+        assert_eq!(out["channel"], "email");
+        assert_eq!(out["tags"], json!(["a", "b"]));
+        assert_eq!(out["comment_count"], 3);
+        assert_eq!(out["email_cc_ids"], json!([8]));
+        assert_eq!(out["satisfaction_rating"], json!({"score": "good"}));
     }
 
     #[tokio::test]
@@ -712,12 +841,40 @@ mod tests {
             })))
             .mount(&server)
             .await;
-        let out = client(&server).get_ticket_comments(5).await.unwrap();
+        let out = client(&server)
+            .get_ticket_comments(5, "desc")
+            .await
+            .unwrap();
         let comments = out.as_array().unwrap();
         assert_eq!(comments.len(), 2);
+        let requests = server.received_requests().await.unwrap();
+        let first: std::collections::HashMap<_, _> = requests[0].url.query_pairs().collect();
+        assert_eq!(first["include"], "users");
+        assert_eq!(first["sort_order"], "desc");
+        assert_eq!(requests[1].url.query(), Some("page=2"));
         assert_eq!(comments[0]["attachments"][0]["file_name"], "a.png");
         assert_eq!(comments[1]["attachments"], json!([]));
         assert_eq!(comments[1]["public"], false);
+    }
+
+    #[tokio::test]
+    async fn get_ticket_comments_adds_author_names_and_rejects_bad_sort_order() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/tickets/5/comments.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "comments": [{"id": 1, "author_id": 1}, {"id": 2, "author_id": 9}],
+                "users": [{"id": 1, "name": "Ann"}],
+                "next_page": null
+            })))
+            .mount(&server)
+            .await;
+        let c = client(&server);
+        let out = c.get_ticket_comments(5, "asc").await.unwrap();
+        assert_eq!(out[0]["author_name"], "Ann");
+        assert!(out[1].get("author_name").is_none());
+        let err = c.get_ticket_comments(5, "up").await.unwrap_err();
+        assert!(err.to_string().contains("Invalid sort_order 'up'"), "{err}");
     }
 
     #[tokio::test]
@@ -754,7 +911,7 @@ mod tests {
             .mount(&server)
             .await;
         let out = client(&server)
-            .post_comment(3, "a\nb", false)
+            .post_comment(3, "a\nb", false, Some("pending"))
             .await
             .unwrap();
         assert_eq!(out, "a\nb");
@@ -763,6 +920,100 @@ mod tests {
         let comment = &body["ticket"]["comment"];
         assert!(comment["html_body"].as_str().unwrap().contains("<br"));
         assert_eq!(comment["public"], false);
+        assert_eq!(body["ticket"]["status"], "pending");
+    }
+
+    #[tokio::test]
+    async fn post_comment_rejects_unknown_status() {
+        let err = offline_client()
+            .post_comment(3, "x", true, Some("closed"))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Invalid status 'closed'"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn create_ticket_sends_requester_email_ccs_and_private_comment() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v2/tickets.json"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({"ticket": {
+                "id": 1, "group_id": 5, "problem_id": 2, "external_id": "e"
+            }})))
+            .mount(&server)
+            .await;
+        let c = client(&server);
+        let out = c
+            .create_ticket(CreateTicket {
+                subject: "s".into(),
+                description: "d".into(),
+                requester: Some(json!({"name": "Ann", "email": "ann@example.com"})),
+                email_ccs: Some(vec!["cc@example.com".into()]),
+                public: Some(false),
+                group_id: Some(5),
+                problem_id: Some(2),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(out["group_id"], 5);
+        assert_eq!(out["problem_id"], 2);
+        assert_eq!(out["external_id"], "e");
+        let requests = server.received_requests().await.unwrap();
+        let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+        let ticket = &body["ticket"];
+        assert_eq!(ticket["comment"], json!({"body": "d", "public": false}));
+        assert_eq!(ticket["requester"]["email"], "ann@example.com");
+        assert_eq!(
+            ticket["email_ccs"],
+            json!([{"user_email": "cc@example.com", "action": "put"}])
+        );
+        assert_eq!(ticket["group_id"], 5);
+        assert!(ticket.get("requester_id").is_none());
+
+        let err = c
+            .create_ticket(CreateTicket {
+                requester: Some(json!({"email": "a@example.com"})),
+                requester_id: Some(1),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not both"), "{err}");
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn update_ticket_sends_email_ccs_and_safe_update() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/api/v2/tickets/4.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ticket": {"id": 4}})))
+            .mount(&server)
+            .await;
+        let c = client(&server);
+        let fields = |v: Value| v.as_object().unwrap().clone();
+        c.update_ticket(
+            4,
+            fields(json!({
+                "email_ccs": [{"user_email": "cc@example.com", "action": "delete"}],
+                "safe_update": true,
+                "updated_stamp": "2026-01-01T00:00:00Z",
+            })),
+        )
+        .await
+        .unwrap();
+        let requests = server.received_requests().await.unwrap();
+        let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["ticket"]["safe_update"], true);
+        assert_eq!(body["ticket"]["updated_stamp"], "2026-01-01T00:00:00Z");
+        assert_eq!(body["ticket"]["email_ccs"][0]["action"], "delete");
+
+        let err = c
+            .update_ticket(4, fields(json!({"safe_update": true})))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("requires updated_stamp"), "{err}");
     }
 
     #[test]
@@ -887,10 +1138,26 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            err.to_string()
-                .contains("Invalid role 'foo'. Allowed: [\"assigned\", \"ccd\", \"requested\"]"),
+            err.to_string().contains(
+                "Invalid role 'foo'. Allowed: [\"assigned\", \"ccd\", \"followed\", \"requested\"]"
+            ),
             "{err}"
         );
+    }
+
+    #[tokio::test]
+    async fn get_user_tickets_accepts_followed() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/users/2/tickets/followed.json"))
+            .respond_with(json_page("tickets", json!([{"id": 1}]), None))
+            .mount(&server)
+            .await;
+        let out = client(&server)
+            .get_user_tickets(2, "followed", 1, 25)
+            .await
+            .unwrap();
+        assert_eq!(out["tickets"][0]["id"], 1);
     }
 
     #[tokio::test]

@@ -152,6 +152,9 @@ pub(super) fn sort_by_relevance() -> String {
 pub(super) fn sort_desc() -> String {
     "desc".into()
 }
+pub(super) fn sort_asc() -> String {
+    "asc".into()
+}
 pub(super) fn role_requested() -> String {
     "requested".into()
 }

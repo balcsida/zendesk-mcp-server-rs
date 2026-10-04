@@ -431,7 +431,7 @@ Retrieve a Zendesk ticket by its ID.
 
 - `ticket_id` (integer)
 
-Includes `requester_name` and `assignee_name` when Zendesk returns the users.
+Includes `requester_name` and `assignee_name` when Zendesk returns the users, and `group_name` for the ticket's group. Also returns `type`, `tags`, `group_id`, `due_at`, `ticket_form_id`, `brand_id`, `custom_status_id`, `problem_id`, `has_incidents`, `is_public`, `external_id`, `followup_ids`, `email_cc_ids`, `follower_ids`, `comment_count`, `channel` (how the ticket was created, e.g. `email`) and `satisfaction_rating` (as Zendesk returns it, or null).
 
 #### get_tickets_bulk
 
@@ -441,9 +441,10 @@ Fetch multiple tickets by IDs, requested from Zendesk in batches of 100.
 
 #### get_ticket_comments
 
-Retrieve all comments for a ticket.
+Retrieve all comments for a ticket. Each comment has `author_id` and, when Zendesk returns the user, `author_name`.
 
 - `ticket_id` (integer)
+- `sort_order` (string, optional): `asc` or `desc` (defaults to `asc`)
 
 #### create_ticket_comment
 
@@ -452,6 +453,7 @@ Create a new comment on an existing ticket.
 - `ticket_id` (integer)
 - `comment` (string): Markdown, plain text and HTML are accepted
 - `public` (boolean, optional): Whether the comment is public (defaults to true)
+- `status` (string, optional): Also set the ticket status in the same update: `new`, `open`, `pending`, `hold`, `solved`. The result text mentions it.
 
 #### get_ticket_attachment
 
@@ -466,11 +468,24 @@ Create a new ticket.
 - `subject` (string)
 - `description` (string)
 - `requester_id` (integer, optional)
+- `requester` (object, optional): `{name, email}`; creates the end user if needed. Not allowed together with `requester_id`
 - `assignee_id` (integer, optional)
 - `priority` (string, optional): `low`, `normal`, `high`, `urgent`
 - `type` (string, optional): `problem`, `incident`, `question`, `task`
 - `tags` (array[string], optional)
 - `custom_fields` (array[object], optional)
+- `group_id` (integer, optional)
+- `ticket_form_id` (integer, optional)
+- `brand_id` (integer, optional)
+- `problem_id` (integer, optional): Links this incident to a problem ticket
+- `via_followup_source_id` (integer, optional): The closed ticket this ticket follows up
+- `custom_status_id` (integer, optional)
+- `due_at` (string, optional): ISO 8601 datetime
+- `external_id` (string, optional)
+- `public` (boolean, optional): Whether the description is a public comment; `false` makes it an internal note (defaults to true)
+- `email_ccs` (array[string], optional): Email addresses to add as CCs
+
+The created ticket also reports `group_id`, `ticket_form_id`, `brand_id`, `custom_status_id`, `problem_id`, `due_at` and `external_id`.
 
 #### update_ticket
 
@@ -486,6 +501,14 @@ Update fields on an existing ticket (for example status, priority, assignee).
 - `tags` (array[string], optional)
 - `custom_fields` (array[object], optional)
 - `due_at` (string, optional): ISO8601 datetime
+- `group_id` (integer, optional)
+- `custom_status_id` (integer, optional)
+- `problem_id` (integer, optional)
+- `external_id` (string, optional)
+- `email_ccs` (array[object], optional): CCs to add or remove, each `{user_id or user_email, action}` with `action` `put` or `delete`
+- `followers` (array[object], optional): Followers to add or remove, each `{user_id, action}` with `action` `put` or `delete`
+- `safe_update` (boolean, optional): Avoid overwriting concurrent changes: Zendesk answers 409 if the ticket changed since `updated_stamp`
+- `updated_stamp` (string, optional): The ticket's current `updated_at` (from `get_ticket`); required when `safe_update` is true
 
 #### delete_ticket
 
@@ -515,7 +538,7 @@ Get the status of a Zendesk background job, such as a merge that was still runni
 Get tickets for a user by role.
 
 - `user_id` (integer)
-- `role` (string, optional): `requested`, `assigned` or `ccd` (defaults to `requested`)
+- `role` (string, optional): `requested`, `assigned`, `ccd` or `followed` (defaults to `requested`)
 - `page` (integer, optional): Defaults to 1
 - `per_page` (integer, optional): Defaults to 25
 

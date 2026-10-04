@@ -1,4 +1,41 @@
+use serde::Serialize;
+
 use super::*;
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct RequesterParams {
+    /// Requester name
+    name: String,
+    /// Requester email address
+    email: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+enum ListAction {
+    Put,
+    Delete,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct EmailCcChange {
+    /// ID of the agent or end user (give this or user_email)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user_id: Option<u64>,
+    /// Email address of the agent or end user (give this or user_id)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user_email: Option<String>,
+    /// put adds the CC, delete removes it
+    action: ListAction,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct FollowerChange {
+    /// ID of the agent
+    user_id: u64,
+    /// put adds the follower, delete removes it
+    action: ListAction,
+}
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct TicketIdParams {
@@ -13,6 +50,8 @@ struct CreateTicketParams {
     /// Ticket description
     description: String,
     requester_id: Option<u64>,
+    /// Requester as {name, email}; the end user is created if needed. Not together with requester_id.
+    requester: Option<RequesterParams>,
     assignee_id: Option<u64>,
     /// low, normal, high, urgent
     priority: Option<String>,
@@ -21,6 +60,36 @@ struct CreateTicketParams {
     ticket_type: Option<String>,
     tags: Option<Vec<String>>,
     custom_fields: Option<Vec<serde_json::Map<String, Value>>>,
+    /// The group to assign the ticket to
+    group_id: Option<u64>,
+    /// The ticket form to use
+    ticket_form_id: Option<u64>,
+    /// The brand the ticket belongs to
+    brand_id: Option<u64>,
+    /// For an incident, the ID of the problem ticket it is linked to
+    problem_id: Option<u64>,
+    /// The ID of the closed ticket this ticket follows up
+    via_followup_source_id: Option<u64>,
+    /// The custom ticket status ID
+    custom_status_id: Option<u64>,
+    /// Due date (ISO 8601), for tickets of type task
+    due_at: Option<String>,
+    /// An ID linking the ticket to a record in another system
+    external_id: Option<String>,
+    /// Whether the description is a public comment; false makes it an internal note
+    #[serde(default = "default_true")]
+    public: bool,
+    /// Email addresses to add as CCs
+    email_ccs: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct TicketCommentsParams {
+    /// The ID of the ticket
+    ticket_id: u64,
+    /// asc (oldest first) or desc (newest first)
+    #[serde(default = "sort_asc")]
+    sort_order: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -48,6 +117,8 @@ struct CreateCommentParams {
     /// Whether the comment should be public
     #[serde(default = "default_true")]
     public: bool,
+    /// Also set the ticket status in the same update: new, open, pending, hold, solved
+    status: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -73,6 +144,22 @@ struct UpdateTicketParams {
     custom_fields: Option<Vec<serde_json::Map<String, Value>>>,
     /// ISO8601 datetime
     due_at: Option<String>,
+    /// The group to assign the ticket to
+    group_id: Option<u64>,
+    /// The custom ticket status ID
+    custom_status_id: Option<u64>,
+    /// For an incident, the ID of the problem ticket it is linked to
+    problem_id: Option<u64>,
+    /// An ID linking the ticket to a record in another system
+    external_id: Option<String>,
+    /// CCs to add or remove, e.g. [{"user_email": "a@example.com", "action": "put"}]
+    email_ccs: Option<Vec<EmailCcChange>>,
+    /// Followers to add or remove, e.g. [{"user_id": 1, "action": "delete"}]
+    followers: Option<Vec<FollowerChange>>,
+    /// Fail with a conflict instead of overwriting changes made since updated_stamp
+    safe_update: Option<bool>,
+    /// The ticket's current updated_at; required when safe_update is true
+    updated_stamp: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -136,7 +223,7 @@ struct JobStatusParams {
 struct UserTicketsParams {
     /// The user ID
     user_id: u64,
-    /// requested, assigned, or ccd
+    /// requested, assigned, ccd, or followed
     #[serde(default = "role_requested")]
     role: String,
     #[serde(default = "page_1")]
@@ -148,7 +235,7 @@ struct UserTicketsParams {
 #[tool_router(router = ticket_router, vis = "pub(super)")]
 impl ZendeskServer {
     #[tool(
-        description = "Retrieve a Zendesk ticket by its ID",
+        description = "Retrieve a Zendesk ticket by its ID, including type, tags, group, due date, form, brand, custom status, CC and follower IDs, comment count, channel and satisfaction rating",
         annotations(read_only_hint = true)
     )]
     async fn get_ticket(&self, Parameters(p): Parameters<TicketIdParams>) -> CallToolResult {
@@ -157,7 +244,7 @@ impl ZendeskServer {
     }
 
     #[tool(
-        description = "Create a new Zendesk ticket",
+        description = "Create a new Zendesk ticket. The requester can be an existing user (requester_id) or {name, email} (created if needed). Set public=false to make the description an internal note.",
         annotations(destructive_hint = false)
     )]
     async fn create_ticket(&self, Parameters(p): Parameters<CreateTicketParams>) -> CallToolResult {
@@ -166,6 +253,9 @@ impl ZendeskServer {
                 subject: p.subject,
                 description: p.description,
                 requester_id: p.requester_id,
+                requester: p
+                    .requester
+                    .map(|r| json!({"name": r.name, "email": r.email})),
                 assignee_id: p.assignee_id,
                 priority: p.priority,
                 ticket_type: p.ticket_type,
@@ -173,6 +263,16 @@ impl ZendeskServer {
                 custom_fields: p
                     .custom_fields
                     .map(|f| f.into_iter().map(Value::Object).collect()),
+                group_id: p.group_id,
+                ticket_form_id: p.ticket_form_id,
+                brand_id: p.brand_id,
+                problem_id: p.problem_id,
+                via_followup_source_id: p.via_followup_source_id,
+                custom_status_id: p.custom_status_id,
+                due_at: p.due_at,
+                external_id: p.external_id,
+                public: Some(p.public),
+                email_ccs: p.email_ccs,
             };
             let created = c.create_ticket(ticket).await?;
             Ok(wrapped("Ticket created successfully", "ticket", created))
@@ -193,19 +293,19 @@ impl ZendeskServer {
     }
 
     #[tool(
-        description = "Retrieve all comments for a Zendesk ticket by its ID",
+        description = "Retrieve all comments for a Zendesk ticket by its ID, oldest first unless sort_order is desc. Each comment has author_id and, when known, author_name.",
         annotations(read_only_hint = true)
     )]
     async fn get_ticket_comments(
         &self,
-        Parameters(p): Parameters<TicketIdParams>,
+        Parameters(p): Parameters<TicketCommentsParams>,
     ) -> CallToolResult {
-        self.call_json(|c| async move { c.get_ticket_comments(p.ticket_id).await })
+        self.call_json(|c| async move { c.get_ticket_comments(p.ticket_id, &p.sort_order).await })
             .await
     }
 
     #[tool(
-        description = "Create a new comment on an existing Zendesk ticket",
+        description = "Create a new comment on an existing Zendesk ticket. Set status to also change the ticket status in the same call, e.g. reply and set it pending.",
         annotations(destructive_hint = false)
     )]
     async fn create_ticket_comment(
@@ -213,9 +313,15 @@ impl ZendeskServer {
         Parameters(p): Parameters<CreateCommentParams>,
     ) -> CallToolResult {
         self.call(|c| async move {
-            let comment = c.post_comment(p.ticket_id, &p.comment, p.public).await?;
+            let comment = c
+                .post_comment(p.ticket_id, &p.comment, p.public, p.status.as_deref())
+                .await?;
+            let status_note = p
+                .status
+                .map(|s| format!(" (ticket status set to {s})"))
+                .unwrap_or_default();
             Ok(ContentBlock::text(format!(
-                "Comment created successfully: {comment}"
+                "Comment created successfully{status_note}: {comment}"
             )))
         })
         .await
@@ -241,7 +347,7 @@ impl ZendeskServer {
     }
 
     #[tool(
-        description = "Update fields on an existing Zendesk ticket (e.g., status, priority, assignee_id)",
+        description = "Update fields on an existing Zendesk ticket (e.g., status, priority, assignee_id, group_id), and add or remove CCs and followers. To avoid overwriting concurrent changes, set safe_update=true with updated_stamp (the ticket's updated_at from get_ticket): Zendesk then rejects the update with a 409 conflict if the ticket changed in the meantime.",
         annotations(destructive_hint = false, idempotent_hint = true)
     )]
     async fn update_ticket(&self, Parameters(p): Parameters<UpdateTicketParams>) -> CallToolResult {
@@ -265,6 +371,14 @@ impl ZendeskServer {
                     .map(|f| Value::Array(f.into_iter().map(Value::Object).collect())),
             );
             set("due_at", p.due_at.map(Value::from));
+            set("group_id", p.group_id.map(Value::from));
+            set("custom_status_id", p.custom_status_id.map(Value::from));
+            set("problem_id", p.problem_id.map(Value::from));
+            set("external_id", p.external_id.map(Value::from));
+            set("email_ccs", p.email_ccs.map(|v| json!(v)));
+            set("followers", p.followers.map(|v| json!(v)));
+            set("safe_update", p.safe_update.map(Value::from));
+            set("updated_stamp", p.updated_stamp.map(Value::from));
             let updated = c.update_ticket(p.ticket_id, fields).await?;
             Ok(wrapped("Ticket updated successfully", "ticket", updated))
         })
@@ -337,7 +451,7 @@ impl ZendeskServer {
     }
 
     #[tool(
-        description = "Get tickets for a specific user by role (requested, assigned, or ccd)",
+        description = "Get tickets for a specific user by role (requested, assigned, ccd, or followed)",
         annotations(read_only_hint = true)
     )]
     async fn get_user_tickets(

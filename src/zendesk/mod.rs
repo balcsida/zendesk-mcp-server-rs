@@ -64,6 +64,19 @@ pub struct CreateTicket {
     pub ticket_type: Option<String>,
     pub tags: Option<Vec<String>>,
     pub custom_fields: Option<Vec<Value>>,
+    pub group_id: Option<u64>,
+    pub ticket_form_id: Option<u64>,
+    pub brand_id: Option<u64>,
+    pub problem_id: Option<u64>,
+    pub via_followup_source_id: Option<u64>,
+    pub custom_status_id: Option<u64>,
+    pub due_at: Option<String>,
+    pub external_id: Option<String>,
+    /// Whether the description is a public comment; Zendesk defaults to public.
+    pub public: Option<bool>,
+    /// `{name, email}` of the requester, created as an end user if needed.
+    pub requester: Option<Value>,
+    pub email_ccs: Option<Vec<String>>,
 }
 
 #[derive(Clone)]
@@ -132,6 +145,13 @@ pub(super) fn full_ticket(data: &Value) -> Result<Value> {
             "assignee_id",
             "organization_id",
             "tags",
+            "group_id",
+            "ticket_form_id",
+            "brand_id",
+            "custom_status_id",
+            "problem_id",
+            "due_at",
+            "external_id",
         ],
         &["tags"],
     );
@@ -425,23 +445,49 @@ impl ZendeskClient {
 
     /// Collect `key` from a listing, following the absolute `next_page` URLs until null.
     pub(super) async fn get_paged(&self, path: &str, key: &str) -> Result<Vec<Value>> {
-        let mut items = Vec::new();
-        let mut url = self.url(path, &[])?;
+        self.get_paged_with(path, &[], key).await
+    }
+
+    /// `get_paged` with query `params` on the first request; `next_page` links are
+    /// followed unchanged.
+    pub(super) async fn get_paged_with(
+        &self,
+        path: &str,
+        params: &[(&str, &(dyn Display + Sync))],
+        key: &str,
+    ) -> Result<Vec<Value>> {
+        let pages = self.get_pages(path, params).await?;
+        Ok(pages
+            .iter()
+            .filter_map(|data| data.get(key).and_then(Value::as_array))
+            .flatten()
+            .cloned()
+            .collect())
+    }
+
+    /// Every page of a listing as returned by Zendesk, so callers can read side-loads.
+    pub(super) async fn get_pages(
+        &self,
+        path: &str,
+        params: &[(&str, &(dyn Display + Sync))],
+    ) -> Result<Vec<Value>> {
+        let mut pages = Vec::new();
+        let mut url = self.url(path, params)?;
         let mut seen = HashSet::from([url.to_string()]);
         loop {
             let data = self.get_url(url).await?;
-            if let Some(page) = data.get(key).and_then(Value::as_array) {
-                items.extend(page.iter().cloned());
-            }
-            let Some(link) = data.get("next_page").and_then(Value::as_str) else {
-                break;
-            };
-            match self.next_page(&mut seen, link)? {
+            let link = data
+                .get("next_page")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            pages.push(data);
+            let Some(link) = link else { break };
+            match self.next_page(&mut seen, &link)? {
                 Some(next) => url = next,
                 None => break,
             }
         }
-        Ok(items)
+        Ok(pages)
     }
 
     /// One page of a cursor-paginated listing; `page_size` is capped at 100.
@@ -648,7 +694,10 @@ mod tests {
             ))
             .mount(&server)
             .await;
-        let err = client(&server).get_ticket_comments(1).await.unwrap_err();
+        let err = client(&server)
+            .get_ticket_comments(1, "asc")
+            .await
+            .unwrap_err();
         assert!(
             err.to_string()
                 .contains("next_page link on another host: evil.example"),
@@ -674,7 +723,10 @@ mod tests {
             ))
             .mount(&server)
             .await;
-        let err = client(&server).get_ticket_comments(1).await.unwrap_err();
+        let err = client(&server)
+            .get_ticket_comments(1, "asc")
+            .await
+            .unwrap_err();
         assert!(
             err.to_string()
                 .contains("Zendesk pagination returned a page it already returned"),
