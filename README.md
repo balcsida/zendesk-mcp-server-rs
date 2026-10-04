@@ -139,7 +139,7 @@ telling the operator to re-run `zendesk-mcp-server auth`.
 
 ### Choosing scopes
 
-The default scopes cover every tool this server exposes:
+The default scopes cover the documented tool families this server exposes:
 
 | Scope | Needed for |
 | --- | --- |
@@ -149,6 +149,11 @@ The default scopes cover every tool this server exposes:
 | `users:write` | creating or updating users |
 | `organizations:write` | updating organizations |
 | `hc:write` | creating or editing Help Center articles |
+
+A few operations have no documented narrow scope: `recover_suspended_ticket`,
+`restore_deleted_ticket`, `search_problem_tickets` with `text` and
+`search_custom_object_records` with a `filter`. If one of them answers 403, add the
+broad `write` scope to `ZENDESK_OAUTH_SCOPES` (reads stay covered by `read`).
 
 `read` alone is the read-only configuration. Zendesk gives search, job statuses
 and ticket audits no narrow read scope (`tickets:read` is not enough for audits),
@@ -450,17 +455,17 @@ Retrieve all comments for a ticket. Each comment has `author_id` and, when Zende
 
 #### create_ticket_comment
 
-Create a new comment on an existing ticket. Returns `{"message": "Comment created", "comment": {"id", "public", "status"}}`; `id` is the new comment's ID (null if Zendesk's audit did not list it) and `status` appears only when you set one.
+Create a new comment on an existing ticket. Public by default, which emails the requester; set `public` to false for an internal note. Returns `{"message": "Comment created", "comment": {"id", "public", "status"}}`; `id` is the new comment's ID (null if Zendesk's audit did not list it) and `status` appears only when you set one.
 
 - `ticket_id` (integer)
 - `comment` (string): Markdown, plain text and HTML are accepted
 - `public` (boolean, optional): Whether the comment is public (defaults to true)
-- `status` (string, optional): Also set the ticket status in the same update: `new`, `open`, `pending`, `hold`, `solved`
+- `status` (string, optional): Also set the ticket status in the same update: `new`, `open`, `pending`, `hold`, `solved`, `closed`
 - `upload_tokens` (array of strings, optional): Tokens from `upload_attachment` to attach to the comment
 
 #### get_ticket_attachment
 
-Fetch a ticket attachment by its `content_url` and return the file as base64-encoded data.
+Fetch a ticket attachment by its `content_url` and return it as an image. Images only (JPEG, PNG, GIF, WebP, up to 10 MB); other types are rejected.
 
 - `content_url` (string): The `content_url` from `get_ticket_comments`
 
@@ -484,7 +489,7 @@ Create a new ticket.
 - `priority` (string, optional): `low`, `normal`, `high`, `urgent`
 - `type` (string, optional): `problem`, `incident`, `question`, `task`
 - `tags` (array[string], optional)
-- `custom_fields` (array[object], optional)
+- `custom_fields` (array[object], optional): `[{"id": 1, "value": "x"}]`
 - `group_id` (integer, optional)
 - `ticket_form_id` (integer, optional)
 - `brand_id` (integer, optional)
@@ -505,13 +510,13 @@ Update fields on an existing ticket (for example status, priority, assignee).
 
 - `ticket_id` (integer)
 - `subject` (string, optional)
-- `status` (string, optional): `new`, `open`, `pending`, `on-hold`, `solved`, `closed`
+- `status` (string, optional): `new`, `open`, `pending`, `hold`, `solved`, `closed`
 - `priority` (string, optional): `low`, `normal`, `high`, `urgent`
-- `type` (string, optional)
+- `type` (string, optional): `problem`, `incident`, `question`, `task`
 - `assignee_id` (integer, optional)
 - `requester_id` (integer, optional)
-- `tags` (array[string], optional)
-- `custom_fields` (array[object], optional)
+- `tags` (array[string], optional): Replaces ALL tags on the ticket; use `update_ticket_tags` to add or remove individual tags
+- `custom_fields` (array[object], optional): `[{"id": 1, "value": "x"}]`
 - `due_at` (string, optional): ISO8601 datetime
 - `group_id` (integer, optional)
 - `custom_status_id` (integer, optional)
@@ -524,7 +529,7 @@ Update fields on an existing ticket (for example status, priority, assignee).
 
 #### delete_ticket
 
-Permanently delete a ticket. Use with caution.
+Soft-delete a ticket. It is recoverable for 30 days with `restore_deleted_ticket` (see `list_deleted_tickets`). Needs permission to delete tickets.
 
 - `ticket_id` (integer)
 
@@ -533,26 +538,26 @@ Permanently delete a ticket. Use with caution.
 Merge source tickets into a target ticket. Zendesk merges in a background job; the tool waits up to 20 seconds and reports whether it completed or is still running (use `get_job_status` to check later).
 
 - `target_id` (integer): The ticket to merge into
-- `source_ids` (array[integer]): Tickets to merge from
-- `target_comment` (string, optional): Defaults to `Merged from related tickets.`
-- `source_comment` (string, optional): Defaults to `This ticket has been merged.`
+- `source_ids` (array[integer]): Tickets to merge from; at least one, no duplicates, not the target
+- `target_comment` (string, optional): Private unless `target_comment_is_public` is true (defaults to `Merged from related tickets.`)
+- `source_comment` (string, optional): Private unless `source_comment_is_public` is true (defaults to `This ticket has been merged.`)
 - `target_comment_is_public` (boolean, optional): Whether the comment on the target ticket is public (Zendesk defaults to private)
 - `source_comment_is_public` (boolean, optional): Whether the comments on the source tickets are public (Zendesk defaults to private)
 
 #### get_job_status
 
-Get the status of a Zendesk background job, such as a merge or `update_tickets_bulk` that was still running. Returns `id`, `status`, `progress`, `total`, `message`, `url`, `pending` (true while queued or working) and per-item `results`.
+Get the status of a Zendesk background job, such as a merge or `update_tickets_bulk` that was still running. Returns `id`, `status`, `progress`, `total`, `message`, `url`, `pending` (true while queued or working), `failed_count` (items whose `success` is false) and per-item `results`. When `merge_tickets` or `update_tickets_bulk` cannot poll the job (for example a rate limit), they return the last known status with `pending: true` and a `poll_error`; call `get_job_status` later.
 
 - `job_id` (string): The job status ID returned by `merge_tickets`, `update_tickets_bulk` or another bulk operation
 
 #### get_user_tickets
 
-Get tickets for a user by role.
+Get tickets for a user by role. Returns `count`, `tickets` (id, subject, status, priority, created_at, updated_at) and `has_more`.
 
 - `user_id` (integer)
 - `role` (string, optional): `requested`, `assigned`, `ccd` or `followed` (defaults to `requested`)
 - `page` (integer, optional): Defaults to 1
-- `per_page` (integer, optional): Defaults to 25
+- `per_page` (integer, optional): Max 100 (defaults to 25)
 
 #### count_tickets
 
@@ -562,7 +567,7 @@ Count all tickets, or those matching a ZQL query: a cheap way to size a result s
 
 #### get_ticket_collaborators
 
-List the followers and email CCs of a ticket as `{id, name, email, role}`. Requires the CCs and followers feature; `update_ticket` changes them.
+List the followers and email CCs of a ticket as `{id, name, email, role}`. Requires the CCs and followers feature; `update_ticket` changes them. If the email CCs request fails (the feature is off), the CCs come from Zendesk's collaborators endpoint instead and `source` is `collaborators` (otherwise `email_ccs`).
 
 - `ticket_id` (integer)
 
@@ -574,7 +579,7 @@ Find problem tickets to link incidents to via `update_ticket`'s `problem_id`. Re
 
 #### get_organization_tickets
 
-List the tickets of an organization, in the same shape as `get_tickets` (with `requester_name` and `assignee_name`).
+List the tickets of an organization one page at a time. Returns `count`, `tickets` (id, subject, status, priority, description, created_at, updated_at, requester_id, assignee_id, custom_fields, plus `requester_name` and `assignee_name` when Zendesk returns the users), `page`, `per_page` and `has_more`.
 
 - `organization_id` (integer)
 - `page` (integer, optional): Defaults to 1
@@ -634,16 +639,16 @@ Permanently replace a string in a comment with block characters, for PII such as
 
 #### mark_ticket_as_spam
 
-Mark a ticket as spam and suspend its requester.
+Mark a ticket as spam and suspend its requester. No tool here lifts that suspension.
 
 - `ticket_id` (integer)
 
 #### update_tickets_bulk
 
-Apply the same change to up to 100 tickets. Waits up to 30 seconds for Zendesk's background job and returns its status under `job`; if it is still `pending`, call `get_job_status` with the returned `id`.
+Apply the same change to up to 100 tickets. Waits up to 30 seconds for Zendesk's background job and returns its status under `job`; if it is still `pending`, call `get_job_status` with the returned `id`. At most 30 jobs may be queued at once. The message says when some tickets failed.
 
 - `ticket_ids` (array of integers): 1 to 100 ticket IDs
-- `status` (string, optional): `new`, `open`, `pending`, `hold`, `solved`
+- `status` (string, optional): `new`, `open`, `pending`, `hold`, `solved`, `closed`
 - `priority` (string, optional): `low`, `normal`, `high`, `urgent`
 - `type` (string, optional): `problem`, `incident`, `question`, `task`
 - `assignee_id` (integer, optional)
@@ -660,12 +665,12 @@ At least one field is required.
 
 #### search
 
-Search with Zendesk Query Language (ZQL) across tickets, users and organizations. Examples: `type:ticket status:open priority:urgent`, `type:ticket assignee:me`, `type:user email:john@example.com`.
+Search with Zendesk Query Language (ZQL) across tickets, users, organizations and groups, one page at a time. Zendesk returns at most 1,000 results per query. Examples: `type:ticket status:open priority:urgent`, `type:ticket assignee:me`, `type:user email:john@example.com`.
 
 - `query` (string): ZQL query
 - `page` (integer, optional): Defaults to 1
 - `per_page` (integer, optional): Max 100 (defaults to 25)
-- `sort_by` (string, optional): `relevance`, `updated_at`, `created_at`, `priority`, `status`, `ticket_type` (defaults to `relevance`)
+- `sort_by` (string, optional): `updated_at`, `created_at`, `priority`, `status`, `ticket_type` (omitted by default, so Zendesk sorts by relevance)
 - `sort_order` (string, optional): `asc` or `desc` (defaults to `desc`)
 
 Ticket results include `requester_name` and `assignee_name` when Zendesk returns the users.
@@ -694,7 +699,7 @@ Get the currently authenticated user. No inputs. Also returns `custom_role_id`, 
 
 #### search_users
 
-Search users by name, email or other properties, or by exact external_id. Give at least one of the two. Zendesk returns at most 10,000 matches. Results include `external_id` and `suspended`.
+Search users by name, email or other properties, or by exact external_id. Give at least one of the two. Returns `count`, `users` (including `external_id` and `suspended`) and `has_more`: the first page of up to 100 matches, so narrow the query for more.
 
 - `query` (string, optional): Name, email, notes, phone or another user property
 - `external_id` (string, optional): Exact external_id (not a search expression)
@@ -707,7 +712,7 @@ Get an organization by ID. Also returns `organization_fields` (custom organizati
 
 #### search_organizations
 
-Search organizations by name.
+Search organizations whose name starts with the query. Returns `count`, `organizations` (id, name, domain_names) and `has_more`: the first page only, so narrow the query for more.
 
 - `query` (string)
 
@@ -788,8 +793,8 @@ Execute a view and return its tickets.
 
 - `view_id` (integer)
 - `page` (integer, optional): Defaults to 1
-- `per_page` (integer, optional): Defaults to 25
-- `sort_by` (string, optional): Column to sort by, e.g. `created_at` or `updated_at`
+- `per_page` (integer, optional): Max 100 (defaults to 25)
+- `sort_by` (string, optional): Column to sort by, e.g. `created_at` or `updated_at`; subject and submitter columns are not supported
 - `sort_order` (string, optional): `asc` or `desc`
 
 #### list_ticket_fields
@@ -842,14 +847,14 @@ List available macros (canned responses and actions). Returns every page.
 
 #### apply_macro
 
-Preview the result of applying a macro to a ticket. Does not save changes.
+PREVIEW ONLY, saves nothing. Use `execute_macro` to apply the macro. Returns `ticket_changes` (the previewed ticket) and the macro's `comment`.
 
 - `ticket_id` (integer)
 - `macro_id` (integer)
 
 #### execute_macro
 
-Apply a macro to a ticket for real. The changes and comment the macro previews are saved and the macro is recorded in the ticket audit. `apply_macro` only previews. Returns the updated ticket.
+Apply a macro to a ticket for real. Zendesk's preview returns the whole ticket, so only the fields the macro changes (compared with the current ticket) are saved, plus the macro's comment (private unless the macro makes it public; a public one emails the requester). The update fails with a 409 if the ticket changed in the meantime, and the macro is recorded in the ticket audit. `apply_macro` only previews. Returns the updated ticket.
 
 - `ticket_id` (integer)
 - `macro_id` (integer)
@@ -877,13 +882,13 @@ List the brands of the account as `{id, name, subdomain, brand_url, default, act
 
 #### get_account_settings
 
-Get feature flags and defaults: `active_features` (such as `custom_objects_activated`, `business_hours`, `allow_ccs`), `brands`, `tickets`, `agents`, `localization`, `limits`, `routing` and `users`, each as Zendesk returns it (null when absent). They tell you which other tools apply. No inputs.
+Get feature flags and defaults: `active_features` (such as `on_hold_status`, `business_hours`, `allow_ccs`), `brands`, `tickets`, `agents`, `localization`, `limits`, `routing` and `users`, each as Zendesk returns it (null when absent). They tell you which features are on. For custom objects, try `list_custom_objects` and treat a 403 or 404 as "not available". No inputs.
 
 ### Custom objects
 
 #### list_custom_objects
 
-List the custom objects of the account as `{key, title, title_pluralized, description, created_at, updated_at}`. Custom objects are account-defined record types (products, orders, assets) linked to tickets through lookup fields; check `active_features.custom_objects_activated` in `get_account_settings`. No inputs.
+List the custom objects of the account as `{key, title, title_pluralized, description, created_at, updated_at}`. Custom objects are account-defined record types (products, orders, assets) linked to tickets through lookup fields. If the account has none this fails with 403 or 404; treat that as "not available". No inputs.
 
 #### get_custom_object
 
@@ -894,6 +899,8 @@ Get a custom object and its fields. Returns `object` and `fields` (`key`, `title
 #### search_custom_object_records
 
 List or search the records of a custom object, one cursor page at a time. With neither `query` nor `filter` it lists the records. Returns `records` (`id`, `name`, `external_id`, `custom_object_fields`, `created_at`, `updated_at`), `count` (when Zendesk sends it), `has_more` and `after_cursor`.
+
+Non-admin agents may get 403 when listing or text-searching objects with cascading permissions; use `filter` instead.
 
 - `key` (string): The custom object key
 - `query` (string, optional): Text search; it covers text fields only
@@ -917,8 +924,8 @@ Search Help Center articles by text and/or filters. Give at least one of `query`
 
 - `query` (string, optional)
 - `locale` (string, optional): For example `en-us`, `fr`, `es`
-- `category` (integer, optional): Only articles in this category
-- `section` (integer, optional): Only articles in this section
+- `category` (integer, optional): Only articles in this category (`category_id` is accepted as an alias)
+- `section` (integer, optional): Only articles in this section (`section_id` is accepted as an alias)
 - `label_names` (array of strings, optional): Only articles with these labels
 - `sort_by` (string, optional): `created_at` or `updated_at` (defaults to relevance)
 - `sort_order` (string, optional): `asc` or `desc` (defaults to `desc`)
@@ -926,7 +933,7 @@ Search Help Center articles by text and/or filters. Give at least one of `query`
 - `per_page` (integer, optional): Max 100 (defaults to 25)
 - `page` (integer, optional): Page number (defaults to 1)
 
-Returns matching articles with id, title, body, snippet (matching text in `<em>` tags), author_id, section_id, locale, html_url, timestamps, draft and promoted status, label_names and vote_sum, plus pagination metadata.
+Returns matching articles with id, title, body, snippet (matching text in `<em>` tags), author_id, section_id, locale, html_url, timestamps, draft and promoted status, label_names and vote_sum, plus `query`, `page`, `per_page`, `count`, `total_count` and `has_more`.
 
 #### list_articles
 
@@ -983,7 +990,7 @@ Create a Help Center article. It is a draft unless `draft` is false. Publish lat
 
 #### update_article
 
-Edit the text of one locale and/or the article's metadata. Set `draft` to false to publish, true to unpublish. Returns the updated article in the `get_article` shape.
+Edit the text of one locale and/or the article's metadata. Set `draft` to false to publish, true to unpublish. Returns the updated article in the `get_article` shape. It may make two writes (the translation, then the metadata), so if the second fails the first stays applied.
 
 - `article_id` (integer)
 - `locale` (string, optional): Required with `title`, `body` or `draft`
@@ -1023,7 +1030,7 @@ Returns the linked incident tickets with id, subject, status, priority, requeste
 
 #### get_sla_breaches
 
-Find tickets that breached SLA within a time period.
+Find tickets that breached SLA within a time period. Admin-only. It reads Zendesk's incremental export, limited to 10 requests per minute, and scans every metric event in the window, so keep `days_back` small.
 
 - `days_back` (integer, optional): Defaults to 7
 - `metric` (string, optional): `reply_time`, `first_reply_time`, `agent_work_time`, `requester_wait_time` or `periodic_update_time`

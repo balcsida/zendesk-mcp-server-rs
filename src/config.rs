@@ -16,9 +16,12 @@ use std::path::PathBuf;
 use anyhow::{Result, bail};
 
 /// The broad `read` (every GET endpoint, including ticket audits and search, which have
-/// no narrow scope) plus the narrow write scopes the write tools need. Zendesk accepts
-/// unknown scope names when issuing a token but then rejects every request with 403,
-/// so keep these exact.
+/// no narrow scope) plus the narrow write scopes of the documented tool families. A few
+/// operations have no documented narrow scope (`recover_suspended_ticket`,
+/// `restore_deleted_ticket`, `search_problem_tickets` with text and
+/// `search_custom_object_records` with a filter); if one answers 403, add the broad
+/// `write` scope. Zendesk accepts unknown scope names when issuing a token but then
+/// rejects every request with 403, so keep these exact.
 pub const DEFAULT_OAUTH_SCOPES: &str =
     "read tickets:write ticket_attachments:write users:write organizations:write hc:write";
 
