@@ -622,6 +622,14 @@ Retrieve the audit trail (all changes and events) for a ticket.
 
 Returns audits with id, author_id, created_at and a trimmed list of events (type, body, value changes and so on).
 
+#### get_linked_incidents
+
+Get the incident tickets linked to a problem ticket.
+
+- `ticket_id` (integer)
+
+Returns the linked incident tickets with id, subject, status, priority, requester_id, assignee_id, group_id and timestamps.
+
 #### get_sla_breaches
 
 Find tickets that breached SLA within a time period.

@@ -1147,6 +1147,24 @@ impl ZendeskClient {
         .map_err(ctx(format!("Failed to get audits for ticket {ticket_id}")))
     }
 
+    /// Incident tickets linked to a problem ticket (`GET /tickets/{ticket_id}/incidents.json`).
+    pub async fn get_linked_incidents(&self, ticket_id: u64) -> Result<Value> {
+        async {
+            let incidents = self
+                .get_paged(&format!("tickets/{ticket_id}/incidents.json"), "tickets")
+                .await?;
+            let incidents = incidents
+                .iter()
+                .map(|t| pick(t, &TICKET_SUMMARY_KEYS, &[]))
+                .collect::<Vec<_>>();
+            Ok(json!({ "count": incidents.len(), "incidents": incidents }))
+        }
+        .await
+        .map_err(ctx(format!(
+            "Failed to get linked incidents for ticket {ticket_id}"
+        )))
+    }
+
     pub async fn get_sla_breaches(&self, days_back: u64, metric: Option<&str>) -> Result<Value> {
         async {
             let days = i64::try_from(days_back.min(MAX_DAYS_BACK))?;
@@ -1702,6 +1720,35 @@ mod tests {
             audit["events"][1],
             json!({"type": "Change", "field_name": "status", "value": "open", "previous_value": "new"})
         );
+    }
+
+    #[tokio::test]
+    async fn get_linked_incidents_follows_pagination() {
+        let server = MockServer::start().await;
+        let next = format!("{}/api/v2/tickets/3/incidents.json?page=2", server.uri());
+        Mock::given(method("GET"))
+            .and(path("/api/v2/tickets/3/incidents.json"))
+            .and(query_param("page", "2"))
+            .respond_with(json_page(
+                "tickets",
+                json!([{"id": 11, "subject": "s2", "status": "open"}]),
+                None,
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/tickets/3/incidents.json"))
+            .respond_with(json_page(
+                "tickets",
+                json!([{"id": 10, "subject": "s1", "status": "new"}]),
+                Some(next),
+            ))
+            .mount(&server)
+            .await;
+        let out = client(&server).get_linked_incidents(3).await.unwrap();
+        assert_eq!(out["count"], 2);
+        assert_eq!(out["incidents"][0]["id"], 10);
+        assert_eq!(out["incidents"][1]["id"], 11);
     }
 
     #[tokio::test]
