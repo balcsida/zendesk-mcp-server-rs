@@ -75,7 +75,8 @@ instead and use `zendesk-mcp-server auth --manual` in step 3.
 Copy `.env.example` to `.env` and set:
 
 ```bash
-ZENDESK_SUBDOMAIN=acme        # for https://acme.zendesk.com
+# for https://acme.zendesk.com
+ZENDESK_SUBDOMAIN=acme
 ZENDESK_CLIENT_ID=your-client-identifier
 ```
 
@@ -375,7 +376,7 @@ If you're using Safari and seeing errors like "Safari cannot open the page becau
 
 If sign-in times out after 5 minutes:
 
-1. Check that the URL scheme handler registered successfully (look for `URL scheme handler registered` in the server log; set `RUST_LOG=debug` for more detail).
+1. Check that the URL scheme handler registered successfully (look for `Registered macOS URL scheme handler`, or the Linux or Windows equivalent, in the server log; set `RUST_LOG=debug` for more detail).
 2. Try the manual fallback by opening the sign-in URL the command prints in your browser.
 3. Complete the sign-in and copy/paste the `zendesk-support://` URL from the address bar.
 

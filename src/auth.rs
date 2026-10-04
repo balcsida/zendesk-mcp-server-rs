@@ -27,13 +27,23 @@ pub enum Auth {
 }
 
 /// The credential to put on one outgoing request.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum AuthValue {
     /// Value of the `Authorization` header.
     Authorization(String),
     /// Value of the `Cookie` header. Set per request rather than through a cookie jar
     /// so it is never replayed to another host on redirect.
     Cookie(String),
+}
+
+// Manual Debug so a `{:?}` can never print the credential.
+impl std::fmt::Debug for AuthValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AuthValue::Authorization(_) => f.write_str("Authorization(<redacted>)"),
+            AuthValue::Cookie(_) => f.write_str("Cookie(<redacted>)"),
+        }
+    }
 }
 
 impl AuthValue {

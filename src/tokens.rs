@@ -323,14 +323,25 @@ fn ensure_directory(path: &Path) -> Result<()> {
     let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) else {
         return Ok(());
     };
+    let created = !dir.exists();
     fs::create_dir_all(dir).with_context(|| format!("Could not create {}", dir.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let mode = fs::metadata(dir)?.permissions().mode() & 0o777;
         if mode != 0o700 {
-            fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
-                .with_context(|| format!("Could not set permissions on {}", dir.display()))?;
+            // Only tighten directories this code created: chmod-ing a shared directory
+            // such as /tmp, or a mount the user cannot change, does more harm than good.
+            if created {
+                fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
+                    .with_context(|| format!("Could not set permissions on {}", dir.display()))?;
+            } else {
+                tracing::warn!(
+                    "{} has mode {mode:o}, not 0700; the token file inside may be readable by \
+                     other users.",
+                    dir.display()
+                );
+            }
         }
     }
     Ok(())

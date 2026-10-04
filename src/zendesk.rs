@@ -3,7 +3,9 @@
 //! Every method returns `serde_json::Value` shaped exactly like the Python server's
 //! output, so MCP clients see no difference after the rewrite.
 
+use std::collections::HashSet;
 use std::fmt::Display;
+use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
 use base64::Engine;
@@ -17,6 +19,15 @@ pub const MAX_ATTACHMENT_BYTES: usize = 10 * 1024 * 1024;
 
 /// Image types a tool may return. SVG is excluded: it can contain active content.
 pub const ALLOWED_IMAGE_TYPES: [&str; 4] = ["image/jpeg", "image/png", "image/gif", "image/webp"];
+
+/// Retries of an idempotent request answered 429 or 503.
+const MAX_RETRIES: u32 = 3;
+/// Longest `Retry-After` honoured, in seconds.
+const MAX_RETRY_AFTER_SECS: u64 = 30;
+/// Pages followed per listing before returning what was collected.
+const MAX_PAGES: usize = 1000;
+/// Largest `days_back` accepted by `get_sla_breaches` (100 years).
+const MAX_DAYS_BACK: u64 = 36_500;
 
 /// Render Markdown (or plain text) to the HTML Zendesk stores as `html_body`.
 ///
@@ -220,6 +231,26 @@ impl ZendeskClient {
             let fresh = self.auth.value().await?;
             resp = fresh.apply(make()).send().await?;
         }
+
+        let idempotent = request.method() != reqwest::Method::POST;
+        let mut attempt = 0;
+        while idempotent && attempt < MAX_RETRIES && matches!(resp.status().as_u16(), 429 | 503) {
+            let delay = resp
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .map_or(1 << attempt, |secs| secs.min(MAX_RETRY_AFTER_SECS));
+            tracing::debug!(
+                "{label} answered HTTP {}, retry {} of {MAX_RETRIES} in {delay}s",
+                resp.status(),
+                attempt + 1
+            );
+            let _ = resp.bytes().await;
+            tokio::time::sleep(Duration::from_secs(delay)).await;
+            resp = self.auth.value().await?.apply(make()).send().await?;
+            attempt += 1;
+        }
         ensure_success(resp, &label).await
     }
 
@@ -253,19 +284,48 @@ impl ZendeskClient {
         Ok(())
     }
 
+    /// Validate a `next_page` link: same scheme, host and port as `base_url`, and not a
+    /// page already fetched. `seen` holds the URLs fetched so far; the link is added to it.
+    /// Returns `None` (after a warning) once `MAX_PAGES` pages have been fetched.
+    fn next_page(&self, seen: &mut HashSet<String>, link: &str) -> Result<Option<url::Url>> {
+        let next = url::Url::parse(link)?;
+        let base = url::Url::parse(&self.base_url)?;
+        if next.scheme() != base.scheme()
+            || next.host_str() != base.host_str()
+            || next.port_or_known_default() != base.port_or_known_default()
+        {
+            bail!(
+                "Zendesk returned a next_page link on another host: {}",
+                next.host_str().unwrap_or("")
+            );
+        }
+        if seen.len() >= MAX_PAGES {
+            tracing::warn!("Stopped following next_page after {MAX_PAGES} pages");
+            return Ok(None);
+        }
+        if !seen.insert(next.to_string()) {
+            bail!("Zendesk pagination returned a page it already returned");
+        }
+        Ok(Some(next))
+    }
+
     /// Collect `key` from a listing, following the absolute `next_page` URLs until null.
     async fn get_paged(&self, path: &str, key: &str) -> Result<Vec<Value>> {
         let mut items = Vec::new();
-        let mut next = Some(self.url(path, &[])?);
-        while let Some(url) = next {
+        let mut url = self.url(path, &[])?;
+        let mut seen = HashSet::from([url.to_string()]);
+        loop {
             let data = self.get_url(url).await?;
             if let Some(page) = data.get(key).and_then(Value::as_array) {
                 items.extend(page.iter().cloned());
             }
-            next = match data.get("next_page").and_then(Value::as_str) {
-                Some(link) => Some(url::Url::parse(link)?),
-                None => None,
+            let Some(link) = data.get("next_page").and_then(Value::as_str) else {
+                break;
             };
+            match self.next_page(&mut seen, link)? {
+                Some(next) => url = next,
+                None => break,
+            }
         }
         Ok(items)
     }
@@ -381,9 +441,9 @@ impl ZendeskClient {
             .trim()
             .to_lowercase();
         if !ALLOWED_IMAGE_TYPES.contains(&content_type.as_str()) {
-            bail!(
-                "Attachment type '{content_type}' is not allowed. Supported types: {ALLOWED_IMAGE_TYPES:?}"
-            );
+            let mut allowed = ALLOWED_IMAGE_TYPES;
+            allowed.sort_unstable();
+            bail!("Attachment type '{content_type}' is not allowed. Supported types: {allowed:?}");
         }
 
         let mut content = Vec::new();
@@ -1040,13 +1100,17 @@ impl ZendeskClient {
 
     pub async fn get_sla_breaches(&self, days_back: u64, metric: Option<&str>) -> Result<Value> {
         async {
-            let days = i64::try_from(days_back).unwrap_or(i64::MAX / 86_400 / 1000);
-            let start = (chrono::Utc::now() - chrono::Duration::days(days)).timestamp();
+            let days = i64::try_from(days_back.min(MAX_DAYS_BACK))?;
+            let start = chrono::Duration::try_days(days)
+                .and_then(|d| chrono::Utc::now().checked_sub_signed(d))
+                .ok_or_else(|| anyhow!("days_back {days_back} is out of range"))?
+                .timestamp();
             let mut url = self.url(
                 "incremental/ticket_metric_events.json",
                 &[("start_time", &start)],
             )?;
             let mut breaches = Vec::new();
+            let mut seen = HashSet::from([url.to_string()]);
             loop {
                 let data = self.get_url(url.clone()).await?;
                 for event in data["ticket_metric_events"]
@@ -1060,13 +1124,15 @@ impl ZendeskClient {
                         breaches.push(breach);
                     }
                 }
-                let next = data["next_page"]
-                    .as_str()
-                    .map(url::Url::parse)
-                    .transpose()?;
-                match next {
-                    Some(next) if data["end_of_stream"] != true && next != url => url = next,
-                    _ => break,
+                let Some(link) = data["next_page"].as_str() else {
+                    break;
+                };
+                if data["end_of_stream"] == true {
+                    break;
+                }
+                match self.next_page(&mut seen, link)? {
+                    Some(next) => url = next,
+                    None => break,
                 }
             }
 
@@ -1092,8 +1158,8 @@ impl ZendeskClient {
 
     pub async fn get_sla_policies(&self) -> Result<Value> {
         async {
-            let data = self.api_get("slas/policies.json", &[]).await?;
-            Ok(data.get("sla_policies").cloned().unwrap_or(json!([])))
+            let policies = self.get_paged("slas/policies.json", "sla_policies").await?;
+            Ok(Value::Array(policies))
         }
         .await
         .map_err(ctx("Failed to get SLA policies"))
@@ -1450,6 +1516,122 @@ mod tests {
         assert_eq!(out["unique_tickets"], 2);
         assert_eq!(out["by_metric"], json!({"reply_time": 3}));
         assert_eq!(out["days_back"], 7);
+    }
+
+    fn json_page(items_key: &str, items: Value, next: Option<String>) -> ResponseTemplate {
+        ResponseTemplate::new(200).set_body_json(json!({ items_key: items, "next_page": next }))
+    }
+
+    #[tokio::test]
+    async fn get_retries_429_then_succeeds() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/users/me.json"))
+            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "0"))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/users/me.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"user": {"id": 1}})))
+            .mount(&server)
+            .await;
+        let user = client(&server).get_current_user().await.unwrap();
+        assert_eq!(user["id"], 1);
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn post_429_is_not_retried() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "0"))
+            .mount(&server)
+            .await;
+        let err = client(&server)
+            .api_post("tickets.json", &json!({}))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("429"), "{err}");
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn next_page_on_another_host_is_rejected() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(json_page(
+                "comments",
+                json!([]),
+                Some("https://evil.example/api/v2/next".into()),
+            ))
+            .mount(&server)
+            .await;
+        let err = client(&server).get_ticket_comments(1).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("next_page link on another host: evil.example"),
+            "{err}"
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn next_page_cycle_terminates() {
+        let server = MockServer::start().await;
+        let first = format!("{}/api/v2/tickets/1/comments.json", server.uri());
+        Mock::given(method("GET"))
+            .and(query_param("p", "b"))
+            .respond_with(json_page("comments", json!([]), Some(first.clone())))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(json_page(
+                "comments",
+                json!([]),
+                Some(format!("{first}?p=b")),
+            ))
+            .mount(&server)
+            .await;
+        let err = client(&server).get_ticket_comments(1).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Zendesk pagination returned a page it already returned"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_sla_policies_merges_pages() {
+        let server = MockServer::start().await;
+        let next = format!("{}/api/v2/slas/policies.json?page=2", server.uri());
+        Mock::given(method("GET"))
+            .and(query_param("page", "2"))
+            .respond_with(json_page("sla_policies", json!([{"id": 2}]), None))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(json_page("sla_policies", json!([{"id": 1}]), Some(next)))
+            .mount(&server)
+            .await;
+        let out = client(&server).get_sla_policies().await.unwrap();
+        assert_eq!(out, json!([{"id": 1}, {"id": 2}]));
+    }
+
+    #[tokio::test]
+    async fn sla_breaches_huge_days_back_does_not_panic() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ticket_metric_events": [], "end_of_stream": true, "next_page": null
+            })))
+            .mount(&server)
+            .await;
+        let out = client(&server)
+            .get_sla_breaches(u64::MAX, None)
+            .await
+            .unwrap();
+        assert_eq!(out["total_breaches"], 0);
     }
 
     #[test]

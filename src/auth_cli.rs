@@ -118,7 +118,7 @@ async fn authorize(
     let captured = if manual {
         receive_code_manually(authorization_url).await?
     } else {
-        receive_code_via_loopback(settings, authorization_url).await?
+        receive_code_via_loopback(settings, state, authorization_url).await?
     };
     let code = validate_callback(&captured, state)?;
     let tokens = exchange_authorization_code(http, settings, &code, pkce).await?;
@@ -128,26 +128,40 @@ async fn authorize(
 }
 
 /// Serves the single redirect Zendesk makes back to this machine.
-fn callback_router(sender: oneshot::Sender<Captured>) -> Router {
-    let slot = Arc::new(Mutex::new(Some(sender)));
+///
+/// Only a redirect carrying the expected `state` is accepted. Anything else is
+/// answered but ignored, so a stray or forged request can neither abort nor hijack
+/// the sign-in while it waits.
+fn callback_router(sender: oneshot::Sender<Captured>, expected_state: &str) -> Router {
+    let shared = Arc::new(CallbackShared {
+        slot: Mutex::new(Some(sender)),
+        expected_state: expected_state.to_string(),
+    });
     // No request logging: the request line carries the authorization code.
-    Router::new().fallback(get(callback)).with_state(slot)
+    Router::new().fallback(get(callback)).with_state(shared)
+}
+
+struct CallbackShared {
+    slot: Mutex<Option<oneshot::Sender<Captured>>>,
+    expected_state: String,
 }
 
 async fn callback(
-    State(slot): State<Arc<Mutex<Option<oneshot::Sender<Captured>>>>>,
+    State(shared): State<Arc<CallbackShared>>,
     RawQuery(query): RawQuery,
 ) -> impl IntoResponse {
     let captured = parse_query(query.as_deref().unwrap_or_default());
-    let (status, body) = if captured.contains_key("code") {
-        (StatusCode::OK, SUCCESS_PAGE)
-    } else if captured.contains_key("error") {
-        (StatusCode::BAD_REQUEST, FAILURE_PAGE)
-    } else {
-        (StatusCode::NOT_FOUND, FAILURE_PAGE)
+    let is_redirect = captured.contains_key("code") || captured.contains_key("error");
+    let accepted = is_redirect && captured.get("state") == Some(&shared.expected_state);
+    let (status, body) = match (is_redirect, accepted, captured.contains_key("code")) {
+        (false, _, _) => (StatusCode::NOT_FOUND, FAILURE_PAGE),
+        // A redirect with the wrong state is not ours: answer it, keep waiting.
+        (true, false, _) => (StatusCode::BAD_REQUEST, FAILURE_PAGE),
+        (true, true, true) => (StatusCode::OK, SUCCESS_PAGE),
+        (true, true, false) => (StatusCode::BAD_REQUEST, FAILURE_PAGE),
     };
-    if status != StatusCode::NOT_FOUND
-        && let Ok(mut slot) = slot.lock()
+    if accepted
+        && let Ok(mut slot) = shared.slot.lock()
         && let Some(sender) = slot.take()
     {
         let _ = sender.send(captured);
@@ -193,12 +207,14 @@ async fn bind_loopback(redirect_uri: &str) -> Result<TcpListener> {
 
 async fn receive_code_via_loopback(
     settings: &OAuthSettings,
+    state: &str,
     authorization_url: &str,
 ) -> Result<Captured> {
     let listener = bind_loopback(&settings.redirect_uri).await?;
     let (sender, receiver) = oneshot::channel();
+    let router = callback_router(sender, state);
     let server = tokio::spawn(async move {
-        let _ = axum::serve(listener, callback_router(sender)).await;
+        let _ = axum::serve(listener, router).await;
     });
 
     println!("Opening your browser to authorize with Zendesk:\n  {authorization_url}\n");
@@ -443,8 +459,9 @@ mod tests {
         let listener = bind_loopback("http://127.0.0.1:0/callback").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let (sender, receiver) = oneshot::channel();
+        let router = callback_router(sender, "s");
         let server = tokio::spawn(async move {
-            let _ = axum::serve(listener, callback_router(sender)).await;
+            let _ = axum::serve(listener, router).await;
         });
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
 
@@ -455,6 +472,14 @@ mod tests {
             .unwrap();
         assert_eq!(stray.status(), 404);
         assert!(stray.text().await.unwrap().contains("Authorization failed"));
+
+        // A redirect with the wrong state is answered but must not consume the slot.
+        let forged = client
+            .get(format!("{base}/callback?code=evil&state=wrong"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(forged.status(), 400);
 
         let ok = client
             .get(format!("{base}/callback?code=abc&state=s"))
@@ -477,19 +502,20 @@ mod tests {
         let listener = bind_loopback("http://localhost:0/callback").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let (sender, receiver) = oneshot::channel();
+        let router = callback_router(sender, "s");
         let server = tokio::spawn(async move {
-            let _ = axum::serve(listener, callback_router(sender)).await;
+            let _ = axum::serve(listener, router).await;
         });
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
         let denied = client
-            .get(format!("{base}/?error=access_denied"))
+            .get(format!("{base}/?error=access_denied&state=s"))
             .send()
             .await
             .unwrap();
         assert_eq!(denied.status(), 400);
         assert_eq!(
             receiver.await.unwrap(),
-            captured(&[("error", "access_denied")])
+            captured(&[("error", "access_denied"), ("state", "s")])
         );
         server.abort();
     }

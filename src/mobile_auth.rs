@@ -20,8 +20,11 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use axum::Router;
 use axum::extract::{Query, State};
+use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Json, Response};
 use axum::routing::get;
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
@@ -48,7 +51,7 @@ window.addEventListener('DOMContentLoaded', function() {
         var callbackUrl = decodeURIComponent(hash.substring(1));
         console.log('Captured callback URL from hash:', callbackUrl);
         // Forward it to our local server
-        fetch('/callback?url=' + encodeURIComponent(callbackUrl))
+        fetch('/callback/__NONCE__?url=' + encodeURIComponent(callbackUrl))
             .then(function() {
                 document.body.innerHTML = '<h2 style="color:#2e7d32">&#9989; Authentication successful!</h2>' +
                     '<p>Token captured and saved. You can close this tab.</p>';
@@ -62,7 +65,8 @@ window.addEventListener('DOMContentLoaded', function() {
 <p>You can close this tab. The MCP server is starting.</p>
 </body></html>"##;
 
-/// `__AUTH_URL__` is replaced by the login URL as a JSON string literal.
+/// `__AUTH_URL__` is replaced by the login URL as a JSON string literal, `__NONCE__` by the
+/// callback nonce.
 const AUTH_PAGE_HTML: &str = r##"<!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>Zendesk Auth</title>
 <style>
@@ -102,7 +106,7 @@ function submitUrl() {
     if (!url) return;
     document.getElementById('steps').style.display = 'none';
     document.getElementById('result').style.display = 'block';
-    fetch('/callback?url=' + encodeURIComponent(url))
+    fetch('/callback/__NONCE__?url=' + encodeURIComponent(url))
         .then(r => r.json())
         .then(function(data) {
             var resultDiv = document.getElementById('result');
@@ -231,6 +235,7 @@ pub fn save_token(token: &MobileToken) -> Result<PathBuf> {
 }
 
 fn save_token_to(token: &MobileToken, path: &Path) -> Result<()> {
+    let payload = serde_json::to_string_pretty(token)?;
     if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
         let mut builder = std::fs::DirBuilder::new();
         builder.recursive(true);
@@ -244,25 +249,27 @@ fn save_token_to(token: &MobileToken, path: &Path) -> Result<()> {
             .with_context(|| format!("Could not create {}", dir.display()))?;
     }
 
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options
-        .open(path)
-        .with_context(|| format!("Could not write {}", path.display()))?;
-    #[cfg(unix)]
-    {
-        // The file may already exist with looser permissions.
-        use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    }
-    file.write_all(serde_json::to_string_pretty(token)?.as_bytes())
-        .with_context(|| format!("Could not write {}", path.display()))?;
-    Ok(())
+    let mut temp_name = path.file_name().unwrap_or_default().to_os_string();
+    temp_name.push(format!(".{}.tmp", uuid::Uuid::new_v4().simple()));
+    let temp_path = path.with_file_name(temp_name);
+
+    let write = || -> std::io::Result<()> {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temp_path)?;
+        file.write_all(payload.as_bytes())?;
+        file.sync_all()?;
+        std::fs::rename(&temp_path, path)
+    };
+    write().map_err(|err| {
+        let _ = std::fs::remove_file(&temp_path);
+        anyhow!("Could not write {}: {err}", path.display())
+    })
 }
 
 fn zendesk_base(subdomain: &str) -> String {
@@ -445,6 +452,7 @@ pub fn build_auth_url(auth_url: &str) -> String {
 // --- Local callback server ---
 
 struct ServerState {
+    nonce: String,
     subdomain: String,
     full_auth_url: String,
     /// Interactive mode answers `/callback` with JSON instead of the success page.
@@ -453,8 +461,11 @@ struct ServerState {
 }
 
 /// Serves the paste page and receives the `zendesk-support://` callback. Stops on drop.
+/// Both routes live under a per-run random nonce so other local processes and web pages
+/// that scan ports cannot submit a token.
 struct CallbackServer {
     port: u16,
+    nonce: String,
     tokens: mpsc::UnboundedReceiver<MobileToken>,
     task: JoinHandle<()>,
 }
@@ -465,21 +476,38 @@ impl Drop for CallbackServer {
     }
 }
 
+fn callback_url_for(port: u16, nonce: &str) -> String {
+    format!("http://127.0.0.1:{port}/callback/{nonce}")
+}
+
+impl CallbackServer {
+    fn callback_url(&self) -> String {
+        callback_url_for(self.port, &self.nonce)
+    }
+
+    fn auth_url(&self) -> String {
+        format!("http://127.0.0.1:{}/auth/{}", self.port, self.nonce)
+    }
+}
+
 async fn start_callback_server(
     subdomain: &str,
     full_auth_url: String,
     interactive: bool,
 ) -> Result<CallbackServer> {
     let (tx, rx) = mpsc::unbounded_channel();
+    let nonce = URL_SAFE_NO_PAD.encode(rand::random::<[u8; 32]>());
     let state = Arc::new(ServerState {
+        nonce: nonce.clone(),
         subdomain: subdomain.to_string(),
         full_auth_url,
         interactive,
         tokens: tx,
     });
     let app = Router::new()
-        .route("/callback", get(callback_handler))
-        .fallback(auth_page_handler)
+        .route(&format!("/callback/{nonce}"), get(callback_handler))
+        .route(&format!("/auth/{nonce}"), get(auth_page_handler))
+        .fallback(|| async { StatusCode::NOT_FOUND })
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
@@ -493,17 +521,20 @@ async fn start_callback_server(
     tracing::info!(port, "Local callback server started");
     Ok(CallbackServer {
         port,
+        nonce,
         tokens: rx,
         task,
     })
 }
 
-fn render_auth_page(full_auth_url: &str) -> String {
+fn render_auth_page(full_auth_url: &str, nonce: &str) -> String {
     // JSON-encode so quotes cannot break out of the JS string; '<' stops `</script>`.
     let literal = serde_json::to_string(full_auth_url)
         .unwrap_or_else(|_| "\"\"".to_string())
         .replace('<', "\\u003c");
-    AUTH_PAGE_HTML.replace("__AUTH_URL__", &literal)
+    AUTH_PAGE_HTML
+        .replace("__AUTH_URL__", &literal)
+        .replace("__NONCE__", nonce)
 }
 
 async fn callback_handler(
@@ -528,7 +559,7 @@ async fn callback_handler(
             if state.interactive {
                 Json(json!({"ok": true, "username": username})).into_response()
             } else {
-                Html(SUCCESS_HTML).into_response()
+                Html(SUCCESS_HTML.replace("__NONCE__", &state.nonce)).into_response()
             }
         }
         None => Json(json!({
@@ -540,7 +571,7 @@ async fn callback_handler(
 }
 
 async fn auth_page_handler(State(state): State<Arc<ServerState>>) -> Html<String> {
-    Html(render_auth_page(&state.full_auth_url))
+    Html(render_auth_page(&state.full_auth_url, &state.nonce))
 }
 
 // --- Browser ---
@@ -610,7 +641,7 @@ fn open_in_default_browser(url: &str) {
 /// Registers a temporary OS-level handler for `zendesk-support://` that forwards the
 /// redirect to the local callback server. Cleans up on `cleanup()` or drop.
 pub struct UrlSchemeHandler {
-    port: u16,
+    callback_url: String,
     cleanup: Vec<Box<dyn FnOnce() + Send>>,
 }
 
@@ -654,9 +685,15 @@ fn home_dir() -> Result<PathBuf> {
 impl UrlSchemeHandler {
     pub fn new(port: u16) -> Self {
         Self {
-            port,
+            callback_url: callback_url_for(port, ""),
             cleanup: Vec::new(),
         }
+    }
+
+    /// Target the server's nonced callback URL; the default one (no nonce) answers 404.
+    fn with_callback_url(mut self, callback_url: String) -> Self {
+        self.callback_url = callback_url;
+        self
     }
 
     /// Create and register the handler. Returns false (after cleaning up) on failure.
@@ -704,7 +741,7 @@ impl UrlSchemeHandler {
             &format!(
                 r#"on open location theURL
     try
-        set curlResult to do shell script "/usr/bin/curl -s -G --max-time 10 --data-urlencode url=" & quoted form of theURL & " 'http://127.0.0.1:{}/callback'"
+        set curlResult to do shell script "/usr/bin/curl -s -G --max-time 10 --data-urlencode url=" & quoted form of theURL & " '{}'"
         log "Zendesk auth callback sent successfully"
         return curlResult
     on error errMsg
@@ -713,7 +750,7 @@ impl UrlSchemeHandler {
     end try
 end open location
 "#,
-                self.port
+                self.callback_url
             ),
         )?;
         let compiled = run(Command::new("osacompile")
@@ -769,9 +806,9 @@ end open location
             &format!(
                 "#!/bin/sh\n\
                  curl -s -G --data-urlencode \"url=$1\" \\\n    \
-                 \"http://127.0.0.1:{}/callback\" \\\n    \
+                 \"{}\" \\\n    \
                  >/dev/null 2>&1 &\n",
-                self.port
+                self.callback_url
             ),
         )?;
         let cleanup_script = script_path.clone();
@@ -804,15 +841,9 @@ end open location
 
     fn register_windows(&mut self) -> Result<()> {
         let script_path =
-            std::env::temp_dir().join(format!("zendesk-mcp-auth-{}.bat", std::process::id()));
-        write_private(
-            &script_path,
-            &format!(
-                "@echo off\r\ncurl -s -G --data-urlencode \"url=%1\" ^\r\n    \
-                 \"http://127.0.0.1:{}/callback\" >nul 2>&1\r\n",
-                self.port
-            ),
-        )?;
+            std::env::temp_dir().join(format!("zendesk-mcp-auth-{}.ps1", std::process::id()));
+        let (script, command) = windows_handler(&script_path, &self.callback_url);
+        write_private(&script_path, &script)?;
         let key = format!("HKCU\\Software\\Classes\\{URL_SCHEME}");
         let cleanup_script = script_path.clone();
         let cleanup_key = key.clone();
@@ -838,12 +869,27 @@ end open location
             &format!("{key}\\shell\\open\\command"),
             "/ve",
             "/d",
-            &format!("\"{}\" \"%1\"", script_path.display()),
+            &command,
             "/f",
         ]))?;
         tracing::info!("Registered Windows URL scheme handler via registry");
         Ok(())
     }
+}
+
+/// PowerShell script text and registry `open\command` value for the Windows handler. The
+/// URL reaches PowerShell as a script argument, so cmd.exe never parses it.
+fn windows_handler(script_path: &Path, callback_url: &str) -> (String, String) {
+    let script = format!(
+        "param([string]$u)\r\nInvoke-RestMethod -Uri (\"{callback_url}?url=\" + \
+         [uri]::EscapeDataString($u)) | Out-Null\r\n"
+    );
+    let command = format!(
+        "\"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\" -NoProfile \
+         -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File \"{}\" \"%1\"",
+        script_path.display()
+    );
+    (script, command)
 }
 
 impl Drop for UrlSchemeHandler {
@@ -863,6 +909,18 @@ fn login_priority(login: &Value) -> u8 {
         _ => 99,
     }
 }
+
+/// The lookup response is untrusted: the URL goes to browser binaries as an argument and to
+/// `window.open`, so only https is accepted (no `-flag`, `javascript:` or `file:`).
+fn require_https_login_url(auth_url: &str) -> Result<String> {
+    match url::Url::parse(auth_url) {
+        Ok(parsed) if parsed.scheme() == "https" => Ok(auth_url.to_string()),
+        _ => bail!("Zendesk returned an unexpected login URL"),
+    }
+}
+
+const REJECTED_TOKEN: &str =
+    "The sign-in returned a token Zendesk does not accept; nothing was saved.";
 
 /// Non-interactive browser sign-in used by the server at startup.
 ///
@@ -906,10 +964,11 @@ pub async fn auth_via_browser(
             .map(String::from)
     };
     let auth_url = auth_url.ok_or_else(|| anyhow!("No authentication URL found."))?;
-    let full_auth_url = build_auth_url(&auth_url);
+    let full_auth_url = build_auth_url(&require_https_login_url(&auth_url)?);
 
     let mut server = start_callback_server(subdomain, full_auth_url.clone(), false).await?;
-    let mut scheme_handler = UrlSchemeHandler::new(server.port);
+    let mut scheme_handler =
+        UrlSchemeHandler::new(server.port).with_callback_url(server.callback_url());
     let registered = scheme_handler.register();
 
     if registered {
@@ -924,7 +983,7 @@ pub async fn auth_via_browser(
             open_in_default_browser(&full_auth_url);
         }
     } else {
-        let local_url = format!("http://127.0.0.1:{}/auth", server.port);
+        let local_url = server.auth_url();
         tracing::warn!("Opening the manual sign-in page: {local_url}");
         if !open_in_private_window(&local_url) {
             open_in_default_browser(&local_url);
@@ -974,6 +1033,9 @@ pub async fn ensure_auth(http: &reqwest::Client, subdomain: Option<&str>) -> Res
             )
         })?;
     let token = auth_via_browser(http, &subdomain, BROWSER_TIMEOUT).await?;
+    if !verify_token(http, &token.subdomain, &token.access_token).await {
+        bail!(REJECTED_TOKEN);
+    }
     save_token(&token)?;
     tracing::info!("OAuth token saved");
     Ok(token)
@@ -1001,8 +1063,9 @@ fn login_label(service: &str) -> &str {
 
 /// Browser sign-in that also accepts the callback URL pasted into the terminal.
 async fn auth_sso_browser_interactive(subdomain: &str, auth_url: &str) -> Result<MobileToken> {
-    let mut server = start_callback_server(subdomain, build_auth_url(auth_url), true).await?;
-    let local_url = format!("http://127.0.0.1:{}/auth", server.port);
+    let full_auth_url = build_auth_url(&require_https_login_url(auth_url)?);
+    let mut server = start_callback_server(subdomain, full_auth_url, true).await?;
+    let local_url = server.auth_url();
     println!("\nOpening browser for Zendesk login...");
     println!("If the browser doesn't open, visit: {local_url}\n");
     open_in_default_browser(&local_url);
@@ -1141,7 +1204,11 @@ pub async fn run_auth_cli(http: reqwest::Client) -> Result<()> {
                     .filter(|s| !s.is_empty())
             })
             .ok_or_else(|| anyhow!("no authentication URL found."))?;
-        auth_sso_browser_interactive(&subdomain, auth_url).await?
+        let token = auth_sso_browser_interactive(&subdomain, auth_url).await?;
+        if !verify_token(&http, &token.subdomain, &token.access_token).await {
+            bail!(REJECTED_TOKEN);
+        }
+        token
     };
 
     let path = save_token(&token)?;
@@ -1170,11 +1237,11 @@ mod tests {
         }
     }
 
-    fn callback_url(port: u16, url: &str) -> String {
+    fn callback_url(server: &CallbackServer, url: &str) -> String {
         let query = url::form_urlencoded::Serializer::new(String::new())
             .append_pair("url", url)
             .finish();
-        format!("http://127.0.0.1:{port}/callback?{query}")
+        format!("{}?{query}", server.callback_url())
     }
 
     #[test]
@@ -1415,7 +1482,7 @@ mod tests {
             .await
             .unwrap();
         let resp = reqwest::get(callback_url(
-            server.port,
+            &server,
             "zendesk-support://authenticate?access_token=abc",
         ))
         .await
@@ -1443,7 +1510,7 @@ mod tests {
             .await
             .unwrap();
         let body: Value = reqwest::get(callback_url(
-            server.port,
+            &server,
             "zendesk-support://authenticate?access_token=abc&username=Ada",
         ))
         .await
@@ -1460,7 +1527,7 @@ mod tests {
         let server = start_callback_server("acme", "https://x/login?a=1&b=\"2\"".into(), false)
             .await
             .unwrap();
-        let page = reqwest::get(format!("http://127.0.0.1:{}/auth", server.port))
+        let page = reqwest::get(server.auth_url())
             .await
             .unwrap()
             .text()
@@ -1476,7 +1543,7 @@ mod tests {
             .await
             .unwrap();
         let body: Value = reqwest::get(callback_url(
-            server.port,
+            &server,
             "zendesk-support://authenticate?foo=1",
         ))
         .await
@@ -1488,5 +1555,114 @@ mod tests {
             body,
             json!({"ok": false, "error": "Could not parse access token from URL."})
         );
+    }
+
+    #[tokio::test]
+    async fn callback_and_auth_routes_require_the_nonce() {
+        let server = start_callback_server("acme", "https://x/login".into(), false)
+            .await
+            .unwrap();
+        let base = format!("http://127.0.0.1:{}", server.port);
+        let token_url = "zendesk-support://authenticate?access_token=abc";
+        let bad_paths = [
+            format!("/callback?url={token_url}"),
+            format!("/callback/wrong?url={token_url}"),
+            "/auth".to_string(),
+            "/auth/wrong".to_string(),
+            "/".to_string(),
+        ];
+        for bad in bad_paths {
+            let resp = reqwest::get(format!("{base}{bad}")).await.unwrap();
+            assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND, "{bad}");
+            assert_eq!(resp.text().await.unwrap(), "", "{bad}");
+        }
+        assert!(server.tokens.is_empty());
+        let ok = reqwest::get(server.auth_url()).await.unwrap();
+        assert_eq!(ok.status(), reqwest::StatusCode::OK);
+        assert_eq!(server.nonce.len(), 43);
+    }
+
+    #[tokio::test]
+    async fn pages_embed_the_nonce_in_their_javascript() {
+        let mut server = start_callback_server("acme", "https://x/login".into(), false)
+            .await
+            .unwrap();
+        let expected = format!("fetch('/callback/{}?url=", server.nonce);
+        let page = reqwest::get(server.auth_url())
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(page.contains(&expected));
+        assert!(!page.contains("__NONCE__"));
+        let success = reqwest::get(callback_url(
+            &server,
+            "zendesk-support://authenticate?access_token=abc",
+        ))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+        assert!(success.contains(&expected));
+        assert!(!success.contains("__NONCE__"));
+        assert!(server.tokens.recv().await.is_some());
+    }
+
+    #[test]
+    fn save_token_leaves_no_temp_file_and_sets_0600() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("token.json");
+        // An existing loose file is replaced, not reused.
+        std::fs::write(&file, "old").unwrap();
+        save_token_to(&token("abc"), &file).unwrap();
+        save_token_to(&token("def"), &file).unwrap();
+        assert_eq!(load_token_from(&file), Some(token("def")));
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("token.json")]);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+    }
+
+    #[test]
+    fn login_url_must_be_https() {
+        for bad in [
+            "-foo",
+            "javascript:alert(1)",
+            "http://x",
+            "file:///etc/passwd",
+            "",
+        ] {
+            let err = require_https_login_url(bad).unwrap_err().to_string();
+            assert_eq!(err, "Zendesk returned an unexpected login URL", "{bad}");
+        }
+        assert_eq!(
+            require_https_login_url("https://acme.zendesk.com/sso").unwrap(),
+            "https://acme.zendesk.com/sso"
+        );
+    }
+
+    #[test]
+    fn windows_handler_uses_powershell_without_cmd() {
+        let callback = callback_url_for(4242, "NONCE");
+        let (script, command) =
+            windows_handler(Path::new(r"C:\Temp\zendesk-mcp-auth-1.ps1"), &callback);
+        assert_eq!(
+            script,
+            "param([string]$u)\r\nInvoke-RestMethod -Uri (\"http://127.0.0.1:4242/callback/NONCE?url=\" + [uri]::EscapeDataString($u)) | Out-Null\r\n"
+        );
+        assert_eq!(
+            command,
+            "\"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\" -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File \"C:\\Temp\\zendesk-mcp-auth-1.ps1\" \"%1\""
+        );
+        assert!(!command.contains("cmd") && !command.contains(".bat"));
     }
 }

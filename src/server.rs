@@ -849,7 +849,12 @@ fn http_router(server: ZendeskServer, bearer_token: &str, ct: CancellationToken)
     let service = StreamableHttpService::new(
         move || Ok(server.clone()),
         LocalSessionManager::default().into(),
-        StreamableHttpServerConfig::default().with_cancellation_token(ct.child_token()),
+        // rmcp accepts only loopback `Host` headers by default, a DNS-rebinding guard for
+        // unauthenticated local servers. This one is bearer-protected and meant to be
+        // reached by name, so accept any `Host`.
+        StreamableHttpServerConfig::default()
+            .with_cancellation_token(ct.child_token())
+            .disable_allowed_hosts(),
     );
     let expected = bearer_token.to_string();
     axum::Router::new()
@@ -861,10 +866,16 @@ fn http_router(server: ZendeskServer, bearer_token: &str, ct: CancellationToken)
                     .headers()
                     .get(axum::http::header::AUTHORIZATION)
                     .and_then(|v| v.to_str().ok())
-                    .and_then(|v| v.strip_prefix("Bearer "));
+                    .and_then(|v| v.split_once(' '))
+                    .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
+                    .map(|(_, token)| token.trim());
                 match presented {
                     Some(t) if constant_time_eq(t.as_bytes(), expected.as_bytes()) => Ok(()),
-                    _ => Err(axum::http::StatusCode::UNAUTHORIZED.into_response()),
+                    _ => Err((
+                        axum::http::StatusCode::UNAUTHORIZED,
+                        [(axum::http::header::WWW_AUTHENTICATE, "Bearer")],
+                    )
+                        .into_response()),
                 }
             },
         ))
@@ -904,11 +915,34 @@ pub async fn run(args: ServeArgs, http: reqwest::Client) -> Result<()> {
     );
     axum::serve(listener, router)
         .with_graceful_shutdown(async move {
-            let _ = tokio::signal::ctrl_c().await;
+            shutdown_signal().await;
             ct.cancel();
         })
         .await?;
     Ok(())
+}
+
+/// Ctrl-C, or SIGTERM (what `docker stop` sends to PID 1).
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                term.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
 }
 
 #[cfg(test)]
@@ -1046,6 +1080,46 @@ mod tests {
         let url = format!("http://{addr}/mcp");
         let anonymous = http.post(&url).body("{}").send().await.unwrap();
         assert_eq!(anonymous.status(), 401);
+        assert_eq!(
+            anonymous
+                .headers()
+                .get("www-authenticate")
+                .and_then(|v| v.to_str().ok()),
+            Some("Bearer")
+        );
+
+        let wrong = http
+            .post(&url)
+            .bearer_auth("wrong")
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(wrong.status(), 401);
+
+        // The scheme is case-insensitive (RFC 7235).
+        let lowercase_scheme = http
+            .post(&url)
+            .header("authorization", "bearer right-token")
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_ne!(lowercase_scheme.status(), 401);
+
+        // Remote deployments reach the server by name, which rmcp rejects by default.
+        let by_name = http
+            .post(&url)
+            .bearer_auth("right-token")
+            .header("host", "mcp.example.com")
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .body("not json")
+            .send()
+            .await
+            .unwrap();
+        assert_ne!(by_name.status(), 403);
+        assert_ne!(by_name.status(), 401);
 
         let authorized = http
             .post(&url)

@@ -21,7 +21,7 @@ RUN apt-get update \
     && apt-get install --no-install-recommends -y ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --uid 10001 --user-group --shell /usr/sbin/nologin appuser \
-    && mkdir /tokens \
+    && mkdir -m 700 /tokens \
     && chown appuser:appuser /tokens
 
 COPY --from=builder /zendesk-mcp-server /usr/local/bin/zendesk-mcp-server
