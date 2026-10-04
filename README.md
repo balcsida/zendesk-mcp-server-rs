@@ -454,12 +454,21 @@ Create a new comment on an existing ticket.
 - `comment` (string): Markdown, plain text and HTML are accepted
 - `public` (boolean, optional): Whether the comment is public (defaults to true)
 - `status` (string, optional): Also set the ticket status in the same update: `new`, `open`, `pending`, `hold`, `solved`. The result text mentions it.
+- `upload_tokens` (array of strings, optional): Tokens from `upload_attachment` to attach to the comment
 
 #### get_ticket_attachment
 
 Fetch a ticket attachment by its `content_url` and return the file as base64-encoded data.
 
 - `content_url` (string): The `content_url` from `get_ticket_comments`
+
+#### upload_attachment
+
+Upload a file to attach to a ticket. Returns a `token` (valid for 60 minutes) and the `attachment` (`id`, `file_name`, `content_type`, `size`, `content_url`); pass the token to `create_ticket_comment` or `create_ticket` as `upload_tokens`. Needs the `ticket_attachments:write` scope.
+
+- `filename` (string): The name the file gets on the comment; keep the extension matching the content type
+- `content_type` (string): MIME type, e.g. `image/png` or `application/pdf`
+- `data_base64` (string): The file content, base64-encoded (max 10 MB decoded)
 
 #### create_ticket
 
@@ -484,6 +493,7 @@ Create a new ticket.
 - `external_id` (string, optional)
 - `public` (boolean, optional): Whether the description is a public comment; `false` makes it an internal note (defaults to true)
 - `email_ccs` (array[string], optional): Email addresses to add as CCs
+- `upload_tokens` (array[string], optional): Tokens from `upload_attachment` to attach to the description
 
 The created ticket also reports `group_id`, `ticket_form_id`, `brand_id`, `custom_status_id`, `problem_id`, `due_at` and `external_id`.
 

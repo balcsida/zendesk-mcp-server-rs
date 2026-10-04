@@ -77,6 +77,8 @@ pub struct CreateTicket {
     /// `{name, email}` of the requester, created as an end user if needed.
     pub requester: Option<Value>,
     pub email_ccs: Option<Vec<String>>,
+    /// Tokens from `upload_attachment`, sent as `comment.uploads`.
+    pub upload_tokens: Option<Vec<String>>,
 }
 
 #[derive(Clone)]
@@ -399,6 +401,26 @@ impl ZendeskClient {
     pub(super) async fn api_post(&self, path: &str, body: &Value) -> Result<Value> {
         let url = self.url(path, &[])?;
         let resp = self.send(|| self.http.post(url.clone()).json(body)).await?;
+        json_or_null(resp).await
+    }
+
+    /// POST raw `bytes` as the body with the given `Content-Type` (file uploads).
+    pub(super) async fn api_post_bytes(
+        &self,
+        path: &str,
+        params: &[(&str, &(dyn Display + Sync))],
+        content_type: &str,
+        bytes: Vec<u8>,
+    ) -> Result<Value> {
+        let url = self.url(path, params)?;
+        let resp = self
+            .send(|| {
+                self.http
+                    .post(url.clone())
+                    .header(reqwest::header::CONTENT_TYPE, content_type)
+                    .body(bytes.clone())
+            })
+            .await?;
         json_or_null(resp).await
     }
 

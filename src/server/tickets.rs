@@ -81,6 +81,8 @@ struct CreateTicketParams {
     public: bool,
     /// Email addresses to add as CCs
     email_ccs: Option<Vec<String>>,
+    /// Upload tokens from upload_attachment to attach to the description
+    upload_tokens: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -119,6 +121,8 @@ struct CreateCommentParams {
     public: bool,
     /// Also set the ticket status in the same update: new, open, pending, hold, solved
     status: Option<String>,
+    /// Upload tokens from upload_attachment to attach to the comment
+    upload_tokens: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -256,6 +260,16 @@ struct OrganizationTicketsParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct UploadAttachmentParams {
+    /// The name the file gets on the comment; keep the extension matching the content type
+    filename: String,
+    /// MIME type of the file, e.g. image/png or application/pdf
+    content_type: String,
+    /// The file content, base64-encoded (max 10 MB decoded)
+    data_base64: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct UpdateTicketTagsParams {
     /// The ID of the ticket
     ticket_id: u64,
@@ -306,6 +320,7 @@ impl ZendeskServer {
                 external_id: p.external_id,
                 public: Some(p.public),
                 email_ccs: p.email_ccs,
+                upload_tokens: p.upload_tokens,
             };
             let created = c.create_ticket(ticket).await?;
             Ok(wrapped("Ticket created successfully", "ticket", created))
@@ -347,7 +362,13 @@ impl ZendeskServer {
     ) -> CallToolResult {
         self.call(|c| async move {
             let comment = c
-                .post_comment(p.ticket_id, &p.comment, p.public, p.status.as_deref())
+                .post_comment(
+                    p.ticket_id,
+                    &p.comment,
+                    p.public,
+                    p.status.as_deref(),
+                    &p.upload_tokens.unwrap_or_default(),
+                )
                 .await?;
             let status_note = p
                 .status
@@ -375,6 +396,21 @@ impl ZendeskServer {
             } else {
                 json_block(&json!({ "content_type": a.content_type, "data_base64": a.data_base64 }))
             }
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Upload a file (base64, up to 10 MB) to attach to a ticket. Returns a token, valid for 60 minutes, to pass to create_ticket_comment or create_ticket as upload_tokens.",
+        annotations(destructive_hint = false)
+    )]
+    async fn upload_attachment(
+        &self,
+        Parameters(p): Parameters<UploadAttachmentParams>,
+    ) -> CallToolResult {
+        self.call_json(|c| async move {
+            c.upload_attachment(&p.filename, &p.content_type, &p.data_base64)
+                .await
         })
         .await
     }

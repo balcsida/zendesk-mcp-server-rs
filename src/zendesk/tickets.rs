@@ -231,6 +231,7 @@ impl ZendeskClient {
         comment: &str,
         public: bool,
         status: Option<&str>,
+        upload_tokens: &[String],
     ) -> Result<String> {
         async {
             if let Some(status) = status
@@ -247,12 +248,67 @@ impl ZendeskClient {
             if let Some(status) = status {
                 body["ticket"]["status"] = json!(status);
             }
+            if !upload_tokens.is_empty() {
+                body["ticket"]["comment"]["uploads"] = json!(upload_tokens);
+            }
             self.api_put(&format!("tickets/{ticket_id}.json"), &body)
                 .await?;
             Ok(comment.to_string())
         }
         .await
         .map_err(ctx(format!("Failed to post comment on ticket {ticket_id}")))
+    }
+
+    /// Uploads a file for attaching to a comment; returns the token (valid for 60 minutes)
+    /// to pass as `upload_tokens`.
+    pub async fn upload_attachment(
+        &self,
+        filename: &str,
+        content_type: &str,
+        data_base64: &str,
+    ) -> Result<Value> {
+        async {
+            if filename.is_empty() || content_type.is_empty() {
+                bail!("filename and content_type must not be empty");
+            }
+            if data_base64.len() > MAX_ATTACHMENT_BYTES / 3 * 4 + 4 {
+                bail!(
+                    "File exceeds the {} MB size limit.",
+                    MAX_ATTACHMENT_BYTES / (1024 * 1024)
+                );
+            }
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(data_base64.trim())
+                .map_err(|e| anyhow!("data_base64 is not valid base64: {e}"))?;
+            if bytes.is_empty() {
+                bail!("data_base64 decodes to an empty file");
+            }
+            if bytes.len() > MAX_ATTACHMENT_BYTES {
+                bail!(
+                    "File exceeds the {} MB size limit.",
+                    MAX_ATTACHMENT_BYTES / (1024 * 1024)
+                );
+            }
+            let data = self
+                .api_post_bytes(
+                    "uploads.json",
+                    &[("filename", &filename)],
+                    content_type,
+                    bytes,
+                )
+                .await?;
+            let upload = object(&data, "upload")?;
+            Ok(json!({
+                "token": upload["token"],
+                "attachment": pick(
+                    &upload["attachment"],
+                    &["id", "file_name", "content_type", "size", "content_url"],
+                    &[],
+                ),
+            }))
+        }
+        .await
+        .map_err(ctx("Failed to upload attachment"))
     }
 
     pub async fn get_tickets(
@@ -301,6 +357,9 @@ impl ZendeskClient {
                 bail!("Give either requester or requester_id, not both");
             }
             let mut comment = json!({"body": ticket.description});
+            if let Some(tokens) = ticket.upload_tokens.filter(|t| !t.is_empty()) {
+                comment["uploads"] = json!(tokens);
+            }
             if let Some(public) = ticket.public {
                 comment["public"] = json!(public);
             }
@@ -1182,7 +1241,7 @@ mod tests {
             .mount(&server)
             .await;
         let out = client(&server)
-            .post_comment(3, "a\nb", false, Some("pending"))
+            .post_comment(3, "a\nb", false, Some("pending"), &["tok".into()])
             .await
             .unwrap();
         assert_eq!(out, "a\nb");
@@ -1191,13 +1250,56 @@ mod tests {
         let comment = &body["ticket"]["comment"];
         assert!(comment["html_body"].as_str().unwrap().contains("<br"));
         assert_eq!(comment["public"], false);
+        assert_eq!(comment["uploads"], json!(["tok"]));
         assert_eq!(body["ticket"]["status"], "pending");
+    }
+
+    #[tokio::test]
+    async fn upload_posts_raw_bytes_with_content_type_and_filename() {
+        use wiremock::matchers::header;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v2/uploads.json"))
+            .and(query_param("filename", "crash report.png"))
+            .and(header("content-type", "image/png"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({"upload": {
+                "token": "tok1",
+                "attachment": {"id": 7, "file_name": "crash report.png", "content_type": "image/png",
+                               "size": 10, "content_url": "https://x/a", "deleted": false},
+            }})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let c = client(&server);
+        let data = base64::engine::general_purpose::STANDARD.encode(PNG);
+        let out = c
+            .upload_attachment("crash report.png", "image/png", &data)
+            .await
+            .unwrap();
+        assert_eq!(out["token"], "tok1");
+        assert_eq!(out["attachment"]["id"], 7);
+        assert!(out["attachment"].get("deleted").is_none());
+        assert_eq!(server.received_requests().await.unwrap()[0].body, PNG);
+
+        let err = c
+            .upload_attachment("a.png", "image/png", "!!!")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not valid base64"), "{err}");
+        let big =
+            base64::engine::general_purpose::STANDARD.encode(vec![0u8; MAX_ATTACHMENT_BYTES + 1]);
+        let err = c
+            .upload_attachment("a.bin", "application/octet-stream", &big)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("size limit"), "{err}");
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 
     #[tokio::test]
     async fn post_comment_rejects_unknown_status() {
         let err = offline_client()
-            .post_comment(3, "x", true, Some("closed"))
+            .post_comment(3, "x", true, Some("closed"), &[])
             .await
             .unwrap_err();
         assert!(err.to_string().contains("Invalid status 'closed'"), "{err}");
@@ -1220,6 +1322,7 @@ mod tests {
                 description: "d".into(),
                 requester: Some(json!({"name": "Ann", "email": "ann@example.com"})),
                 email_ccs: Some(vec!["cc@example.com".into()]),
+                upload_tokens: Some(vec!["tok".into()]),
                 public: Some(false),
                 group_id: Some(5),
                 problem_id: Some(2),
@@ -1233,7 +1336,10 @@ mod tests {
         let requests = server.received_requests().await.unwrap();
         let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
         let ticket = &body["ticket"];
-        assert_eq!(ticket["comment"], json!({"body": "d", "public": false}));
+        assert_eq!(
+            ticket["comment"],
+            json!({"body": "d", "uploads": ["tok"], "public": false})
+        );
         assert_eq!(ticket["requester"]["email"], "ann@example.com");
         assert_eq!(
             ticket["email_ccs"],
