@@ -826,6 +826,53 @@ impl ZendeskClient {
         .map_err(ctx("Search failed"))
     }
 
+    /// Every ticket matching `query`, instead of one page like `search`. Zendesk search
+    /// returns at most 1,000 results (page 11 at 100 per page is a 422), so this stops after
+    /// 10 pages and sets `truncated` when more remain. Non-ticket results are skipped, so
+    /// `query` should be scoped to tickets (e.g. `type:ticket status:open`).
+    pub async fn search_all_tickets(
+        &self,
+        query: &str,
+        sort_by: &str,
+        sort_order: &str,
+    ) -> Result<Value> {
+        async {
+            let mut tickets = Vec::new();
+            let mut truncated = false;
+            for page in 1..=10u64 {
+                let data = self
+                    .api_get(
+                        "search.json",
+                        &[
+                            ("query", &query),
+                            ("page", &page),
+                            ("per_page", &100u64),
+                            ("sort_by", &sort_by),
+                            ("sort_order", &sort_order),
+                            ("include", &"tickets(users)"),
+                        ],
+                    )
+                    .await?;
+                let names = side_loaded_user_names(&data);
+                tickets.extend(
+                    data.get("results")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter(|r| r.get("result_type").and_then(Value::as_str) == Some("ticket"))
+                        .map(|t| with_user_names(pick(t, &TICKET_SUMMARY_KEYS, &[]), t, &names)),
+                );
+                truncated = !data["next_page"].is_null();
+                if !truncated {
+                    break;
+                }
+            }
+            Ok(json!({ "count": tickets.len(), "truncated": truncated, "tickets": tickets }))
+        }
+        .await
+        .map_err(ctx("Search failed"))
+    }
+
     pub async fn get_user(&self, user_id: u64) -> Result<Value> {
         async {
             let data = self.api_get(&format!("users/{user_id}.json"), &[]).await?;
@@ -1842,6 +1889,33 @@ mod tests {
         assert_eq!(out["count"], 2);
         assert_eq!(out["incidents"][0]["id"], 10);
         assert_eq!(out["incidents"][1]["id"], 11);
+    }
+
+    #[tokio::test]
+    async fn search_all_tickets_stops_at_the_search_result_limit() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/search.json"))
+            .and(query_param("include", "tickets(users)"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": [
+                    {"result_type": "ticket", "id": 1, "requester_id": 5, "extra": true},
+                    {"result_type": "user", "id": 5}
+                ],
+                "users": [{"id": 5, "name": "Ann"}],
+                "next_page": "more"
+            })))
+            .expect(10)
+            .mount(&server)
+            .await;
+        let out = client(&server)
+            .search_all_tickets("type:ticket", "created_at", "desc")
+            .await
+            .unwrap();
+        assert_eq!(out["count"], 10);
+        assert_eq!(out["truncated"], true);
+        assert_eq!(out["tickets"][0]["requester_name"], "Ann");
+        assert!(out["tickets"][0].get("extra").is_none());
     }
 
     #[tokio::test]

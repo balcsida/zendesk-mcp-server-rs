@@ -253,6 +253,18 @@ struct SearchParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct SearchAllTicketsParams {
+    /// ZQL search query, e.g. 'type:ticket status:open priority:urgent'
+    query: String,
+    /// updated_at, created_at, priority, status, ticket_type (defaults to created_at)
+    #[serde(default = "sort_by_created_at")]
+    sort_by: String,
+    /// asc or desc
+    #[serde(default = "sort_desc")]
+    sort_order: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct UserIdParams {
     /// The user ID
     user_id: u64,
@@ -573,6 +585,20 @@ impl ZendeskServer {
     async fn search(&self, Parameters(p): Parameters<SearchParams>) -> CallToolResult {
         self.call_json(|c| async move {
             c.search(&p.query, p.page, p.per_page, &p.sort_by, &p.sort_order)
+                .await
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Search Zendesk tickets with ZQL and return every match instead of one page like 'search', up to Zendesk's 1,000-result search limit ('truncated' is true when more matched; narrow the query to get the rest). Use for 'find all tickets matching X' queries."
+    )]
+    async fn search_all_tickets(
+        &self,
+        Parameters(p): Parameters<SearchAllTicketsParams>,
+    ) -> CallToolResult {
+        self.call_json(|c| async move {
+            c.search_all_tickets(&p.query, &p.sort_by, &p.sort_order)
                 .await
         })
         .await
@@ -981,7 +1007,7 @@ async fn shutdown_signal() {
 mod tests {
     use super::*;
 
-    const TOOLS: [&str; 31] = [
+    const TOOLS: [&str; 32] = [
         "get_ticket",
         "create_ticket",
         "get_tickets",
@@ -990,6 +1016,7 @@ mod tests {
         "get_ticket_attachment",
         "update_ticket",
         "search",
+        "search_all_tickets",
         "get_user",
         "get_current_user",
         "search_users",
@@ -1026,7 +1053,7 @@ mod tests {
     }
 
     #[test]
-    fn lists_exactly_the_31_tools() {
+    fn lists_exactly_the_32_tools() {
         let mut names: Vec<String> = ZendeskServer::tool_router()
             .list_all()
             .iter()

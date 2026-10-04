@@ -519,6 +519,14 @@ Search with Zendesk Query Language (ZQL) across tickets, users and organizations
 
 Ticket results include `requester_name` and `assignee_name` when Zendesk returns the users.
 
+#### search_all_tickets
+
+Search tickets with ZQL and return every match instead of one page, up to Zendesk's 1,000-result search limit. `truncated` is true when more tickets matched; narrow the query (for example with `created>2026-01-01`) to get the rest.
+
+- `query` (string): ZQL query scoped to tickets, for example `type:ticket status:open`
+- `sort_by` (string, optional): `updated_at`, `created_at`, `priority`, `status`, `ticket_type` (defaults to `created_at`)
+- `sort_order` (string, optional): `asc` or `desc` (defaults to `desc`)
+
 ### Users and organizations
 
 #### get_user
