@@ -100,6 +100,7 @@ Please fetch the ticket info, comments and knowledge base to draft a professiona
 The response should be formatted well and ready to be posted as a comment.
 ";
 
+mod custom_objects;
 mod help_center;
 mod people;
 mod ticket_ops;
@@ -117,7 +118,8 @@ impl ZendeskServer {
                 + Self::people_router()
                 + Self::ticket_ops_router()
                 + Self::workflows_router()
-                + Self::help_center_router(),
+                + Self::help_center_router()
+                + Self::custom_objects_router(),
             prompt_router: Self::prompt_router(),
         }
     }
@@ -454,7 +456,7 @@ async fn shutdown_signal() {
 mod tests {
     use super::*;
 
-    const TOOLS: [&str; 60] = [
+    const TOOLS: [&str; 64] = [
         "get_ticket",
         "create_ticket",
         "get_tickets",
@@ -515,6 +517,10 @@ mod tests {
         "get_group_members",
         "list_brands",
         "get_account_settings",
+        "list_custom_objects",
+        "get_custom_object",
+        "search_custom_object_records",
+        "get_custom_object_record",
     ];
 
     fn server() -> ZendeskServer {
@@ -528,7 +534,7 @@ mod tests {
     }
 
     #[test]
-    fn lists_exactly_the_60_tools() {
+    fn lists_exactly_the_64_tools() {
         let mut names: Vec<String> = server()
             .tool_router
             .list_all()

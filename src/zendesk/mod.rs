@@ -615,6 +615,7 @@ pub(super) const TICKET_SUMMARY_KEYS: [&str; 9] = [
     "updated_at",
 ];
 
+mod custom_objects;
 mod help_center;
 mod people;
 mod ticket_ops;

@@ -837,6 +837,36 @@ List the brands of the account as `{id, name, subdomain, brand_url, default, act
 
 Get feature flags and defaults: `active_features` (such as `custom_objects_activated`, `business_hours`, `allow_ccs`), `brands`, `tickets`, `agents`, `localization`, `limits`, `routing` and `users`, each as Zendesk returns it (null when absent). They tell you which other tools apply. No inputs.
 
+### Custom objects
+
+#### list_custom_objects
+
+List the custom objects of the account as `{key, title, title_pluralized, description, created_at, updated_at}`. Custom objects are account-defined record types (products, orders, assets) linked to tickets through lookup fields; check `active_features.custom_objects_activated` in `get_account_settings`. No inputs.
+
+#### get_custom_object
+
+Get a custom object and its fields. Returns `object` and `fields` (`key`, `title`, `type`, `required`, `description`, `custom_field_options` as `[{name, value}]` or null, `relationship_target_type`).
+
+- `key` (string): The custom object key from `list_custom_objects`
+
+#### search_custom_object_records
+
+List or search the records of a custom object, one cursor page at a time. With neither `query` nor `filter` it lists the records. Returns `records` (`id`, `name`, `external_id`, `custom_object_fields`, `created_at`, `updated_at`), `count` (when Zendesk sends it), `has_more` and `after_cursor`.
+
+- `key` (string): The custom object key
+- `query` (string, optional): Text search; it covers text fields only
+- `filter` (object, optional): Zendesk filter for other field types, such as `{"custom_object_fields.status": {"$eq": "open"}}` or `{"$and": [...]}`
+- `sort` (string, optional): `id`, `updated_at` (list) or `name`, `created_at`, `updated_at` (search), with a leading `-` for descending
+- `page_size` (integer, optional): Defaults to 25, max 100
+- `after_cursor` (string, optional): The `after_cursor` of the previous page
+
+#### get_custom_object_record
+
+Get one custom object record.
+
+- `key` (string): The custom object key
+- `record_id` (string)
+
 ### Help Center
 
 #### search_articles
