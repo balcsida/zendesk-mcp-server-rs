@@ -740,6 +740,14 @@ impl ZendeskServer {
             .await
     }
 
+    #[tool(
+        description = "Retrieve the audit trail (all changes and events) for a Zendesk ticket by its ID"
+    )]
+    async fn get_ticket_audits(&self, Parameters(p): Parameters<TicketIdParams>) -> CallToolResult {
+        self.call_json(|c| async move { c.get_ticket_audits(p.ticket_id).await })
+            .await
+    }
+
     #[tool(description = "Find tickets that breached SLA within a specified time period")]
     async fn get_sla_breaches(
         &self,
@@ -964,7 +972,7 @@ async fn shutdown_signal() {
 mod tests {
     use super::*;
 
-    const TOOLS: [&str; 29] = [
+    const TOOLS: [&str; 30] = [
         "get_ticket",
         "create_ticket",
         "get_tickets",
@@ -992,6 +1000,7 @@ mod tests {
         "search_articles",
         "get_article",
         "get_ticket_metrics",
+        "get_ticket_audits",
         "get_sla_breaches",
         "get_sla_policies",
     ];
@@ -1007,7 +1016,7 @@ mod tests {
     }
 
     #[test]
-    fn lists_exactly_the_29_tools() {
+    fn lists_exactly_the_30_tools() {
         let mut names: Vec<String> = ZendeskServer::tool_router()
             .list_all()
             .iter()

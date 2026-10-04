@@ -614,6 +614,14 @@ Get performance and SLA metrics for a ticket (reply time, resolution time, wait 
 
 - `ticket_id` (integer)
 
+#### get_ticket_audits
+
+Retrieve the audit trail (all changes and events) for a ticket.
+
+- `ticket_id` (integer)
+
+Returns audits with id, author_id, created_at and a trimmed list of events (type, body, value changes and so on).
+
 #### get_sla_breaches
 
 Find tickets that breached SLA within a time period.

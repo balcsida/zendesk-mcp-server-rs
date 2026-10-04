@@ -1098,6 +1098,55 @@ impl ZendeskClient {
         .map_err(ctx(format!("Failed to get metrics for ticket {ticket_id}")))
     }
 
+    /// `events` are trimmed to the fields relevant across event types: `type`, `body`,
+    /// `html_body`, `public`, `value`, `previous_value` and `field_name`. Absent fields are
+    /// omitted rather than padded with nulls, since event shape varies by `type`.
+    pub async fn get_ticket_audits(&self, ticket_id: u64) -> Result<Value> {
+        async {
+            let audits = self
+                .get_paged(&format!("tickets/{ticket_id}/audits.json"), "audits")
+                .await?;
+            let audits: Vec<Value> = audits
+                .iter()
+                .map(|a| {
+                    let mut out = pick(a, &["id", "ticket_id", "author_id", "created_at"], &[]);
+                    let events = a
+                        .get("events")
+                        .and_then(Value::as_array)
+                        .map_or(&[][..], |e| e);
+                    out["events"] = Value::Array(
+                        events
+                            .iter()
+                            .map(|e| {
+                                let mut event = Map::new();
+                                for key in [
+                                    "type",
+                                    "body",
+                                    "html_body",
+                                    "public",
+                                    "value",
+                                    "previous_value",
+                                    "field_name",
+                                ] {
+                                    if let Some(v) = e.get(key)
+                                        && !v.is_null()
+                                    {
+                                        event.insert(key.to_string(), v.clone());
+                                    }
+                                }
+                                Value::Object(event)
+                            })
+                            .collect(),
+                    );
+                    out
+                })
+                .collect();
+            Ok(json!({ "count": audits.len(), "audits": audits }))
+        }
+        .await
+        .map_err(ctx(format!("Failed to get audits for ticket {ticket_id}")))
+    }
+
     pub async fn get_sla_breaches(&self, days_back: u64, metric: Option<&str>) -> Result<Value> {
         async {
             let days = i64::try_from(days_back.min(MAX_DAYS_BACK))?;
@@ -1616,6 +1665,43 @@ mod tests {
             .await;
         let out = client(&server).get_sla_policies().await.unwrap();
         assert_eq!(out, json!([{"id": 1}, {"id": 2}]));
+    }
+
+    #[tokio::test]
+    async fn get_ticket_audits_trims_event_fields() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/tickets/9/audits.json"))
+            .respond_with(json_page(
+                "audits",
+                json!([{
+                    "id": 1, "ticket_id": 9, "author_id": 4, "created_at": "c",
+                    "extra": true,
+                    "events": [
+                        {"type": "Comment", "body": "hi", "html_body": "<p>hi</p>",
+                            "public": true, "extra": "drop me"},
+                        {"type": "Change", "field_name": "status",
+                            "value": "open", "previous_value": "new"}
+                    ]
+                }]),
+                None,
+            ))
+            .mount(&server)
+            .await;
+        let out = client(&server).get_ticket_audits(9).await.unwrap();
+        assert_eq!(out["count"], 1);
+        let audit = &out["audits"][0];
+        assert_eq!(audit["id"], 1);
+        assert_eq!(audit["author_id"], 4);
+        assert!(audit.get("extra").is_none());
+        assert_eq!(
+            audit["events"][0],
+            json!({"type": "Comment", "body": "hi", "html_body": "<p>hi</p>", "public": true})
+        );
+        assert_eq!(
+            audit["events"][1],
+            json!({"type": "Change", "field_name": "status", "value": "open", "previous_value": "new"})
+        );
     }
 
     #[tokio::test]
