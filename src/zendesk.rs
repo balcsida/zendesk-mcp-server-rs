@@ -3,8 +3,12 @@
 //! Every method returns `serde_json::Value` shaped exactly like the Python server's
 //! output, so MCP clients see no difference after the rewrite.
 
-use anyhow::Result;
-use serde_json::Value;
+use std::fmt::Display;
+
+use anyhow::{Result, anyhow, bail};
+use base64::Engine;
+use pulldown_cmark::{Event, Options, Parser, html};
+use serde_json::{Map, Value, json};
 
 use crate::auth::Auth;
 
@@ -20,8 +24,14 @@ pub const ALLOWED_IMAGE_TYPES: [&str; 4] = ["image/jpeg", "image/png", "image/gi
 /// text keeps its line breaks; raw HTML in the input is passed through for Zendesk to
 /// sanitize server-side.
 pub fn markdown_to_html(text: &str) -> String {
-    let _ = text;
-    todo!("worker: client")
+    let options = Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH;
+    let events = Parser::new_ext(text, options).map(|event| match event {
+        Event::SoftBreak => Event::HardBreak,
+        other => other,
+    });
+    let mut out = String::new();
+    html::push_html(&mut out, events);
+    out
 }
 
 /// A fetched, validated image attachment.
@@ -54,6 +64,103 @@ pub struct ZendeskClient {
     auth: Auth,
 }
 
+/// Copy `keys` out of `obj`, defaulting to null (or `[]` for `array_keys`) when absent.
+fn pick(obj: &Value, keys: &[&str], array_keys: &[&str]) -> Value {
+    let mut out = Map::new();
+    for key in keys {
+        let value = match obj.get(*key) {
+            Some(v) if !v.is_null() => v.clone(),
+            _ if array_keys.contains(key) => json!([]),
+            _ => Value::Null,
+        };
+        out.insert((*key).to_string(), value);
+    }
+    Value::Object(out)
+}
+
+/// `pick` applied to every element of `data[key]`.
+fn pick_all(data: &Value, key: &str, keys: &[&str], array_keys: &[&str]) -> Value {
+    let items = data
+        .get(key)
+        .and_then(Value::as_array)
+        .map_or(&[][..], |a| a);
+    Value::Array(items.iter().map(|i| pick(i, keys, array_keys)).collect())
+}
+
+/// `[{id, value}]` from a ticket's raw `custom_fields`.
+fn custom_fields(ticket: &Value) -> Value {
+    let items = ticket.get("custom_fields").and_then(Value::as_array);
+    Value::Array(
+        items
+            .map_or(&[][..], |a| a)
+            .iter()
+            .map(|f| pick(f, &["id", "value"], &[]))
+            .collect(),
+    )
+}
+
+/// The shape `create_ticket` and `update_ticket` return.
+fn full_ticket(data: &Value) -> Result<Value> {
+    let ticket = data
+        .get("ticket")
+        .ok_or_else(|| anyhow!("Zendesk response has no 'ticket' object"))?;
+    let mut out = pick(
+        ticket,
+        &[
+            "id",
+            "subject",
+            "description",
+            "status",
+            "priority",
+            "type",
+            "created_at",
+            "updated_at",
+            "requester_id",
+            "assignee_id",
+            "organization_id",
+            "tags",
+        ],
+        &["tags"],
+    );
+    out["custom_fields"] = custom_fields(ticket);
+    Ok(out)
+}
+
+fn object<'a>(data: &'a Value, key: &str) -> Result<&'a Value> {
+    data.get(key)
+        .ok_or_else(|| anyhow!("Zendesk response has no '{key}' object"))
+}
+
+/// Prefix an error the way the Python server worded it.
+fn ctx(prefix: impl Display) -> impl FnOnce(anyhow::Error) -> anyhow::Error {
+    move |e| anyhow!("{prefix}: {e:#}")
+}
+
+fn magic_matches(content_type: &str, bytes: &[u8]) -> bool {
+    match content_type {
+        "image/jpeg" => bytes.starts_with(&[0xFF, 0xD8, 0xFF]),
+        "image/png" => bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]),
+        "image/gif" => bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a"),
+        "image/webp" => bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP"),
+        _ => false,
+    }
+}
+
+/// Fail on a non-success status with Zendesk's body (truncated), never the request headers.
+async fn ensure_success(resp: reqwest::Response, label: &str) -> Result<reqwest::Response> {
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(resp);
+    }
+    let body = resp.bytes().await.unwrap_or_default();
+    Err(status_error(status, label, &body))
+}
+
+fn status_error(status: reqwest::StatusCode, label: &str, body: &[u8]) -> anyhow::Error {
+    let text: String = String::from_utf8_lossy(body).chars().take(500).collect();
+    anyhow!("Zendesk API error HTTP {status} for {label}: {text}")
+}
+
 impl ZendeskClient {
     pub fn new(subdomain: &str, auth: Auth, http: reqwest::Client) -> Self {
         let base_url = format!("https://{subdomain}.zendesk.com/api/v2");
@@ -74,23 +181,231 @@ impl ZendeskClient {
         }
     }
 
-    pub fn subdomain(&self) -> &str {
-        &self.subdomain
+    fn url(&self, path: &str, params: &[(&str, &(dyn Display + Sync))]) -> Result<url::Url> {
+        let mut url = url::Url::parse(&format!("{}/{path}", self.base_url))?;
+        if !params.is_empty() {
+            let mut pairs = url.query_pairs_mut();
+            for (key, value) in params {
+                pairs.append_pair(key, &value.to_string());
+            }
+        }
+        Ok(url)
+    }
+
+    /// Send an authenticated request. After a 401 `invalid_token` under OAuth the token is
+    /// renewed and the request sent exactly once more.
+    async fn send(&self, make: impl Fn() -> reqwest::RequestBuilder) -> Result<reqwest::Response> {
+        let request = make().build()?;
+        let label = format!("{} {}", request.method(), request.url().path());
+
+        let value = self.auth.value().await?;
+        let mut resp = value.apply(make()).send().await?;
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED
+            && let Some(provider) = self.auth.oauth()
+        {
+            let body = resp.bytes().await.unwrap_or_default();
+            if !crate::oauth::is_invalid_token_body(&body) {
+                return Err(status_error(
+                    reqwest::StatusCode::UNAUTHORIZED,
+                    &label,
+                    &body,
+                ));
+            }
+            provider
+                .renew(
+                    "Zendesk reported the access token as invalid",
+                    value.bearer_token(),
+                )
+                .await?;
+            let fresh = self.auth.value().await?;
+            resp = fresh.apply(make()).send().await?;
+        }
+        ensure_success(resp, &label).await
+    }
+
+    async fn get_url(&self, url: url::Url) -> Result<Value> {
+        Ok(self
+            .send(|| self.http.get(url.clone()))
+            .await?
+            .json()
+            .await?)
+    }
+
+    async fn api_get(&self, path: &str, params: &[(&str, &(dyn Display + Sync))]) -> Result<Value> {
+        self.get_url(self.url(path, params)?).await
+    }
+
+    async fn api_post(&self, path: &str, body: &Value) -> Result<Value> {
+        let url = self.url(path, &[])?;
+        let resp = self.send(|| self.http.post(url.clone()).json(body)).await?;
+        Ok(resp.json().await?)
+    }
+
+    async fn api_put(&self, path: &str, body: &Value) -> Result<Value> {
+        let url = self.url(path, &[])?;
+        let resp = self.send(|| self.http.put(url.clone()).json(body)).await?;
+        Ok(resp.json().await?)
+    }
+
+    async fn api_delete(&self, path: &str) -> Result<()> {
+        let url = self.url(path, &[])?;
+        self.send(|| self.http.delete(url.clone())).await?;
+        Ok(())
+    }
+
+    /// Collect `key` from a listing, following the absolute `next_page` URLs until null.
+    async fn get_paged(&self, path: &str, key: &str) -> Result<Vec<Value>> {
+        let mut items = Vec::new();
+        let mut next = Some(self.url(path, &[])?);
+        while let Some(url) = next {
+            let data = self.get_url(url).await?;
+            if let Some(page) = data.get(key).and_then(Value::as_array) {
+                items.extend(page.iter().cloned());
+            }
+            next = match data.get("next_page").and_then(Value::as_str) {
+                Some(link) => Some(url::Url::parse(link)?),
+                None => None,
+            };
+        }
+        Ok(items)
     }
 
     pub async fn get_ticket(&self, ticket_id: u64) -> Result<Value> {
-        let _ = ticket_id;
-        todo!("worker: client")
+        async {
+            let data = self
+                .api_get(&format!("tickets/{ticket_id}.json"), &[])
+                .await?;
+            let ticket = object(&data, "ticket")?;
+            let mut out = pick(
+                ticket,
+                &[
+                    "id",
+                    "subject",
+                    "description",
+                    "status",
+                    "priority",
+                    "created_at",
+                    "updated_at",
+                    "requester_id",
+                    "assignee_id",
+                    "organization_id",
+                ],
+                &[],
+            );
+            out["custom_fields"] = custom_fields(ticket);
+            Ok(out)
+        }
+        .await
+        .map_err(ctx(format!("Failed to get ticket {ticket_id}")))
     }
 
     pub async fn get_ticket_comments(&self, ticket_id: u64) -> Result<Value> {
-        let _ = ticket_id;
-        todo!("worker: client")
+        async {
+            let comments = self
+                .get_paged(&format!("tickets/{ticket_id}/comments.json"), "comments")
+                .await?;
+            let out = comments.iter().map(|c| {
+                let mut out = pick(
+                    c,
+                    &[
+                        "id",
+                        "author_id",
+                        "body",
+                        "html_body",
+                        "public",
+                        "created_at",
+                    ],
+                    &[],
+                );
+                out["attachments"] = pick_all(
+                    c,
+                    "attachments",
+                    &["id", "file_name", "content_url", "content_type", "size"],
+                    &[],
+                );
+                out
+            });
+            Ok(Value::Array(out.collect()))
+        }
+        .await
+        .map_err(ctx(format!(
+            "Failed to get comments for ticket {ticket_id}"
+        )))
     }
 
     pub async fn get_ticket_attachment(&self, content_url: &str) -> Result<Attachment> {
-        let _ = content_url;
-        todo!("worker: client")
+        let (url, send_credentials) = self.validate_attachment_url(content_url)?;
+        self.fetch_attachment(url, send_credentials).await
+    }
+
+    /// Returns the parsed URL and whether Zendesk credentials may be sent to its host.
+    fn validate_attachment_url(&self, content_url: &str) -> Result<(url::Url, bool)> {
+        let url = url::Url::parse(content_url)
+            .map_err(|e| anyhow!("Attachment URL is not valid: {e}"))?;
+        if url.scheme() != "https" {
+            bail!("Attachment URL must use HTTPS.");
+        }
+        if !url.username().is_empty() || url.password().is_some() {
+            bail!("Attachment URL must not contain credentials.");
+        }
+        let Some(host) = url.host_str().map(str::to_lowercase) else {
+            bail!("Attachment URL must include a valid hostname.");
+        };
+        // Only the account subdomain gets credentials; Zendesk's CDN needs none.
+        let send_credentials = host == format!("{}.zendesk.com", self.subdomain.to_lowercase());
+        if !send_credentials && !host.ends_with(".zdusercontent.com") {
+            bail!(
+                "Attachment host is not trusted. Only Zendesk-hosted attachment URLs are allowed."
+            );
+        }
+        Ok((url, send_credentials))
+    }
+
+    async fn fetch_attachment(&self, url: url::Url, send_credentials: bool) -> Result<Attachment> {
+        // Zendesk attachment URLs redirect to the zdusercontent.com CDN. reqwest follows
+        // redirects by default and strips Authorization and Cookie when the host changes,
+        // which the CDN requires (it answers 403 to a request carrying credentials).
+        let mut resp = if send_credentials {
+            self.send(|| self.http.get(url.clone())).await?
+        } else {
+            let resp = self.http.get(url.clone()).send().await?;
+            ensure_success(resp, &format!("GET {}", url.path())).await?
+        };
+
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.split(';').next())
+            .unwrap_or("")
+            .trim()
+            .to_lowercase();
+        if !ALLOWED_IMAGE_TYPES.contains(&content_type.as_str()) {
+            bail!(
+                "Attachment type '{content_type}' is not allowed. Supported types: {ALLOWED_IMAGE_TYPES:?}"
+            );
+        }
+
+        let mut content = Vec::new();
+        while let Some(chunk) = resp.chunk().await? {
+            if content.len() + chunk.len() > MAX_ATTACHMENT_BYTES {
+                bail!(
+                    "Attachment exceeds the {} MB size limit.",
+                    MAX_ATTACHMENT_BYTES / (1024 * 1024)
+                );
+            }
+            content.extend_from_slice(&chunk);
+        }
+
+        if !magic_matches(&content_type, &content) {
+            bail!(
+                "File header does not match declared content type '{content_type}'. The attachment may be spoofed."
+            );
+        }
+        Ok(Attachment {
+            data_base64: base64::engine::general_purpose::STANDARD.encode(&content),
+            content_type,
+        })
     }
 
     pub async fn post_comment(
@@ -99,8 +414,14 @@ impl ZendeskClient {
         comment: &str,
         public: bool,
     ) -> Result<String> {
-        let _ = (ticket_id, comment, public);
-        todo!("worker: client")
+        let body = json!({"ticket": {"comment": {
+            "html_body": markdown_to_html(comment),
+            "public": public,
+        }}});
+        self.api_put(&format!("tickets/{ticket_id}.json"), &body)
+            .await
+            .map_err(ctx(format!("Failed to post comment on ticket {ticket_id}")))?;
+        Ok(comment.to_string())
     }
 
     pub async fn get_tickets(
@@ -110,12 +431,103 @@ impl ZendeskClient {
         sort_by: &str,
         sort_order: &str,
     ) -> Result<Value> {
-        let _ = (page, per_page, sort_by, sort_order);
-        todo!("worker: client")
+        async {
+            let per_page = per_page.min(100);
+            let data = self
+                .api_get(
+                    "tickets.json",
+                    &[
+                        ("page", &page),
+                        ("per_page", &per_page),
+                        ("sort_by", &sort_by),
+                        ("sort_order", &sort_order),
+                    ],
+                )
+                .await?;
+            let tickets: Vec<Value> = data
+                .get("tickets")
+                .and_then(Value::as_array)
+                .map_or(&[][..], |a| a)
+                .iter()
+                .map(|t| {
+                    let mut out = pick(
+                        t,
+                        &[
+                            "id",
+                            "subject",
+                            "status",
+                            "priority",
+                            "description",
+                            "created_at",
+                            "updated_at",
+                            "requester_id",
+                            "assignee_id",
+                        ],
+                        &[],
+                    );
+                    out["custom_fields"] =
+                        t.get("custom_fields").cloned().unwrap_or_else(|| json!([]));
+                    out
+                })
+                .collect();
+            let has_next = !data["next_page"].is_null();
+            let has_previous = !data["previous_page"].is_null() && page > 1;
+            Ok(json!({
+                "count": tickets.len(),
+                "tickets": tickets,
+                "page": page,
+                "per_page": per_page,
+                "sort_by": sort_by,
+                "sort_order": sort_order,
+                "has_more": has_next,
+                "next_page": has_next.then_some(page + 1),
+                "previous_page": has_previous.then(|| page - 1),
+            }))
+        }
+        .await
+        .map_err(ctx("Failed to get latest tickets"))
     }
 
     pub async fn get_all_articles(&self) -> Result<Value> {
-        todo!("worker: client")
+        async {
+            let mut kb = Map::new();
+            for section in self
+                .get_paged("help_center/sections.json", "sections")
+                .await?
+            {
+                let id = &section["id"];
+                // A section's articles live under its own locale; the locale-less path only
+                // serves the default one, so non-English help centers came back empty
+                // (upstream issue #10).
+                let path = match section.get("locale").and_then(Value::as_str) {
+                    Some(locale) => {
+                        format!("help_center/{locale}/sections/{id}/articles.json")
+                    }
+                    None => format!("help_center/sections/{id}/articles.json"),
+                };
+                let articles = self.get_paged(&path, "articles").await?;
+                let articles: Vec<Value> = articles
+                    .iter()
+                    .map(|a| {
+                        let mut out = pick(a, &["id", "title", "body", "updated_at"], &[]);
+                        out["url"] = a["html_url"].clone();
+                        out
+                    })
+                    .collect();
+                let name = section["name"].as_str().unwrap_or_default().to_string();
+                kb.insert(
+                    name,
+                    json!({
+                        "section_id": section["id"],
+                        "description": section["description"],
+                        "articles": articles,
+                    }),
+                );
+            }
+            Ok(Value::Object(kb))
+        }
+        .await
+        .map_err(ctx("Failed to fetch knowledge base"))
     }
 
     pub async fn search_articles(
@@ -125,29 +537,145 @@ impl ZendeskClient {
         per_page: u64,
         page: u64,
     ) -> Result<Value> {
-        let _ = (query, locale, per_page, page);
-        todo!("worker: client")
+        async {
+            let per_page = per_page.min(100);
+            let mut params: Vec<(&str, &(dyn Display + Sync))> =
+                vec![("query", &query), ("per_page", &per_page), ("page", &page)];
+            let locale = locale.filter(|l| !l.is_empty());
+            if let Some(locale) = &locale {
+                params.push(("locale", locale));
+            }
+            let data = self
+                .api_get("help_center/articles/search.json", &params)
+                .await?;
+            let mut articles = pick_all(
+                &data,
+                "results",
+                &[
+                    "id",
+                    "title",
+                    "body",
+                    "author_id",
+                    "section_id",
+                    "locale",
+                    "html_url",
+                    "created_at",
+                    "updated_at",
+                ],
+                &[],
+            );
+            for (article, raw) in articles
+                .as_array_mut()
+                .into_iter()
+                .flatten()
+                .zip(data["results"].as_array().into_iter().flatten())
+            {
+                article["draft"] = raw.get("draft").cloned().unwrap_or(json!(false));
+            }
+            let count = articles.as_array().map_or(0, Vec::len);
+            Ok(json!({
+                "articles": articles,
+                "query": query,
+                "page": page,
+                "per_page": per_page,
+                "count": count,
+                "total_count": data.get("count").cloned().unwrap_or(json!(count)),
+                "next_page": data["next_page"],
+                "previous_page": data["previous_page"],
+            }))
+        }
+        .await
+        .map_err(ctx("Failed to search articles"))
     }
 
     pub async fn get_article(&self, article_id: u64, locale: Option<&str>) -> Result<Value> {
-        let _ = (article_id, locale);
-        todo!("worker: client")
+        async {
+            // Zendesk takes the locale as a path segment, not a query parameter.
+            let path = match locale.filter(|l| !l.is_empty()) {
+                Some(locale) => {
+                    let locale: String = url::form_urlencoded::byte_serialize(locale.as_bytes())
+                        .collect::<String>()
+                        .replace('+', "%20");
+                    format!("help_center/{locale}/articles/{article_id}.json")
+                }
+                None => format!("help_center/articles/{article_id}.json"),
+            };
+            let data = self.api_get(&path, &[]).await?;
+            let article = data.get("article").cloned().unwrap_or(json!({}));
+            let mut out = pick(
+                &article,
+                &[
+                    "id",
+                    "title",
+                    "body",
+                    "author_id",
+                    "section_id",
+                    "locale",
+                    "source_locale",
+                    "html_url",
+                    "created_at",
+                    "updated_at",
+                    "edited_at",
+                    "position",
+                    "vote_sum",
+                    "vote_count",
+                    "label_names",
+                ],
+                &["label_names"],
+            );
+            for key in ["draft", "promoted"] {
+                out[key] = article.get(key).cloned().unwrap_or(json!(false));
+            }
+            Ok(out)
+        }
+        .await
+        .map_err(ctx(format!("Failed to get article {article_id}")))
     }
 
     pub async fn create_ticket(&self, ticket: CreateTicket) -> Result<Value> {
-        let _ = ticket;
-        todo!("worker: client")
+        async {
+            let mut body = json!({
+                "subject": ticket.subject,
+                "comment": {"body": ticket.description},
+            });
+            let optional = [
+                ("requester_id", ticket.requester_id.map(Value::from)),
+                ("assignee_id", ticket.assignee_id.map(Value::from)),
+                ("priority", ticket.priority.map(Value::from)),
+                ("type", ticket.ticket_type.map(Value::from)),
+                ("tags", ticket.tags.map(Value::from)),
+                ("custom_fields", ticket.custom_fields.map(Value::from)),
+            ];
+            for (key, value) in optional {
+                if let Some(value) = value {
+                    body[key] = value;
+                }
+            }
+            let data = self
+                .api_post("tickets.json", &json!({"ticket": body}))
+                .await?;
+            full_ticket(&data)
+        }
+        .await
+        .map_err(ctx("Failed to create ticket"))
     }
 
     /// `fields` are the ticket attributes to set (subject, status, priority, type,
     /// assignee_id, requester_id, tags, custom_fields, due_at, ...). Null values are skipped.
-    pub async fn update_ticket(
-        &self,
-        ticket_id: u64,
-        fields: serde_json::Map<String, Value>,
-    ) -> Result<Value> {
-        let _ = (ticket_id, fields);
-        todo!("worker: client")
+    pub async fn update_ticket(&self, ticket_id: u64, fields: Map<String, Value>) -> Result<Value> {
+        async {
+            let fields: Map<String, Value> =
+                fields.into_iter().filter(|(_, v)| !v.is_null()).collect();
+            let data = self
+                .api_put(
+                    &format!("tickets/{ticket_id}.json"),
+                    &json!({"ticket": fields}),
+                )
+                .await?;
+            full_ticket(&data)
+        }
+        .await
+        .map_err(ctx(format!("Failed to update ticket {ticket_id}")))
     }
 
     pub async fn search(
@@ -158,54 +686,229 @@ impl ZendeskClient {
         sort_by: &str,
         sort_order: &str,
     ) -> Result<Value> {
-        let _ = (query, page, per_page, sort_by, sort_order);
-        todo!("worker: client")
+        async {
+            let per_page = per_page.min(100);
+            let data = self
+                .api_get(
+                    "search.json",
+                    &[
+                        ("query", &query),
+                        ("page", &page),
+                        ("per_page", &per_page),
+                        ("sort_by", &sort_by),
+                        ("sort_order", &sort_order),
+                    ],
+                )
+                .await?;
+            Ok(json!({
+                "results": data.get("results").cloned().unwrap_or(json!([])),
+                "count": data.get("count").cloned().unwrap_or(json!(0)),
+                "page": page,
+                "per_page": per_page,
+                "has_more": !data["next_page"].is_null(),
+            }))
+        }
+        .await
+        .map_err(ctx("Search failed"))
     }
 
     pub async fn get_user(&self, user_id: u64) -> Result<Value> {
-        let _ = user_id;
-        todo!("worker: client")
+        async {
+            let data = self.api_get(&format!("users/{user_id}.json"), &[]).await?;
+            let user = object(&data, "user")?;
+            let mut out = pick(
+                user,
+                &[
+                    "id",
+                    "name",
+                    "email",
+                    "role",
+                    "phone",
+                    "organization_id",
+                    "time_zone",
+                    "active",
+                    "suspended",
+                    "created_at",
+                    "updated_at",
+                    "tags",
+                ],
+                &["tags"],
+            );
+            out["photo_url"] = user["photo"]["content_url"].clone();
+            Ok(out)
+        }
+        .await
+        .map_err(ctx(format!("Failed to get user {user_id}")))
     }
 
     pub async fn get_current_user(&self) -> Result<Value> {
-        todo!("worker: client")
+        async {
+            let data = self.api_get("users/me.json", &[]).await?;
+            Ok(pick(
+                object(&data, "user")?,
+                &[
+                    "id",
+                    "name",
+                    "email",
+                    "role",
+                    "organization_id",
+                    "time_zone",
+                    "default_group_id",
+                ],
+                &[],
+            ))
+        }
+        .await
+        .map_err(ctx("Failed to get current user"))
     }
 
     pub async fn search_users(&self, query: &str) -> Result<Value> {
-        let _ = query;
-        todo!("worker: client")
+        async {
+            let data = self
+                .api_get("users/search.json", &[("query", &query)])
+                .await?;
+            Ok(pick_all(
+                &data,
+                "users",
+                &["id", "name", "email", "role", "organization_id", "active"],
+                &[],
+            ))
+        }
+        .await
+        .map_err(ctx("User search failed"))
     }
 
     pub async fn list_views(&self) -> Result<Value> {
-        todo!("worker: client")
+        async {
+            let data = self.api_get("views.json", &[]).await?;
+            Ok(pick_all(
+                &data,
+                "views",
+                &["id", "title", "active", "position"],
+                &[],
+            ))
+        }
+        .await
+        .map_err(ctx("Failed to list views"))
     }
 
     pub async fn execute_view(&self, view_id: u64, page: u64, per_page: u64) -> Result<Value> {
-        let _ = (view_id, page, per_page);
-        todo!("worker: client")
+        async {
+            let per_page = per_page.min(100);
+            let data = self
+                .api_get(
+                    &format!("views/{view_id}/tickets.json"),
+                    &[("page", &page), ("per_page", &per_page)],
+                )
+                .await?;
+            let tickets = pick_all(&data, "tickets", &TICKET_SUMMARY_KEYS, &[]);
+            Ok(json!({
+                "count": tickets.as_array().map_or(0, Vec::len),
+                "tickets": tickets,
+                "has_more": !data["next_page"].is_null(),
+            }))
+        }
+        .await
+        .map_err(ctx(format!("Failed to execute view {view_id}")))
     }
 
     pub async fn list_ticket_fields(&self) -> Result<Value> {
-        todo!("worker: client")
+        async {
+            let data = self.api_get("ticket_fields.json", &[]).await?;
+            let mut fields = pick_all(
+                &data,
+                "ticket_fields",
+                &["id", "title", "type", "active", "required"],
+                &[],
+            );
+            for (field, raw) in fields
+                .as_array_mut()
+                .into_iter()
+                .flatten()
+                .zip(data["ticket_fields"].as_array().into_iter().flatten())
+            {
+                let options = pick_all(raw, "custom_field_options", &["name", "value"], &[]);
+                field["custom_field_options"] = match options.as_array() {
+                    Some(o) if !o.is_empty() => options,
+                    _ => Value::Null,
+                };
+            }
+            Ok(fields)
+        }
+        .await
+        .map_err(ctx("Failed to list ticket fields"))
     }
 
     pub async fn get_organization(&self, organization_id: u64) -> Result<Value> {
-        let _ = organization_id;
-        todo!("worker: client")
+        async {
+            let data = self
+                .api_get(&format!("organizations/{organization_id}.json"), &[])
+                .await?;
+            Ok(pick(
+                object(&data, "organization")?,
+                &[
+                    "id",
+                    "name",
+                    "domain_names",
+                    "details",
+                    "notes",
+                    "group_id",
+                    "tags",
+                    "created_at",
+                    "updated_at",
+                ],
+                &["domain_names", "tags"],
+            ))
+        }
+        .await
+        .map_err(ctx(format!("Failed to get organization {organization_id}")))
     }
 
     pub async fn search_organizations(&self, query: &str) -> Result<Value> {
-        let _ = query;
-        todo!("worker: client")
+        async {
+            let data = self
+                .api_get("organizations/autocomplete.json", &[("name", &query)])
+                .await?;
+            Ok(pick_all(
+                &data,
+                "organizations",
+                &["id", "name", "domain_names"],
+                &["domain_names"],
+            ))
+        }
+        .await
+        .map_err(ctx("Organization search failed"))
     }
 
     pub async fn get_tickets_bulk(&self, ticket_ids: &[u64]) -> Result<Value> {
-        let _ = ticket_ids;
-        todo!("worker: client")
+        async {
+            let ids = ticket_ids
+                .iter()
+                .take(100)
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            let data = self
+                .api_get("tickets/show_many.json", &[("ids", &ids)])
+                .await?;
+            Ok(pick_all(&data, "tickets", &TICKET_SUMMARY_KEYS, &[]))
+        }
+        .await
+        .map_err(ctx("Bulk ticket fetch failed"))
     }
 
     pub async fn list_groups(&self) -> Result<Value> {
-        todo!("worker: client")
+        async {
+            let data = self.api_get("groups/assignable.json", &[]).await?;
+            Ok(pick_all(
+                &data,
+                "groups",
+                &["id", "name", "description"],
+                &[],
+            ))
+        }
+        .await
+        .map_err(ctx("Failed to list groups"))
     }
 
     pub async fn merge_tickets(
@@ -215,18 +918,53 @@ impl ZendeskClient {
         target_comment: &str,
         source_comment: &str,
     ) -> Result<Value> {
-        let _ = (target_id, source_ids, target_comment, source_comment);
-        todo!("worker: client")
+        let body = json!({
+            "ids": source_ids,
+            "target_comment": target_comment,
+            "source_comment": source_comment,
+        });
+        self.api_post(&format!("tickets/{target_id}/merge.json"), &body)
+            .await
+            .map_err(ctx(format!("Failed to merge tickets into {target_id}")))
     }
 
     pub async fn list_macros(&self, active_only: bool) -> Result<Value> {
-        let _ = active_only;
-        todo!("worker: client")
+        async {
+            let path = if active_only {
+                "macros/active.json"
+            } else {
+                "macros.json"
+            };
+            let data = self.api_get(path, &[]).await?;
+            Ok(pick_all(
+                &data,
+                "macros",
+                &["id", "title", "description", "active"],
+                &[],
+            ))
+        }
+        .await
+        .map_err(ctx("Failed to list macros"))
     }
 
     pub async fn apply_macro(&self, ticket_id: u64, macro_id: u64) -> Result<Value> {
-        let _ = (ticket_id, macro_id);
-        todo!("worker: client")
+        async {
+            let data = self
+                .api_get(
+                    &format!("tickets/{ticket_id}/macros/{macro_id}/apply.json"),
+                    &[],
+                )
+                .await?;
+            let result = &data["result"];
+            Ok(json!({
+                "ticket_changes": result.get("ticket").cloned().unwrap_or(json!({})),
+                "comment": result["comment"],
+            }))
+        }
+        .await
+        .map_err(ctx(format!(
+            "Failed to apply macro {macro_id} to ticket {ticket_id}"
+        )))
     }
 
     /// `role` must be one of `requested`, `assigned`, `ccd`.
@@ -237,30 +975,577 @@ impl ZendeskClient {
         page: u64,
         per_page: u64,
     ) -> Result<Value> {
-        let _ = (user_id, role, page, per_page);
-        todo!("worker: client")
+        async {
+            if !["requested", "assigned", "ccd"].contains(&role) {
+                bail!("Invalid role '{role}'. Allowed: [\"assigned\", \"ccd\", \"requested\"]");
+            }
+            let per_page = per_page.min(100);
+            let data = self
+                .api_get(
+                    &format!("users/{user_id}/tickets/{role}.json"),
+                    &[("page", &page), ("per_page", &per_page)],
+                )
+                .await?;
+            Ok(json!({
+                "tickets": pick_all(
+                    &data,
+                    "tickets",
+                    &["id", "subject", "status", "priority", "created_at", "updated_at"],
+                    &[],
+                ),
+                "has_more": !data["next_page"].is_null(),
+            }))
+        }
+        .await
+        .map_err(ctx(format!("Failed to get tickets for user {user_id}")))
     }
 
     pub async fn list_ticket_forms(&self) -> Result<Value> {
-        todo!("worker: client")
+        async {
+            let data = self.api_get("ticket_forms.json", &[]).await?;
+            Ok(pick_all(
+                &data,
+                "ticket_forms",
+                &[
+                    "id",
+                    "name",
+                    "display_name",
+                    "active",
+                    "default",
+                    "ticket_field_ids",
+                ],
+                &["ticket_field_ids"],
+            ))
+        }
+        .await
+        .map_err(ctx("Failed to list ticket forms"))
     }
 
     pub async fn delete_ticket(&self, ticket_id: u64) -> Result<()> {
-        let _ = ticket_id;
-        todo!("worker: client")
+        self.api_delete(&format!("tickets/{ticket_id}.json"))
+            .await
+            .map_err(ctx(format!("Failed to delete ticket {ticket_id}")))
     }
 
     pub async fn get_ticket_metrics(&self, ticket_id: u64) -> Result<Value> {
-        let _ = ticket_id;
-        todo!("worker: client")
+        async {
+            let data = self
+                .api_get(&format!("tickets/{ticket_id}/metrics.json"), &[])
+                .await?;
+            Ok(object(&data, "ticket_metric")?.clone())
+        }
+        .await
+        .map_err(ctx(format!("Failed to get metrics for ticket {ticket_id}")))
     }
 
     pub async fn get_sla_breaches(&self, days_back: u64, metric: Option<&str>) -> Result<Value> {
-        let _ = (days_back, metric);
-        todo!("worker: client")
+        async {
+            let days = i64::try_from(days_back).unwrap_or(i64::MAX / 86_400 / 1000);
+            let start = (chrono::Utc::now() - chrono::Duration::days(days)).timestamp();
+            let mut url = self.url(
+                "incremental/ticket_metric_events.json",
+                &[("start_time", &start)],
+            )?;
+            let mut breaches = Vec::new();
+            loop {
+                let data = self.get_url(url.clone()).await?;
+                for event in data["ticket_metric_events"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                {
+                    if event["type"] == "breach" && metric.is_none_or(|m| event["metric"] == m) {
+                        let mut breach = pick(event, &["ticket_id", "metric", "time"], &[]);
+                        breach["instance_id"] = event["instance_id"].clone();
+                        breaches.push(breach);
+                    }
+                }
+                let next = data["next_page"]
+                    .as_str()
+                    .map(url::Url::parse)
+                    .transpose()?;
+                match next {
+                    Some(next) if data["end_of_stream"] != true && next != url => url = next,
+                    _ => break,
+                }
+            }
+
+            let mut tickets = std::collections::HashSet::new();
+            let mut by_metric = Map::new();
+            for breach in &breaches {
+                tickets.insert(breach["ticket_id"].to_string());
+                let name = breach["metric"].as_str().unwrap_or_default().to_string();
+                let count = by_metric.get(&name).and_then(Value::as_u64).unwrap_or(0);
+                by_metric.insert(name, json!(count + 1));
+            }
+            Ok(json!({
+                "total_breaches": breaches.len(),
+                "unique_tickets": tickets.len(),
+                "breaches": breaches,
+                "by_metric": by_metric,
+                "days_back": days_back,
+            }))
+        }
+        .await
+        .map_err(ctx("Failed to get SLA breaches"))
     }
 
     pub async fn get_sla_policies(&self) -> Result<Value> {
-        todo!("worker: client")
+        async {
+            let data = self.api_get("slas/policies.json", &[]).await?;
+            Ok(data.get("sla_policies").cloned().unwrap_or(json!([])))
+        }
+        .await
+        .map_err(ctx("Failed to get SLA policies"))
+    }
+}
+
+const TICKET_SUMMARY_KEYS: [&str; 9] = [
+    "id",
+    "subject",
+    "status",
+    "priority",
+    "requester_id",
+    "assignee_id",
+    "group_id",
+    "created_at",
+    "updated_at",
+];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+    fn client(server: &MockServer) -> ZendeskClient {
+        ZendeskClient::with_base_url(
+            "acme",
+            Auth::bearer("t"),
+            reqwest::Client::new(),
+            format!("{}/api/v2", server.uri()),
+        )
+    }
+
+    fn offline_client() -> ZendeskClient {
+        ZendeskClient::new("acme", Auth::bearer("t"), reqwest::Client::new())
+    }
+
+    const PNG: &[u8] = &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0];
+
+    fn image(content_type: &str, body: Vec<u8>) -> ResponseTemplate {
+        ResponseTemplate::new(200)
+            .insert_header("content-type", content_type)
+            .set_body_bytes(body)
+    }
+
+    async fn serve_image(server: &MockServer, response: ResponseTemplate) {
+        Mock::given(method("GET"))
+            .and(path("/img"))
+            .respond_with(response)
+            .mount(server)
+            .await;
+    }
+
+    fn img_url(server: &MockServer) -> url::Url {
+        url::Url::parse(&format!("{}/img", server.uri())).unwrap()
+    }
+
+    #[tokio::test]
+    async fn get_ticket_shape_with_custom_fields() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/tickets/7.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ticket": {
+                "id": 7, "subject": "s", "description": "d", "status": "open",
+                "priority": null, "created_at": "c", "updated_at": "u",
+                "requester_id": 1, "assignee_id": null, "organization_id": 3,
+                "custom_fields": [{"id": 9, "value": "x"}], "extra": true
+            }})))
+            .mount(&server)
+            .await;
+        let out = client(&server).get_ticket(7).await.unwrap();
+        assert_eq!(
+            out,
+            json!({
+                "id": 7, "subject": "s", "description": "d", "status": "open",
+                "priority": null, "created_at": "c", "updated_at": "u",
+                "requester_id": 1, "assignee_id": null, "organization_id": 3,
+                "custom_fields": [{"id": 9, "value": "x"}]
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn get_ticket_comments_follows_next_page() {
+        let server = MockServer::start().await;
+        let next = format!("{}/api/v2/tickets/5/comments.json?page=2", server.uri());
+        Mock::given(method("GET"))
+            .and(path("/api/v2/tickets/5/comments.json"))
+            .and(query_param("page", "2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "comments": [{"id": 2, "author_id": 1, "body": "b2", "html_body": "h2",
+                    "public": false, "created_at": "c2"}],
+                "next_page": null
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/tickets/5/comments.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "comments": [{"id": 1, "author_id": 1, "body": "b1", "html_body": "h1",
+                    "public": true, "created_at": "c1",
+                    "attachments": [{"id": 4, "file_name": "a.png",
+                        "content_url": "u", "content_type": "image/png", "size": 3}]}],
+                "next_page": next
+            })))
+            .mount(&server)
+            .await;
+        let out = client(&server).get_ticket_comments(5).await.unwrap();
+        let comments = out.as_array().unwrap();
+        assert_eq!(comments.len(), 2);
+        assert_eq!(comments[0]["attachments"][0]["file_name"], "a.png");
+        assert_eq!(comments[1]["attachments"], json!([]));
+        assert_eq!(comments[1]["public"], false);
+    }
+
+    #[tokio::test]
+    async fn get_tickets_caps_per_page_and_reports_paging() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/tickets.json"))
+            .and(query_param("per_page", "100"))
+            .and(query_param("page", "2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "tickets": [{"id": 1, "subject": "s"}],
+                "next_page": "https://x/next", "previous_page": "https://x/prev"
+            })))
+            .mount(&server)
+            .await;
+        let out = client(&server)
+            .get_tickets(2, 500, "created_at", "desc")
+            .await
+            .unwrap();
+        assert_eq!(out["per_page"], 100);
+        assert_eq!(out["count"], 1);
+        assert_eq!(out["has_more"], true);
+        assert_eq!(out["next_page"], 3);
+        assert_eq!(out["previous_page"], 1);
+        assert_eq!(out["tickets"][0]["custom_fields"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn post_comment_sends_html_body_and_privacy() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/api/v2/tickets/3.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .mount(&server)
+            .await;
+        let out = client(&server)
+            .post_comment(3, "a\nb", false)
+            .await
+            .unwrap();
+        assert_eq!(out, "a\nb");
+        let requests = server.received_requests().await.unwrap();
+        let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+        let comment = &body["ticket"]["comment"];
+        assert!(comment["html_body"].as_str().unwrap().contains("<br"));
+        assert_eq!(comment["public"], false);
+    }
+
+    #[tokio::test]
+    async fn invalid_token_without_oauth_is_not_retried() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(401).set_body_json(json!({"error": "invalid_token"})),
+            )
+            .mount(&server)
+            .await;
+        let err = client(&server).get_ticket(1).await.unwrap_err().to_string();
+        assert!(err.contains("Failed to get ticket 1: "), "{err}");
+        assert!(err.contains("HTTP 401"), "{err}");
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn forbidden_passes_body_through() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(403).set_body_string("nope scope"))
+            .mount(&server)
+            .await;
+        let err = client(&server).list_views().await.unwrap_err().to_string();
+        assert!(
+            err.contains("HTTP 403 Forbidden for GET /api/v2/views.json: nope scope"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn attachment_url_rejects_http() {
+        let err = offline_client()
+            .validate_attachment_url("http://acme.zendesk.com/a.png")
+            .unwrap_err();
+        assert_eq!(err.to_string(), "Attachment URL must use HTTPS.");
+    }
+
+    #[test]
+    fn attachment_url_rejects_credentials() {
+        let err = offline_client()
+            .validate_attachment_url("https://u:p@acme.zendesk.com/a.png")
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Attachment URL must not contain credentials."
+        );
+    }
+
+    #[test]
+    fn attachment_url_rejects_untrusted_host() {
+        for url in [
+            "https://evil.com/a.png",
+            "https://acme.zendesk.com.evil.com/a.png",
+        ] {
+            let err = offline_client().validate_attachment_url(url).unwrap_err();
+            assert!(
+                err.to_string()
+                    .starts_with("Attachment host is not trusted"),
+                "{url}"
+            );
+        }
+    }
+
+    #[test]
+    fn attachment_url_credentials_only_for_account_host() {
+        let c = offline_client();
+        let (url, creds) = c
+            .validate_attachment_url("https://ACME.Zendesk.com/a.png")
+            .unwrap();
+        assert!(creds);
+        assert_eq!(url.host_str(), Some("acme.zendesk.com"));
+        let (_, creds) = c
+            .validate_attachment_url("https://X.ZDUSERCONTENT.com/a.png")
+            .unwrap();
+        assert!(!creds);
+    }
+
+    #[tokio::test]
+    async fn fetch_attachment_rejects_html() {
+        let server = MockServer::start().await;
+        serve_image(&server, image("text/html", b"<html>".to_vec())).await;
+        let err = client(&server)
+            .fetch_attachment(img_url(&server), false)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .starts_with("Attachment type 'text/html' is not allowed"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_attachment_rejects_spoofed_header() {
+        let server = MockServer::start().await;
+        serve_image(&server, image("image/png", vec![0xFF, 0xD8, 0xFF, 0xE0])).await;
+        let err = client(&server)
+            .fetch_attachment(img_url(&server), false)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("may be spoofed"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn fetch_attachment_rejects_oversized_body() {
+        let server = MockServer::start().await;
+        let mut body = PNG.to_vec();
+        body.resize(MAX_ATTACHMENT_BYTES + 1, 0);
+        serve_image(&server, image("image/png", body)).await;
+        let err = client(&server)
+            .fetch_attachment(img_url(&server), false)
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), "Attachment exceeds the 10 MB size limit.");
+    }
+
+    #[tokio::test]
+    async fn fetch_attachment_returns_base64() {
+        let server = MockServer::start().await;
+        serve_image(&server, image("Image/PNG; charset=binary", PNG.to_vec())).await;
+        let out = client(&server)
+            .fetch_attachment(img_url(&server), false)
+            .await
+            .unwrap();
+        assert_eq!(out.content_type, "image/png");
+        assert_eq!(
+            out.data_base64,
+            base64::engine::general_purpose::STANDARD.encode(PNG)
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_attachment_sends_credentials_only_when_asked() {
+        let server = MockServer::start().await;
+        serve_image(&server, image("image/png", PNG.to_vec())).await;
+        let c = client(&server);
+        c.fetch_attachment(img_url(&server), true).await.unwrap();
+        c.fetch_attachment(img_url(&server), false).await.unwrap();
+        let requests = server.received_requests().await.unwrap();
+        let has_auth = |r: &Request| r.headers.contains_key("authorization");
+        assert!(has_auth(&requests[0]));
+        assert!(!has_auth(&requests[1]));
+    }
+
+    #[tokio::test]
+    async fn get_user_tickets_rejects_unknown_role() {
+        let err = offline_client()
+            .get_user_tickets(1, "foo", 1, 25)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Invalid role 'foo'. Allowed: [\"assigned\", \"ccd\", \"requested\"]"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sla_breaches_filter_metric_and_sum_pages() {
+        let server = MockServer::start().await;
+        let next = format!(
+            "{}/api/v2/incremental/ticket_metric_events.json?cursor=2",
+            server.uri()
+        );
+        Mock::given(method("GET"))
+            .and(path("/api/v2/incremental/ticket_metric_events.json"))
+            .and(query_param("cursor", "2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ticket_metric_events": [
+                    {"type": "breach", "metric": "reply_time", "ticket_id": 1, "time": "t3", "instance_id": 0},
+                    {"type": "breach", "metric": "reply_time", "ticket_id": 2, "time": "t4", "instance_id": 0}
+                ],
+                "end_of_stream": true, "next_page": next
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/incremental/ticket_metric_events.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ticket_metric_events": [
+                    {"type": "breach", "metric": "reply_time", "ticket_id": 1, "time": "t1", "instance_id": 1},
+                    {"type": "breach", "metric": "agent_work_time", "ticket_id": 1, "time": "t2", "instance_id": 1},
+                    {"type": "activate", "metric": "reply_time", "ticket_id": 3, "time": "t0", "instance_id": 1}
+                ],
+                "end_of_stream": false, "next_page": next
+            })))
+            .mount(&server)
+            .await;
+        let out = client(&server)
+            .get_sla_breaches(7, Some("reply_time"))
+            .await
+            .unwrap();
+        assert_eq!(out["total_breaches"], 3);
+        assert_eq!(out["unique_tickets"], 2);
+        assert_eq!(out["by_metric"], json!({"reply_time": 3}));
+        assert_eq!(out["days_back"], 7);
+    }
+
+    #[test]
+    fn markdown_newline_becomes_br() {
+        assert!(markdown_to_html("a\nb").contains("<br"));
+    }
+
+    #[test]
+    fn markdown_bold_and_table() {
+        assert!(markdown_to_html("**b**").contains("<strong>b</strong>"));
+        assert!(markdown_to_html("|a|b|\n|-|-|\n|1|2|").contains("<table>"));
+    }
+
+    #[test]
+    fn markdown_keeps_raw_html() {
+        assert!(markdown_to_html("<b>x</b>").contains("<b>x</b>"));
+    }
+
+    #[test]
+    fn markdown_empty_is_empty() {
+        assert_eq!(markdown_to_html(""), "");
+    }
+
+    /// The one cross-module path: Zendesk rejects the stored token, the provider
+    /// refreshes and persists the new pair, and the request is retried exactly once.
+    #[tokio::test]
+    async fn invalid_token_401_renews_once_and_retries() {
+        use wiremock::matchers::{body_string_contains, header};
+
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let settings = crate::config::OAuthSettings {
+            subdomain: "acme".into(),
+            client_id: "cid".into(),
+            token_file: dir.path().join("tokens.json"),
+            scopes: "tickets:read".into(),
+            redirect_uri: "http://localhost:4567/callback".into(),
+        };
+        let store = crate::tokens::TokenStore::new(settings.token_file.clone());
+        store
+            .save(&crate::tokens::TokenSet {
+                access_token: "old".into(),
+                refresh_token: Some("r1".into()),
+                expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+                refresh_token_expires_at: None,
+                subdomain: "acme".into(),
+                client_id: "cid".into(),
+                scope: None,
+            })
+            .unwrap();
+        let provider = crate::oauth::OAuthProvider::with_store(
+            settings,
+            store.clone(),
+            reqwest::Client::new(),
+        )
+        .with_token_endpoint(&format!("{}/oauth/tokens", server.uri()));
+
+        Mock::given(method("GET"))
+            .and(path("/api/v2/users/me.json"))
+            .and(header("authorization", "Bearer old"))
+            .respond_with(
+                ResponseTemplate::new(401).set_body_json(json!({"error": "invalid_token"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/oauth/tokens"))
+            .and(body_string_contains("grant_type=refresh_token"))
+            .and(body_string_contains("refresh_token=r1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "new", "refresh_token": "r2",
+                "expires_in": 1800, "refresh_token_expires_in": 7776000
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/users/me.json"))
+            .and(header("authorization", "Bearer new"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"user": {"id": 1}})))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = ZendeskClient::with_base_url(
+            "acme",
+            Auth::OAuth(std::sync::Arc::new(provider)),
+            reqwest::Client::new(),
+            format!("{}/api/v2", server.uri()),
+        );
+        let user = client.get_current_user().await.unwrap();
+        assert_eq!(user["id"], 1);
+        // The rotated pair reached disk before the retry was sent.
+        let stored = store.load().unwrap();
+        assert_eq!(stored.access_token, "new");
+        assert_eq!(stored.refresh_token.as_deref(), Some("r2"));
     }
 }

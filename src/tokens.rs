@@ -25,12 +25,14 @@
 //! }
 //! ```
 
-use std::fs::File;
+use std::fmt;
+use std::fs::{self, File, OpenOptions, TryLockError};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::Result;
-use chrono::{DateTime, Utc};
+use anyhow::{Context, Result, anyhow, bail};
+use chrono::{DateTime, NaiveDateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 
 /// Refresh slightly early so a request is never sent with a token that expires in
@@ -50,9 +52,9 @@ pub struct TokenSet {
     pub access_token: String,
     #[serde(default)]
     pub refresh_token: Option<String>,
-    #[serde(default)]
+    #[serde(default, with = "timestamp")]
     pub expires_at: Option<DateTime<Utc>>,
-    #[serde(default)]
+    #[serde(default, with = "timestamp")]
     pub refresh_token_expires_at: Option<DateTime<Utc>>,
     pub subdomain: String,
     pub client_id: String,
@@ -60,7 +62,68 @@ pub struct TokenSet {
     pub scope: Option<String>,
 }
 
-// TODO(worker): manual `Debug` that redacts access_token and refresh_token.
+impl fmt::Debug for TokenSet {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TokenSet")
+            .field("access_token", &"<redacted>")
+            .field(
+                "refresh_token",
+                &self.refresh_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("expires_at", &self.expires_at)
+            .field("refresh_token_expires_at", &self.refresh_token_expires_at)
+            .field("subdomain", &self.subdomain)
+            .field("client_id", &self.client_id)
+            .field("scope", &self.scope)
+            .finish()
+    }
+}
+
+/// RFC 3339 with a `+00:00` offset (what Python's `isoformat` writes). Reading also
+/// accepts naive timestamps, which Python treats as UTC.
+mod timestamp {
+    use super::*;
+    use serde::{Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(
+        value: &Option<DateTime<Utc>>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        match value {
+            Some(moment) => {
+                serializer.serialize_str(&moment.to_rfc3339_opts(SecondsFormat::AutoSi, false))
+            }
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<DateTime<Utc>>, D::Error> {
+        let Some(raw) = Option::<String>::deserialize(deserializer)? else {
+            return Ok(None);
+        };
+        parse(&raw).map(Some).map_err(serde::de::Error::custom)
+    }
+
+    pub(super) fn parse(raw: &str) -> Result<DateTime<Utc>, String> {
+        if let Ok(moment) = DateTime::parse_from_rfc3339(raw) {
+            return Ok(moment.with_timezone(&Utc));
+        }
+        NaiveDateTime::parse_from_str(raw, "%Y-%m-%dT%H:%M:%S%.f")
+            .map(|naive| naive.and_utc())
+            .map_err(|_| format!("invalid timestamp {raw:?}"))
+    }
+}
+
+/// Seconds as a JSON number or numeric string.
+fn seconds_field(payload: &serde_json::Value, key: &str) -> Option<i64> {
+    match payload.get(key)? {
+        serde_json::Value::Number(n) => n.as_i64().or_else(|| n.as_f64().map(|f| f as i64)),
+        serde_json::Value::String(s) => s.trim().parse().ok(),
+        _ => None,
+    }
+}
 
 impl TokenSet {
     /// Build a `TokenSet` from a Zendesk `/oauth/tokens` response body.
@@ -73,8 +136,32 @@ impl TokenSet {
         client_id: &str,
         issued_at: DateTime<Utc>,
     ) -> Result<Self> {
-        let _ = (payload, subdomain, client_id, issued_at);
-        todo!("worker: tokens")
+        let access_token = payload
+            .get("access_token")
+            .and_then(|v| v.as_str())
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| anyhow!("Zendesk token response did not include an access_token."))?;
+        let expires_at = |key: &str| {
+            seconds_field(payload, key)
+                .and_then(chrono::Duration::try_seconds)
+                .and_then(|ttl| issued_at.checked_add_signed(ttl))
+        };
+        let text = |key: &str| {
+            payload
+                .get(key)
+                .and_then(|v| v.as_str())
+                .filter(|v| !v.is_empty())
+                .map(str::to_owned)
+        };
+        Ok(TokenSet {
+            access_token: access_token.to_owned(),
+            refresh_token: text("refresh_token"),
+            expires_at: expires_at("expires_in"),
+            refresh_token_expires_at: expires_at("refresh_token_expires_in"),
+            subdomain: subdomain.to_owned(),
+            client_id: client_id.to_owned(),
+            scope: text("scope"),
+        })
     }
 
     /// True when the access token is within `DEFAULT_EXPIRY_SKEW` of `expires_at`.
@@ -83,8 +170,7 @@ impl TokenSet {
     }
 
     pub fn access_token_expired_at(&self, now: DateTime<Utc>) -> bool {
-        let _ = now;
-        todo!("worker: tokens")
+        expired(self.expires_at, now)
     }
 
     pub fn refresh_token_expired(&self) -> bool {
@@ -92,14 +178,19 @@ impl TokenSet {
     }
 
     pub fn refresh_token_expired_at(&self, now: DateTime<Utc>) -> bool {
-        let _ = now;
-        todo!("worker: tokens")
+        expired(self.refresh_token_expires_at, now)
     }
 
     /// A refresh token is present and not yet expired.
     pub fn can_refresh(&self) -> bool {
-        todo!("worker: tokens")
+        self.refresh_token.as_deref().is_some_and(|t| !t.is_empty())
+            && !self.refresh_token_expired()
     }
+}
+
+fn expired(expires_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool {
+    let skew = chrono::Duration::from_std(DEFAULT_EXPIRY_SKEW).unwrap_or_default();
+    expires_at.is_some_and(|at| now + skew >= at)
 }
 
 /// Reads and writes a `TokenSet` as JSON on the local filesystem.
@@ -123,30 +214,97 @@ impl TokenStore {
         TokenStore { path, lock_path }
     }
 
-    pub fn exists(&self) -> bool {
-        self.path.is_file()
-    }
-
     /// Hold an exclusive cross-process lock (`std::fs::File::try_lock`, polled until
     /// `LOCK_TIMEOUT`). Wrap the read-refresh-write cycle in this so a second MCP
     /// process cannot refresh at the same time and invalidate the token this one
     /// just stored. Creates the directory (0700) if needed.
     pub async fn lock(&self) -> Result<TokenLock> {
-        todo!("worker: tokens")
+        self.lock_with_timeout(LOCK_TIMEOUT).await
+    }
+
+    async fn lock_with_timeout(&self, timeout: Duration) -> Result<TokenLock> {
+        ensure_directory(&self.path)?;
+        let mut options = OpenOptions::new();
+        options.create(true).truncate(false).write(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let file = options
+            .open(&self.lock_path)
+            .with_context(|| format!("Could not open {}", self.lock_path.display()))?;
+
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(TokenLock { _file: file }),
+                Err(TryLockError::WouldBlock) => {}
+                Err(TryLockError::Error(err)) => {
+                    return Err(err)
+                        .with_context(|| format!("Could not lock {}", self.lock_path.display()));
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                bail!(
+                    "Timed out after {}s waiting for the token store lock at {}. Another \
+                     process may be stuck; remove the lock file if no other Zendesk MCP \
+                     server is running.",
+                    timeout.as_secs(),
+                    self.lock_path.display()
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
 
     /// Read and parse the token file. The error for a missing file tells the operator
     /// to run `zendesk-mcp-server auth`.
     pub fn load(&self) -> Result<TokenSet> {
-        todo!("worker: tokens")
+        let path = self.path.display();
+        let raw = fs::read_to_string(&self.path).map_err(|err| {
+            if err.kind() == std::io::ErrorKind::NotFound {
+                anyhow!(
+                    "No Zendesk OAuth tokens found at {path}. Run zendesk-mcp-server auth to \
+                     authorize this machine."
+                )
+            } else {
+                anyhow!("Could not read {path}: {err}")
+            }
+        })?;
+        serde_json::from_str(&raw).map_err(|err| {
+            anyhow!(
+                "Token store at {path} is not valid JSON or is missing a field ({err}). \
+                 Re-run zendesk-mcp-server auth to recreate it."
+            )
+        })
     }
 
     /// Write tokens atomically, replacing any existing file: temp file in the same
     /// directory with mode 0600, write, fsync, rename. Ensures the directory exists
     /// with mode 0700 first.
     pub fn save(&self, tokens: &TokenSet) -> Result<()> {
-        let _ = tokens;
-        todo!("worker: tokens")
+        ensure_directory(&self.path)?;
+        let mut payload = serde_json::to_string_pretty(&serde_json::to_value(tokens)?)?;
+        payload.push('\n');
+
+        let mut temp_name = self.path.file_name().unwrap_or_default().to_os_string();
+        temp_name.push(format!(".{}.tmp", uuid::Uuid::new_v4().simple()));
+        let temp_path = self.path.with_file_name(temp_name);
+
+        let write = || -> std::io::Result<()> {
+            let mut options = OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+            let mut file = options.open(&temp_path)?;
+            file.write_all(payload.as_bytes())?;
+            file.sync_all()?;
+            fs::rename(&temp_path, &self.path)
+        };
+        write().map_err(|err| {
+            let _ = fs::remove_file(&temp_path);
+            anyhow!("Could not write {}: {err}", self.path.display())
+        })?;
+        tracing::debug!("Stored Zendesk OAuth tokens at {}", self.path.display());
+        Ok(())
     }
 }
 
@@ -157,4 +315,195 @@ fn lock_path_for(path: &Path) -> PathBuf {
         .unwrap_or_default();
     name.push(".lock");
     path.with_file_name(name)
+}
+
+/// Create the directory holding `path` with mode 0700, tightening it if it exists with
+/// other bits.
+fn ensure_directory(path: &Path) -> Result<()> {
+    let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) else {
+        return Ok(());
+    };
+    fs::create_dir_all(dir).with_context(|| format!("Could not create {}", dir.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(dir)?.permissions().mode() & 0o777;
+        if mode != 0o700 {
+            fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
+                .with_context(|| format!("Could not set permissions on {}", dir.display()))?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+    use serde_json::json;
+
+    fn sample(expires_at: Option<DateTime<Utc>>) -> TokenSet {
+        TokenSet {
+            access_token: "access".into(),
+            refresh_token: Some("refresh".into()),
+            expires_at,
+            refresh_token_expires_at: expires_at.map(|t| t + chrono::Duration::days(90)),
+            subdomain: "acme".into(),
+            client_id: "client".into(),
+            scope: Some("tickets:read users:read".into()),
+        }
+    }
+
+    #[test]
+    fn save_then_load_preserves_all_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TokenStore::new(dir.path().join("nested/tokens.json"));
+        let tokens = sample(Some(Utc.with_ymd_and_hms(2026, 10, 4, 12, 0, 0).unwrap()));
+        store.save(&tokens).unwrap();
+        assert_eq!(store.load().unwrap(), tokens);
+
+        let raw = fs::read_to_string(&store.path).unwrap();
+        assert!(raw.ends_with("}\n"));
+        assert!(raw.contains("\"expires_at\": \"2026-10-04T12:00:00+00:00\""));
+        // Keys are sorted, like Python's sort_keys=True.
+        assert!(raw.find("access_token").unwrap() < raw.find("subdomain").unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_is_0600_and_directory_0700() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let store = TokenStore::new(dir.path().join("zd/tokens.json"));
+        store.save(&sample(None)).unwrap();
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&store.path), 0o600);
+        assert_eq!(mode(store.path.parent().unwrap()), 0o700);
+    }
+
+    #[test]
+    fn expiry_skew_boundary() {
+        let at = Utc.with_ymd_and_hms(2026, 10, 4, 12, 0, 0).unwrap();
+        let tokens = sample(Some(at));
+        let skew = chrono::Duration::seconds(60);
+        assert!(!tokens.access_token_expired_at(at - skew - chrono::Duration::seconds(1)));
+        assert!(tokens.access_token_expired_at(at - skew));
+        assert!(!sample(None).access_token_expired_at(at + chrono::Duration::days(999)));
+        assert!(!sample(None).refresh_token_expired_at(at));
+    }
+
+    #[test]
+    fn can_refresh_needs_unexpired_refresh_token() {
+        let mut tokens = sample(None);
+        assert!(tokens.can_refresh());
+        tokens.refresh_token_expires_at = Some(Utc::now() - chrono::Duration::hours(1));
+        assert!(!tokens.can_refresh());
+        tokens.refresh_token_expires_at = None;
+        tokens.refresh_token = None;
+        assert!(!tokens.can_refresh());
+    }
+
+    #[test]
+    fn from_token_response_with_and_without_expires_in() {
+        let issued = Utc.with_ymd_and_hms(2026, 10, 4, 12, 0, 0).unwrap();
+        let full = json!({
+            "access_token": "a", "refresh_token": "r", "scope": "tickets:read",
+            "expires_in": 1800, "refresh_token_expires_in": "7776000"
+        });
+        let tokens = TokenSet::from_token_response(&full, "acme", "client", issued).unwrap();
+        assert_eq!(
+            tokens.expires_at,
+            Some(issued + chrono::Duration::seconds(1800))
+        );
+        assert_eq!(
+            tokens.refresh_token_expires_at,
+            Some(issued + chrono::Duration::seconds(7_776_000))
+        );
+        assert_eq!(tokens.refresh_token.as_deref(), Some("r"));
+        assert_eq!(tokens.scope.as_deref(), Some("tickets:read"));
+
+        let bare = json!({"access_token": "a"});
+        let tokens = TokenSet::from_token_response(&bare, "acme", "client", issued).unwrap();
+        assert_eq!(tokens.expires_at, None);
+        assert_eq!(tokens.refresh_token, None);
+
+        let err = TokenSet::from_token_response(&json!({}), "acme", "client", issued).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Zendesk token response did not include an access_token."
+        );
+    }
+
+    #[test]
+    fn parses_python_written_timestamps() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tokens.json");
+        fs::write(
+            &path,
+            r#"{"access_token": "a", "refresh_token": null,
+                "expires_at": "2026-10-04T12:34:56.123456+00:00",
+                "refresh_token_expires_at": "2026-10-04T12:34:56",
+                "subdomain": "acme", "client_id": "c", "scope": null}"#,
+        )
+        .unwrap();
+        let tokens = TokenStore::new(&path).load().unwrap();
+        let expected = Utc.with_ymd_and_hms(2026, 10, 4, 12, 34, 56).unwrap();
+        assert_eq!(
+            tokens.expires_at,
+            Some(expected + chrono::Duration::microseconds(123_456))
+        );
+        assert_eq!(tokens.refresh_token_expires_at, Some(expected));
+    }
+
+    #[test]
+    fn load_errors_name_the_remedy() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TokenStore::new(dir.path().join("tokens.json"));
+        let missing = store.load().unwrap_err().to_string();
+        assert!(missing.contains("No Zendesk OAuth tokens found") && missing.contains("auth"));
+
+        fs::write(&store.path, "{not json").unwrap();
+        assert!(
+            store
+                .load()
+                .unwrap_err()
+                .to_string()
+                .contains("Re-run zendesk-mcp-server auth")
+        );
+        fs::write(&store.path, r#"{"access_token": "a"}"#).unwrap();
+        assert!(
+            store
+                .load()
+                .unwrap_err()
+                .to_string()
+                .contains("Re-run zendesk-mcp-server auth")
+        );
+    }
+
+    #[test]
+    fn debug_redacts_secrets() {
+        let shown = format!("{:?}", sample(None));
+        assert!(!shown.contains("access\"") && !shown.contains("\"refresh\""));
+        assert!(shown.contains("<redacted>"));
+    }
+
+    #[tokio::test]
+    async fn lock_times_out_while_another_handle_holds_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = TokenStore::new(dir.path().join("tokens.json"));
+        let second = first.clone();
+        let held = first.lock().await.unwrap();
+        let err = second
+            .lock_with_timeout(Duration::from_millis(250))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(&first.lock_path.display().to_string()));
+        assert!(err.contains("remove the lock file"));
+        drop(held);
+        second
+            .lock_with_timeout(Duration::from_millis(250))
+            .await
+            .unwrap();
+    }
 }

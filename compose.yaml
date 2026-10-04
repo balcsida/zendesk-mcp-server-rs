@@ -1,0 +1,15 @@
+services:
+  zendesk-mcp:
+    build: .
+    env_file: .env
+    environment:
+      MCP_HTTP_ADDR: 0.0.0.0:8080
+      # MCP_BEARER_TOKEN comes from .env
+    ports:
+      - "8080:8080"
+    volumes:
+      - zendesk-tokens:/tokens
+    restart: unless-stopped
+
+volumes:
+  zendesk-tokens:
