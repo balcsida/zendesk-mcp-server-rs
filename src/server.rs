@@ -358,6 +358,20 @@ struct SearchArticlesParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ListArticlesParams {
+    /// Only list the articles in this section
+    section_id: Option<u64>,
+    /// Optional locale (e.g., 'en-us', 'fr', 'es'); defaults to the help center's default locale
+    locale: Option<String>,
+    /// Number of articles per page (max 100)
+    #[serde(default = "per_page_25")]
+    per_page: u64,
+    /// Page number (1-based)
+    #[serde(default = "page_1")]
+    page: u64,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct ArticleParams {
     /// The ID of the article to retrieve
     article_id: u64,
@@ -749,6 +763,17 @@ impl ZendeskServer {
         .await
     }
 
+    #[tool(
+        description = "List Zendesk help center articles one page at a time, optionally only those in one section. Returns titles and links without bodies; use get_article for an article's full text."
+    )]
+    async fn list_articles(&self, Parameters(p): Parameters<ListArticlesParams>) -> CallToolResult {
+        self.call_json(|c| async move {
+            c.list_articles(p.section_id, p.locale.as_deref(), p.page, p.per_page)
+                .await
+        })
+        .await
+    }
+
     #[tool(description = "Get a specific Zendesk help center article by its ID")]
     async fn get_article(&self, Parameters(p): Parameters<ArticleParams>) -> CallToolResult {
         self.call_json(|c| async move { c.get_article(p.article_id, p.locale.as_deref()).await })
@@ -1007,7 +1032,7 @@ async fn shutdown_signal() {
 mod tests {
     use super::*;
 
-    const TOOLS: [&str; 32] = [
+    const TOOLS: [&str; 33] = [
         "get_ticket",
         "create_ticket",
         "get_tickets",
@@ -1034,6 +1059,7 @@ mod tests {
         "list_ticket_forms",
         "delete_ticket",
         "search_articles",
+        "list_articles",
         "get_article",
         "get_ticket_metrics",
         "get_ticket_audits",
@@ -1053,7 +1079,7 @@ mod tests {
     }
 
     #[test]
-    fn lists_exactly_the_32_tools() {
+    fn lists_exactly_the_33_tools() {
         let mut names: Vec<String> = ZendeskServer::tool_router()
             .list_all()
             .iter()

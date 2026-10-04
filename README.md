@@ -147,7 +147,7 @@ The default scopes cover every tool this server exposes:
 | `tickets:write` | `create_ticket`, `update_ticket`, `create_ticket_comment` |
 | `ticket_attachments:read` | `get_ticket_attachment` |
 | `users:read` | requester and assignee details on tickets |
-| `hc:read` | the `zendesk://knowledge-base` resource |
+| `hc:read` | `list_articles` and the `zendesk://knowledge-base` resource |
 
 Narrow them with `ZENDESK_OAUTH_SCOPES` if you do not need every tool. For
 read-only access, use `tickets:read users:read hc:read`.
@@ -616,6 +616,17 @@ Search Help Center articles by query string.
 - `page` (integer, optional): Page number (defaults to 1)
 
 Returns matching articles with id, title, body, author_id, section_id, locale, html_url, timestamps and draft status, plus pagination metadata.
+
+#### list_articles
+
+List Help Center articles one page at a time, without their bodies. Use `get_article` for an article's full text.
+
+- `section_id` (integer, optional): Only list the articles in this section
+- `locale` (string, optional): For example `en-us`, `fr`, `es` (defaults to the help center's default locale)
+- `per_page` (integer, optional): Max 100 (defaults to 25)
+- `page` (integer, optional): Page number (defaults to 1)
+
+Returns articles with id, title, section_id, html_url, draft status and updated_at, plus `total_count` and `has_more`.
 
 #### get_article
 

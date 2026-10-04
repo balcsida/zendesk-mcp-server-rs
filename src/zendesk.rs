@@ -205,6 +205,20 @@ fn status_error(status: reqwest::StatusCode, label: &str, body: &[u8]) -> anyhow
     anyhow!("Zendesk API error HTTP {status} for {label}: {text}")
 }
 
+/// `help_center`, or `help_center/{locale}` when a locale is given: Zendesk takes the
+/// locale as a path segment, not a query parameter.
+fn help_center_path(locale: Option<&str>) -> String {
+    match locale.filter(|l| !l.is_empty()) {
+        Some(locale) => {
+            let locale: String = url::form_urlencoded::byte_serialize(locale.as_bytes())
+                .collect::<String>()
+                .replace('+', "%20");
+            format!("help_center/{locale}")
+        }
+        None => "help_center".into(),
+    }
+}
+
 impl ZendeskClient {
     pub fn new(subdomain: &str, auth: Auth, http: reqwest::Client) -> Self {
         let base_url = format!("https://{subdomain}.zendesk.com/api/v2");
@@ -687,18 +701,53 @@ impl ZendeskClient {
         .map_err(ctx("Failed to search articles"))
     }
 
+    /// One page of articles, from the whole help center or one section, without bodies.
+    pub async fn list_articles(
+        &self,
+        section_id: Option<u64>,
+        locale: Option<&str>,
+        page: u64,
+        per_page: u64,
+    ) -> Result<Value> {
+        async {
+            let per_page = per_page.min(100);
+            let section = section_id
+                .map(|id| format!("/sections/{id}"))
+                .unwrap_or_default();
+            let path = format!("{}{section}/articles.json", help_center_path(locale));
+            let data = self
+                .api_get(&path, &[("page", &page), ("per_page", &per_page)])
+                .await?;
+            let articles = pick_all(
+                &data,
+                "articles",
+                &[
+                    "id",
+                    "title",
+                    "section_id",
+                    "html_url",
+                    "draft",
+                    "updated_at",
+                ],
+                &[],
+            );
+            let count = articles.as_array().map_or(0, Vec::len);
+            Ok(json!({
+                "articles": articles,
+                "page": page,
+                "per_page": per_page,
+                "count": count,
+                "total_count": data.get("count").cloned().unwrap_or(json!(count)),
+                "has_more": !data["next_page"].is_null(),
+            }))
+        }
+        .await
+        .map_err(ctx("Failed to list articles"))
+    }
+
     pub async fn get_article(&self, article_id: u64, locale: Option<&str>) -> Result<Value> {
         async {
-            // Zendesk takes the locale as a path segment, not a query parameter.
-            let path = match locale.filter(|l| !l.is_empty()) {
-                Some(locale) => {
-                    let locale: String = url::form_urlencoded::byte_serialize(locale.as_bytes())
-                        .collect::<String>()
-                        .replace('+', "%20");
-                    format!("help_center/{locale}/articles/{article_id}.json")
-                }
-                None => format!("help_center/articles/{article_id}.json"),
-            };
+            let path = format!("{}/articles/{article_id}.json", help_center_path(locale));
             let data = self.api_get(&path, &[]).await?;
             let article = data.get("article").cloned().unwrap_or(json!({}));
             let mut out = pick(
@@ -1916,6 +1965,43 @@ mod tests {
         assert_eq!(out["truncated"], true);
         assert_eq!(out["tickets"][0]["requester_name"], "Ann");
         assert!(out["tickets"][0].get("extra").is_none());
+    }
+
+    #[tokio::test]
+    async fn list_articles_pages_one_section_or_all_without_bodies() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/help_center/pt-br/sections/5/articles.json"))
+            .and(query_param("page", "2"))
+            .and(query_param("per_page", "100"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "articles": [{"id": 1, "title": "t", "body": "<p>long</p>", "section_id": 5,
+                    "html_url": "h", "draft": false, "updated_at": "u"}],
+                "count": 250, "next_page": "https://x/next"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/help_center/articles.json"))
+            .respond_with(json_page("articles", json!([]), None))
+            .mount(&server)
+            .await;
+        let c = client(&server);
+        let out = c
+            .list_articles(Some(5), Some("pt-br"), 2, 500)
+            .await
+            .unwrap();
+        assert_eq!(
+            out["articles"],
+            json!([{"id": 1, "title": "t", "section_id": 5, "html_url": "h",
+                "draft": false, "updated_at": "u"}])
+        );
+        assert_eq!(out["per_page"], 100);
+        assert_eq!(out["total_count"], 250);
+        assert_eq!(out["has_more"], true);
+        let out = c.list_articles(None, None, 1, 25).await.unwrap();
+        assert_eq!(out["count"], 0);
+        assert_eq!(out["has_more"], false);
     }
 
     #[tokio::test]
