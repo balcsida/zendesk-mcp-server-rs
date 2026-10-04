@@ -38,7 +38,10 @@ struct ArticleParams {
 
 #[tool_router(router = help_center_router, vis = "pub(super)")]
 impl ZendeskServer {
-    #[tool(description = "Search Zendesk help center articles by query string")]
+    #[tool(
+        description = "Search Zendesk help center articles by query string",
+        annotations(read_only_hint = true)
+    )]
     async fn search_articles(
         &self,
         Parameters(p): Parameters<SearchArticlesParams>,
@@ -51,7 +54,8 @@ impl ZendeskServer {
     }
 
     #[tool(
-        description = "List Zendesk help center articles one page at a time, optionally only those in one section. Returns titles and links without bodies; use get_article for an article's full text."
+        description = "List Zendesk help center articles one page at a time, optionally only those in one section. Returns titles and links without bodies; use get_article for an article's full text.",
+        annotations(read_only_hint = true)
     )]
     async fn list_articles(&self, Parameters(p): Parameters<ListArticlesParams>) -> CallToolResult {
         self.call_json(|c| async move {
@@ -61,7 +65,10 @@ impl ZendeskServer {
         .await
     }
 
-    #[tool(description = "Get a specific Zendesk help center article by its ID")]
+    #[tool(
+        description = "Get a specific Zendesk help center article by its ID",
+        annotations(read_only_hint = true)
+    )]
     async fn get_article(&self, Parameters(p): Parameters<ArticleParams>) -> CallToolResult {
         self.call_json(|c| async move { c.get_article(p.article_id, p.locale.as_deref()).await })
             .await

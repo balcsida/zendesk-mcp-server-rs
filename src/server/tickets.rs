@@ -137,13 +137,19 @@ struct UserTicketsParams {
 
 #[tool_router(router = ticket_router, vis = "pub(super)")]
 impl ZendeskServer {
-    #[tool(description = "Retrieve a Zendesk ticket by its ID")]
+    #[tool(
+        description = "Retrieve a Zendesk ticket by its ID",
+        annotations(read_only_hint = true)
+    )]
     async fn get_ticket(&self, Parameters(p): Parameters<TicketIdParams>) -> CallToolResult {
         self.call_json(|c| async move { c.get_ticket(p.ticket_id).await })
             .await
     }
 
-    #[tool(description = "Create a new Zendesk ticket")]
+    #[tool(
+        description = "Create a new Zendesk ticket",
+        annotations(destructive_hint = false)
+    )]
     async fn create_ticket(&self, Parameters(p): Parameters<CreateTicketParams>) -> CallToolResult {
         self.call_json(|c| async move {
             let ticket = crate::zendesk::CreateTicket {
@@ -164,7 +170,10 @@ impl ZendeskServer {
         .await
     }
 
-    #[tool(description = "Fetch the latest tickets with pagination support")]
+    #[tool(
+        description = "Fetch the latest tickets with pagination support",
+        annotations(read_only_hint = true)
+    )]
     async fn get_tickets(&self, Parameters(p): Parameters<GetTicketsParams>) -> CallToolResult {
         self.call_json(|c| async move {
             c.get_tickets(p.page, p.per_page, &p.sort_by, &p.sort_order)
@@ -173,7 +182,10 @@ impl ZendeskServer {
         .await
     }
 
-    #[tool(description = "Retrieve all comments for a Zendesk ticket by its ID")]
+    #[tool(
+        description = "Retrieve all comments for a Zendesk ticket by its ID",
+        annotations(read_only_hint = true)
+    )]
     async fn get_ticket_comments(
         &self,
         Parameters(p): Parameters<TicketIdParams>,
@@ -182,7 +194,10 @@ impl ZendeskServer {
             .await
     }
 
-    #[tool(description = "Create a new comment on an existing Zendesk ticket")]
+    #[tool(
+        description = "Create a new comment on an existing Zendesk ticket",
+        annotations(destructive_hint = false)
+    )]
     async fn create_ticket_comment(
         &self,
         Parameters(p): Parameters<CreateCommentParams>,
@@ -197,7 +212,8 @@ impl ZendeskServer {
     }
 
     #[tool(
-        description = "Fetch a Zendesk ticket attachment by its content_url and return the file as base64-encoded data. Use the attachment URLs returned by get_ticket_comments."
+        description = "Fetch a Zendesk ticket attachment by its content_url and return the file as base64-encoded data. Use the attachment URLs returned by get_ticket_comments.",
+        annotations(read_only_hint = true)
     )]
     async fn get_ticket_attachment(
         &self,
@@ -215,7 +231,8 @@ impl ZendeskServer {
     }
 
     #[tool(
-        description = "Update fields on an existing Zendesk ticket (e.g., status, priority, assignee_id)"
+        description = "Update fields on an existing Zendesk ticket (e.g., status, priority, assignee_id)",
+        annotations(destructive_hint = false, idempotent_hint = true)
     )]
     async fn update_ticket(&self, Parameters(p): Parameters<UpdateTicketParams>) -> CallToolResult {
         self.call_json(|c| async move {
@@ -245,7 +262,8 @@ impl ZendeskServer {
     }
 
     #[tool(
-        description = "Search Zendesk using Zendesk Query Language (ZQL). Searches tickets, users, and organizations. Example queries: 'type:ticket status:open priority:urgent', 'type:ticket assignee:me', 'type:user email:john@example.com'"
+        description = "Search Zendesk using Zendesk Query Language (ZQL). Searches tickets, users, and organizations. Example queries: 'type:ticket status:open priority:urgent', 'type:ticket assignee:me', 'type:user email:john@example.com'",
+        annotations(read_only_hint = true)
     )]
     async fn search(&self, Parameters(p): Parameters<SearchParams>) -> CallToolResult {
         self.call_json(|c| async move {
@@ -256,7 +274,8 @@ impl ZendeskServer {
     }
 
     #[tool(
-        description = "Search Zendesk tickets with ZQL and return every match instead of one page like 'search', up to Zendesk's 1,000-result search limit ('truncated' is true when more matched; narrow the query to get the rest). Use for 'find all tickets matching X' queries."
+        description = "Search Zendesk tickets with ZQL and return every match instead of one page like 'search', up to Zendesk's 1,000-result search limit ('truncated' is true when more matched; narrow the query to get the rest). Use for 'find all tickets matching X' queries.",
+        annotations(read_only_hint = true)
     )]
     async fn search_all_tickets(
         &self,
@@ -269,7 +288,10 @@ impl ZendeskServer {
         .await
     }
 
-    #[tool(description = "Fetch multiple tickets by IDs in a single request (max 100)")]
+    #[tool(
+        description = "Fetch multiple tickets by IDs in a single request (max 100)",
+        annotations(read_only_hint = true)
+    )]
     async fn get_tickets_bulk(
         &self,
         Parameters(p): Parameters<TicketsBulkParams>,
@@ -278,7 +300,10 @@ impl ZendeskServer {
             .await
     }
 
-    #[tool(description = "Merge source tickets into a target ticket")]
+    #[tool(
+        description = "Merge source tickets into a target ticket",
+        annotations(destructive_hint = true)
+    )]
     async fn merge_tickets(&self, Parameters(p): Parameters<MergeTicketsParams>) -> CallToolResult {
         self.call_json(|c| async move {
             let result = c
@@ -294,7 +319,10 @@ impl ZendeskServer {
         .await
     }
 
-    #[tool(description = "Get tickets for a specific user by role (requested, assigned, or ccd)")]
+    #[tool(
+        description = "Get tickets for a specific user by role (requested, assigned, or ccd)",
+        annotations(read_only_hint = true)
+    )]
     async fn get_user_tickets(
         &self,
         Parameters(p): Parameters<UserTicketsParams>,
@@ -306,7 +334,10 @@ impl ZendeskServer {
         .await
     }
 
-    #[tool(description = "Permanently delete a Zendesk ticket. Use with caution.")]
+    #[tool(
+        description = "Permanently delete a Zendesk ticket. Use with caution.",
+        annotations(destructive_hint = true)
+    )]
     async fn delete_ticket(&self, Parameters(p): Parameters<TicketIdParams>) -> CallToolResult {
         self.call_json(|c| async move {
             c.delete_ticket(p.ticket_id).await?;
@@ -316,7 +347,8 @@ impl ZendeskServer {
     }
 
     #[tool(
-        description = "Get performance/SLA metrics for a specific ticket (reply time, resolution time, wait times, etc.)"
+        description = "Get performance/SLA metrics for a specific ticket (reply time, resolution time, wait times, etc.)",
+        annotations(read_only_hint = true)
     )]
     async fn get_ticket_metrics(
         &self,
@@ -327,14 +359,18 @@ impl ZendeskServer {
     }
 
     #[tool(
-        description = "Retrieve the audit trail (all changes and events) for a Zendesk ticket by its ID"
+        description = "Retrieve the audit trail (all changes and events) for a Zendesk ticket by its ID",
+        annotations(read_only_hint = true)
     )]
     async fn get_ticket_audits(&self, Parameters(p): Parameters<TicketIdParams>) -> CallToolResult {
         self.call_json(|c| async move { c.get_ticket_audits(p.ticket_id).await })
             .await
     }
 
-    #[tool(description = "Get the incident tickets linked to a Zendesk problem ticket by its ID")]
+    #[tool(
+        description = "Get the incident tickets linked to a Zendesk problem ticket by its ID",
+        annotations(read_only_hint = true)
+    )]
     async fn get_linked_incidents(
         &self,
         Parameters(p): Parameters<TicketIdParams>,

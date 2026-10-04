@@ -507,6 +507,27 @@ mod tests {
     }
 
     #[test]
+    fn every_tool_is_annotated_and_delete_is_destructive() {
+        let tools = server().tool_router.list_all();
+        let hints = |name: &str| {
+            tools
+                .iter()
+                .find(|t| t.name == name)
+                .and_then(|t| t.annotations.clone())
+                .unwrap_or_else(|| panic!("{name} has no annotations"))
+        };
+        for tool in &tools {
+            assert!(
+                tool.annotations.is_some(),
+                "{} has no annotations",
+                tool.name
+            );
+        }
+        assert_eq!(hints("delete_ticket").destructive_hint, Some(true));
+        assert_eq!(hints("get_ticket").read_only_hint, Some(true));
+    }
+
+    #[test]
     fn tool_schemas_are_objects_and_get_ticket_requires_ticket_id() {
         for tool in server().tool_router.list_all() {
             assert_eq!(tool.input_schema["type"], "object", "{}", tool.name);

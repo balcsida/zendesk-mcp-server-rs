@@ -27,26 +27,36 @@ struct SearchOrganizationsParams {
 #[tool_router(router = people_router, vis = "pub(super)")]
 impl ZendeskServer {
     #[tool(
-        description = "Get a Zendesk user by their ID. Use this to resolve requester_id or assignee_id from tickets."
+        description = "Get a Zendesk user by their ID. Use this to resolve requester_id or assignee_id from tickets.",
+        annotations(read_only_hint = true)
     )]
     async fn get_user(&self, Parameters(p): Parameters<UserIdParams>) -> CallToolResult {
         self.call_json(|c| async move { c.get_user(p.user_id).await })
             .await
     }
 
-    #[tool(description = "Get the currently authenticated Zendesk user")]
+    #[tool(
+        description = "Get the currently authenticated Zendesk user",
+        annotations(read_only_hint = true)
+    )]
     async fn get_current_user(&self) -> CallToolResult {
         self.call_json(|c| async move { c.get_current_user().await })
             .await
     }
 
-    #[tool(description = "Search Zendesk users by name, email, or external_id")]
+    #[tool(
+        description = "Search Zendesk users by name, email, or external_id",
+        annotations(read_only_hint = true)
+    )]
     async fn search_users(&self, Parameters(p): Parameters<SearchUsersParams>) -> CallToolResult {
         self.call_json(|c| async move { c.search_users(&p.query).await })
             .await
     }
 
-    #[tool(description = "Get a Zendesk organization by its ID")]
+    #[tool(
+        description = "Get a Zendesk organization by its ID",
+        annotations(read_only_hint = true)
+    )]
     async fn get_organization(
         &self,
         Parameters(p): Parameters<OrganizationIdParams>,
@@ -55,7 +65,10 @@ impl ZendeskServer {
             .await
     }
 
-    #[tool(description = "Search Zendesk organizations by name")]
+    #[tool(
+        description = "Search Zendesk organizations by name",
+        annotations(read_only_hint = true)
+    )]
     async fn search_organizations(
         &self,
         Parameters(p): Parameters<SearchOrganizationsParams>,
@@ -64,7 +77,10 @@ impl ZendeskServer {
             .await
     }
 
-    #[tool(description = "List assignable Zendesk groups for ticket routing")]
+    #[tool(
+        description = "List assignable Zendesk groups for ticket routing",
+        annotations(read_only_hint = true)
+    )]
     async fn list_groups(&self) -> CallToolResult {
         self.call_json(|c| async move { c.list_groups().await })
             .await

@@ -58,40 +58,54 @@ struct SlaBreachesParams {
 
 #[tool_router(router = workflows_router, vis = "pub(super)")]
 impl ZendeskServer {
-    #[tool(description = "List all available Zendesk views (saved ticket queues)")]
+    #[tool(
+        description = "List all available Zendesk views (saved ticket queues)",
+        annotations(read_only_hint = true)
+    )]
     async fn list_views(&self) -> CallToolResult {
         self.call_json(|c| async move { c.list_views().await })
             .await
     }
 
-    #[tool(description = "Execute a Zendesk view and return its tickets")]
+    #[tool(
+        description = "Execute a Zendesk view and return its tickets",
+        annotations(read_only_hint = true)
+    )]
     async fn execute_view(&self, Parameters(p): Parameters<ExecuteViewParams>) -> CallToolResult {
         self.call_json(|c| async move { c.execute_view(p.view_id, p.page, p.per_page).await })
             .await
     }
 
     #[tool(
-        description = "List all ticket fields (system + custom) with their types and valid options"
+        description = "List all ticket fields (system + custom) with their types and valid options",
+        annotations(read_only_hint = true)
     )]
     async fn list_ticket_fields(&self) -> CallToolResult {
         self.call_json(|c| async move { c.list_ticket_fields().await })
             .await
     }
 
-    #[tool(description = "List all ticket forms and their associated field IDs")]
+    #[tool(
+        description = "List all ticket forms and their associated field IDs",
+        annotations(read_only_hint = true)
+    )]
     async fn list_ticket_forms(&self) -> CallToolResult {
         self.call_json(|c| async move { c.list_ticket_forms().await })
             .await
     }
 
-    #[tool(description = "List available Zendesk macros (canned responses and actions)")]
+    #[tool(
+        description = "List available Zendesk macros (canned responses and actions)",
+        annotations(read_only_hint = true)
+    )]
     async fn list_macros(&self, Parameters(p): Parameters<ListMacrosParams>) -> CallToolResult {
         self.call_json(|c| async move { c.list_macros(p.active_only).await })
             .await
     }
 
     #[tool(
-        description = "Preview the result of applying a macro to a ticket (does not save changes)"
+        description = "Preview the result of applying a macro to a ticket (does not save changes)",
+        annotations(read_only_hint = true)
     )]
     async fn apply_macro(&self, Parameters(p): Parameters<ApplyMacroParams>) -> CallToolResult {
         self.call_json(|c| async move {
@@ -101,7 +115,10 @@ impl ZendeskServer {
         .await
     }
 
-    #[tool(description = "Find tickets that breached SLA within a specified time period")]
+    #[tool(
+        description = "Find tickets that breached SLA within a specified time period",
+        annotations(read_only_hint = true)
+    )]
     async fn get_sla_breaches(
         &self,
         Parameters(p): Parameters<SlaBreachesParams>,
@@ -113,7 +130,10 @@ impl ZendeskServer {
         .await
     }
 
-    #[tool(description = "Get all SLA policies with their metric targets per priority level")]
+    #[tool(
+        description = "Get all SLA policies with their metric targets per priority level",
+        annotations(read_only_hint = true)
+    )]
     async fn get_sla_policies(&self) -> CallToolResult {
         self.call_json(|c| async move { c.get_sla_policies().await })
             .await
