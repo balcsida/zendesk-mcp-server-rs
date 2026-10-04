@@ -8,6 +8,10 @@ struct ExecuteViewParams {
     page: u64,
     #[serde(default = "per_page_25")]
     per_page: u64,
+    /// Column to sort by, e.g. created_at or updated_at (see Zendesk's view columns)
+    sort_by: Option<String>,
+    /// asc or desc
+    sort_order: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -72,8 +76,17 @@ impl ZendeskServer {
         annotations(read_only_hint = true)
     )]
     async fn execute_view(&self, Parameters(p): Parameters<ExecuteViewParams>) -> CallToolResult {
-        self.call_json(|c| async move { c.execute_view(p.view_id, p.page, p.per_page).await })
+        self.call_json(|c| async move {
+            c.execute_view(
+                p.view_id,
+                p.page,
+                p.per_page,
+                p.sort_by.as_deref(),
+                p.sort_order.as_deref(),
+            )
             .await
+        })
+        .await
     }
 
     #[tool(

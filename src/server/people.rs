@@ -8,8 +8,10 @@ struct UserIdParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct SearchUsersParams {
-    /// Name, email, or external_id to search for
-    query: String,
+    /// Name, email, notes, phone or other user property to search for
+    query: Option<String>,
+    /// Exact external_id to match (not a search expression)
+    external_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -45,12 +47,15 @@ impl ZendeskServer {
     }
 
     #[tool(
-        description = "Search Zendesk users by name, email, or external_id",
+        description = "Search Zendesk users by name, email or other properties (query) or by exact external_id; give at least one. Zendesk returns at most 10,000 matches.",
         annotations(read_only_hint = true)
     )]
     async fn search_users(&self, Parameters(p): Parameters<SearchUsersParams>) -> CallToolResult {
-        self.call_json(|c| async move { c.search_users(&p.query).await })
-            .await
+        self.call_json(|c| async move {
+            c.search_users(p.query.as_deref(), p.external_id.as_deref())
+                .await
+        })
+        .await
     }
 
     #[tool(

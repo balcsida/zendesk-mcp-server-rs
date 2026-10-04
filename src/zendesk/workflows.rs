@@ -18,14 +18,26 @@ impl ZendeskClient {
         .map_err(ctx("Failed to list views"))
     }
 
-    pub async fn execute_view(&self, view_id: u64, page: u64, per_page: u64) -> Result<Value> {
+    pub async fn execute_view(
+        &self,
+        view_id: u64,
+        page: u64,
+        per_page: u64,
+        sort_by: Option<&str>,
+        sort_order: Option<&str>,
+    ) -> Result<Value> {
         async {
             let per_page = per_page.min(100);
+            let mut params: Vec<(&str, &(dyn std::fmt::Display + Sync))> =
+                vec![("page", &page), ("per_page", &per_page)];
+            if let Some(sort_by) = &sort_by {
+                params.push(("sort_by", sort_by));
+            }
+            if let Some(sort_order) = &sort_order {
+                params.push(("sort_order", sort_order));
+            }
             let data = self
-                .api_get(
-                    &format!("views/{view_id}/tickets.json"),
-                    &[("page", &page), ("per_page", &per_page)],
-                )
+                .api_get(&format!("views/{view_id}/tickets.json"), &params)
                 .await?;
             let tickets = pick_all(&data, "tickets", &TICKET_SUMMARY_KEYS, &[]);
             Ok(json!({
@@ -93,9 +105,9 @@ impl ZendeskClient {
             } else {
                 "macros.json"
             };
-            let data = self.api_get(path, &[]).await?;
+            let macros = self.get_paged(path, "macros").await?;
             Ok(pick_all(
-                &data,
+                &json!({ "macros": macros }),
                 "macros",
                 &["id", "title", "description", "active"],
                 &[],
@@ -199,6 +211,50 @@ mod tests {
     use crate::zendesk::test_support::*;
     use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn list_macros_concatenates_pages() {
+        let server = MockServer::start().await;
+        let next = format!("{}/api/v2/macros/active.json?page=2", server.uri());
+        Mock::given(method("GET"))
+            .and(path("/api/v2/macros/active.json"))
+            .and(query_param("page", "2"))
+            .respond_with(json_page("macros", json!([{"id": 2, "title": "b"}]), None))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/macros/active.json"))
+            .respond_with(json_page(
+                "macros",
+                json!([{"id": 1, "title": "a", "extra": true}]),
+                Some(next),
+            ))
+            .mount(&server)
+            .await;
+        let out = client(&server).list_macros(true).await.unwrap();
+        assert_eq!(out.as_array().unwrap().len(), 2);
+        assert_eq!(out[0]["title"], "a");
+        assert!(out[0].get("extra").is_none());
+        assert_eq!(out[1]["id"], 2);
+    }
+
+    #[tokio::test]
+    async fn execute_view_passes_sort_params() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/views/3/tickets.json"))
+            .and(query_param("sort_by", "updated_at"))
+            .and(query_param("sort_order", "desc"))
+            .respond_with(json_page("tickets", json!([{"id": 1}]), None))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let out = client(&server)
+            .execute_view(3, 1, 25, Some("updated_at"), Some("desc"))
+            .await
+            .unwrap();
+        assert_eq!(out["count"], 1);
+    }
 
     #[tokio::test]
     async fn sla_breaches_filter_metric_and_sum_pages() {

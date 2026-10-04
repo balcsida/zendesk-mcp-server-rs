@@ -572,19 +572,22 @@ Get a user by ID. Use it to resolve `requester_id` or `assignee_id` from tickets
 
 - `user_id` (integer)
 
+Also returns `user_fields` (custom user fields, or null), `notes`, `details`, `external_id`, `locale`, `last_login_at`, `ticket_restriction`, `verified`, `default_group_id` and `alias`.
+
 #### get_current_user
 
-Get the currently authenticated user. No inputs.
+Get the currently authenticated user. No inputs. Also returns `custom_role_id`, `ticket_restriction`, `restricted_agent`, `shared_agent`, `locale`, `active` and `verified`.
 
 #### search_users
 
-Search users by name, email or external_id.
+Search users by name, email or other properties, or by exact external_id. Give at least one of the two. Zendesk returns at most 10,000 matches. Results include `external_id` and `suspended`.
 
-- `query` (string)
+- `query` (string, optional): Name, email, notes, phone or another user property
+- `external_id` (string, optional): Exact external_id (not a search expression)
 
 #### get_organization
 
-Get an organization by ID.
+Get an organization by ID. Also returns `organization_fields` (custom organization fields, or null), `external_id`, `shared_tickets` and `shared_comments`.
 
 - `organization_id` (integer)
 
@@ -607,6 +610,8 @@ Execute a view and return its tickets.
 - `view_id` (integer)
 - `page` (integer, optional): Defaults to 1
 - `per_page` (integer, optional): Defaults to 25
+- `sort_by` (string, optional): Column to sort by, e.g. `created_at` or `updated_at`
+- `sort_order` (string, optional): `asc` or `desc`
 
 #### list_ticket_fields
 
@@ -622,7 +627,7 @@ List assignable groups for ticket routing. No inputs.
 
 #### list_macros
 
-List available macros (canned responses and actions).
+List available macros (canned responses and actions). Returns every page.
 
 - `active_only` (boolean, optional): Defaults to true
 
