@@ -529,9 +529,9 @@ Merge source tickets into a target ticket. Zendesk merges in a background job; t
 
 #### get_job_status
 
-Get the status of a Zendesk background job, such as a merge that was still running. Returns `id`, `status`, `progress`, `total`, `message`, `url`, `pending` (true while queued or working) and per-item `results`.
+Get the status of a Zendesk background job, such as a merge or `update_tickets_bulk` that was still running. Returns `id`, `status`, `progress`, `total`, `message`, `url`, `pending` (true while queued or working) and per-item `results`.
 
-- `job_id` (string): The job status ID returned by `merge_tickets` or a bulk operation
+- `job_id` (string): The job status ID returned by `merge_tickets`, `update_tickets_bulk` or another bulk operation
 
 #### get_user_tickets
 
@@ -575,6 +575,72 @@ Add and/or remove specific tags on a ticket and return its current tags. Unlike 
 - `ticket_id` (integer)
 - `add` (array of strings, optional): Tags to add
 - `remove` (array of strings, optional): Tags to remove (no commas). At least one of `add` and `remove` is required.
+
+### Ticket operations
+
+#### list_deleted_tickets
+
+List soft-deleted tickets from the last 30 days: `id`, `subject`, `deleted_at`, `actor` (`id`, `name`) and `previous_state`. Zendesk limits this to 10 requests per minute. `restore_deleted_ticket` undoes a deletion.
+
+- `page` (integer, optional): Defaults to 1
+- `per_page` (integer, optional): Max 100 (defaults to 25)
+
+#### restore_deleted_ticket
+
+Restore a soft-deleted ticket.
+
+- `ticket_id` (integer)
+
+#### list_suspended_tickets
+
+List suspended tickets one page at a time: `id`, `subject`, `cause`, `cause_id`, `author`, `recipient`, `created_at`, `ticket_id`, `channel` and optionally `content`. Returns `has_more` and `after_cursor`. The content is untrusted (mostly spam). Needs an admin or unrestricted agent.
+
+- `page_size` (integer, optional): Max 100 (defaults to 25)
+- `after_cursor` (string, optional): The `after_cursor` of the previous page
+- `include_content` (boolean, optional): Include the flagged content (defaults to false)
+
+#### recover_suspended_ticket
+
+Recover a suspended ticket. The new ticket's requester is the authenticated user, not the original sender. If Zendesk cannot recover it, the error says why.
+
+- `suspended_ticket_id` (integer): The ID from `list_suspended_tickets`
+
+#### make_comment_private
+
+Make a public comment private. One-way: a private comment cannot be made public again.
+
+- `ticket_id` (integer)
+- `comment_id` (integer)
+
+#### redact_comment_text
+
+Permanently replace a string in a comment with block characters, for PII such as card numbers. Irreversible; does not work on closed tickets. Returns the comment.
+
+- `ticket_id` (integer)
+- `comment_id` (integer)
+- `text` (string): The exact string to redact
+
+#### mark_ticket_as_spam
+
+Mark a ticket as spam and suspend its requester.
+
+- `ticket_id` (integer)
+
+#### update_tickets_bulk
+
+Apply the same change to up to 100 tickets. Waits up to 30 seconds for Zendesk's background job and returns its status under `job`; if it is still `pending`, call `get_job_status` with the returned `id`.
+
+- `ticket_ids` (array of integers): 1 to 100 ticket IDs
+- `status` (string, optional): `new`, `open`, `pending`, `hold`, `solved`
+- `priority` (string, optional): `low`, `normal`, `high`, `urgent`
+- `type` (string, optional): `problem`, `incident`, `question`, `task`
+- `assignee_id` (integer, optional)
+- `group_id` (integer, optional)
+- `custom_status_id` (integer, optional)
+- `tags` (array of strings, optional): Replaces all tags on every ticket
+- `custom_fields` (array of objects, optional): `[{"id": 1, "value": "x"}]`
+
+At least one field is required.
 
 ### Search
 

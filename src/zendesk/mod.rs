@@ -596,6 +596,7 @@ pub(super) const TICKET_SUMMARY_KEYS: [&str; 9] = [
 
 mod help_center;
 mod people;
+mod ticket_ops;
 mod tickets;
 mod workflows;
 

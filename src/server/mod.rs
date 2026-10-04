@@ -102,6 +102,7 @@ The response should be formatted well and ready to be posted as a comment.
 
 mod help_center;
 mod people;
+mod ticket_ops;
 mod tickets;
 mod workflows;
 
@@ -114,6 +115,7 @@ impl ZendeskServer {
             kb_cache: Arc::new(Mutex::new(None)),
             tool_router: Self::ticket_router()
                 + Self::people_router()
+                + Self::ticket_ops_router()
                 + Self::workflows_router()
                 + Self::help_center_router(),
             prompt_router: Self::prompt_router(),
@@ -452,7 +454,7 @@ async fn shutdown_signal() {
 mod tests {
     use super::*;
 
-    const TOOLS: [&str; 41] = [
+    const TOOLS: [&str; 49] = [
         "get_ticket",
         "create_ticket",
         "get_tickets",
@@ -494,6 +496,14 @@ mod tests {
         "update_ticket_tags",
         "list_custom_statuses",
         "list_satisfaction_ratings",
+        "list_deleted_tickets",
+        "restore_deleted_ticket",
+        "list_suspended_tickets",
+        "recover_suspended_ticket",
+        "make_comment_private",
+        "redact_comment_text",
+        "mark_ticket_as_spam",
+        "update_tickets_bulk",
     ];
 
     fn server() -> ZendeskServer {
@@ -507,7 +517,7 @@ mod tests {
     }
 
     #[test]
-    fn lists_exactly_the_41_tools() {
+    fn lists_exactly_the_49_tools() {
         let mut names: Vec<String> = server()
             .tool_router
             .list_all()
