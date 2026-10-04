@@ -1051,6 +1051,31 @@ fn prompt(message: &str) -> Result<String> {
     Ok(line.trim().to_string())
 }
 
+/// Subdomain for the interactive `mobile-auth` command: `env_subdomain` (trimmed) if set and
+/// non-empty, printed since it is not a secret, else whatever `ask` returns. Either way, a
+/// pasted `https://mycompany.zendesk.com/` is normalized down to `mycompany`.
+fn resolve_subdomain(
+    env_subdomain: Option<String>,
+    ask: impl FnOnce() -> Result<String>,
+) -> Result<String> {
+    let env_subdomain = env_subdomain
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let subdomain = match env_subdomain {
+        Some(subdomain) => {
+            println!("Using subdomain '{subdomain}' from ZENDESK_SUBDOMAIN.");
+            subdomain
+        }
+        None => ask()?,
+    };
+    Ok(subdomain
+        .replace(".zendesk.com", "")
+        .replace("https://", "")
+        .replace("http://", "")
+        .trim_matches('/')
+        .to_string())
+}
+
 fn login_label(service: &str) -> &str {
     match service {
         "zendesk" => "Email & Password",
@@ -1129,27 +1154,9 @@ pub async fn run_auth_cli(http: reqwest::Client) -> Result<()> {
         println!();
     }
 
-    let default_subdomain = std::env::var("ZENDESK_SUBDOMAIN")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
-    let question = match &default_subdomain {
-        Some(default) => format!(
-            "Enter your Zendesk subdomain (e.g., 'mycompany' for mycompany.zendesk.com) [{default}]: "
-        ),
-        None => "Enter your Zendesk subdomain (e.g., 'mycompany' for mycompany.zendesk.com): "
-            .to_string(),
-    };
-    let mut subdomain = prompt(&question)?;
-    if subdomain.is_empty() {
-        subdomain = default_subdomain.unwrap_or_default();
-    }
-    let subdomain = subdomain
-        .replace(".zendesk.com", "")
-        .replace("https://", "")
-        .replace("http://", "")
-        .trim_matches('/')
-        .to_string();
+    let subdomain = resolve_subdomain(std::env::var("ZENDESK_SUBDOMAIN").ok(), || {
+        prompt("Enter your Zendesk subdomain (e.g., 'mycompany' for mycompany.zendesk.com): ")
+    })?;
     if subdomain.is_empty() {
         bail!("subdomain is required.");
     }
@@ -1300,6 +1307,40 @@ mod tests {
         let url = build_auth_url("https://sso.example.com/login?x=1");
         assert!(url.starts_with("https://sso.example.com/login?x=1&client_id="));
         assert_eq!(url.matches('?').count(), 1);
+    }
+
+    #[test]
+    fn resolve_subdomain_uses_env_without_asking() {
+        let asked = std::cell::Cell::new(false);
+        let subdomain = resolve_subdomain(Some("example".to_string()), || {
+            asked.set(true);
+            Ok(String::new())
+        })
+        .unwrap();
+        assert_eq!(subdomain, "example");
+        assert!(
+            !asked.get(),
+            "should not prompt when ZENDESK_SUBDOMAIN is set"
+        );
+    }
+
+    #[test]
+    fn resolve_subdomain_asks_when_env_is_unset_or_blank() {
+        for env in [None, Some("   ".to_string())] {
+            let subdomain =
+                resolve_subdomain(env, || Ok("https://example.zendesk.com/".to_string())).unwrap();
+            assert_eq!(subdomain, "example");
+        }
+    }
+
+    #[test]
+    fn resolve_subdomain_normalizes_env_value() {
+        let subdomain = resolve_subdomain(
+            Some("  https://example.zendesk.com/ ".to_string()),
+            || unreachable!(),
+        )
+        .unwrap();
+        assert_eq!(subdomain, "example");
     }
 
     #[test]

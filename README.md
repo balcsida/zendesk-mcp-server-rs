@@ -203,6 +203,9 @@ needed. Use it when you cannot register an OAuth client in Admin Center.
   redirect goes to `zendesk-support://authenticate?...`, which is captured by a
   temporary URL-scheme handler, or by pasting the URL.
 
+If `ZENDESK_SUBDOMAIN` is already set, `mobile-auth` uses it directly instead of
+prompting (the subdomain is printed, since it is not a secret).
+
 The access token has no refresh token, so sign in again when it expires.
 
 The token is saved to `~/.config/zendesk-mcp/mobile_token.json` (under
