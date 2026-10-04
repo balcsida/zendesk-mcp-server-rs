@@ -41,6 +41,10 @@ claude mcp add zendesk -e ZENDESK_SUBDOMAIN=acme -e ZENDESK_CLIENT_ID=your-clien
 
 The server also reads a `.env` file from its working directory or any parent.
 
+Without a subcommand the binary serves over stdio; `zendesk-mcp-server stdio` is
+the same thing. `zendesk-mcp-server http` serves streamable HTTP instead, see
+[Remote hosting](#remote-hosting).
+
 ## Authentication
 
 This server authenticates with OAuth. Each operator authorizes with their own
@@ -282,12 +286,13 @@ Claude Code or Claude Desktop configuration:
 ```bash
 docker run -d --name zendesk-mcp \
   --env-file .env \
-  -e MCP_HTTP_ADDR=0.0.0.0:8080 \
   -e MCP_BEARER_TOKEN=change-me \
   -v zendesk-tokens:/tokens \
   -p 8080:8080 \
-  zendesk-mcp-server-rs
+  zendesk-mcp-server-rs http
 ```
+
+Inside the image `http` listens on `0.0.0.0:8080` by default.
 
 ### Compose
 
@@ -301,14 +306,15 @@ docker compose run --rm zendesk-mcp auth --manual   # first time only
 
 ## Remote hosting
 
-Serve over streamable HTTP with `--http ADDR` or `MCP_HTTP_ADDR`:
+Serve over streamable HTTP with the `http` subcommand:
 
 ```bash
-zendesk-mcp-server --http 0.0.0.0:8080 --bearer-token "$(openssl rand -hex 32)"
+zendesk-mcp-server http --bind 0.0.0.0:8080 --bearer-token "$(openssl rand -hex 32)"
 ```
 
 - The MCP endpoint is `http://host:8080/mcp`.
-- HTTP mode requires a bearer token (`--bearer-token` or `MCP_BEARER_TOKEN`). Clients send it as `Authorization: Bearer <token>`.
+- `--bind` (or `MCP_HTTP_ADDR`) defaults to `127.0.0.1:8080`; the Docker image sets it to `0.0.0.0:8080`.
+- The `http` transport requires a bearer token (`--bearer-token` or `MCP_BEARER_TOKEN`). Clients send it as `Authorization: Bearer <token>`.
 - `GET /healthz` is unauthenticated, for health checks.
 - The server speaks plain HTTP. Put TLS in front with a reverse proxy such as Caddy or nginx.
 
@@ -335,8 +341,8 @@ Everyone who holds the bearer token acts as that Zendesk user.
 | `ZENDESK_EMAIL` | none | Email for API token auth (deprecated). |
 | `ZENDESK_API_KEY` | none | API token (deprecated). |
 | `ZENDESK_SESSION_COOKIE` | none | `_zendesk_session` cookie of a signed-in browser. |
-| `MCP_HTTP_ADDR` | none | Serve HTTP on this address instead of stdio. Same as `--http`. |
-| `MCP_BEARER_TOKEN` | none | Bearer token clients must present over HTTP. Same as `--bearer-token`. |
+| `MCP_HTTP_ADDR` | `127.0.0.1:8080` (`0.0.0.0:8080` in Docker) | Listen address for the `http` subcommand. Same as `--bind`. |
+| `MCP_BEARER_TOKEN` | none | Bearer token clients must present to the `http` transport. Same as `--bearer-token`. |
 | `RUST_LOG` | `info` | Log filter. Logs go to stderr. |
 
 ## Development

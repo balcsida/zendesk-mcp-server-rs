@@ -28,15 +28,20 @@ use tower_http::validate_request::ValidateRequestHeaderLayer;
 use crate::config::Credentials;
 use crate::zendesk::ZendeskClient;
 
-/// Command-line / environment options for serving.
-#[derive(Debug, Clone, Default, clap::Args)]
-pub struct ServeArgs {
-    /// Serve over streamable HTTP on this address (for example 0.0.0.0:8080) instead of
-    /// stdio. Requires MCP_BEARER_TOKEN.
-    #[arg(long, env = "MCP_HTTP_ADDR", value_name = "ADDR")]
-    pub http: Option<SocketAddr>,
+/// Options for the `http` subcommand.
+#[derive(Debug, Clone, clap::Args)]
+pub struct HttpArgs {
+    /// Address to listen on. The MCP endpoint is http://ADDR/mcp.
+    #[arg(
+        long,
+        env = "MCP_HTTP_ADDR",
+        value_name = "ADDR",
+        default_value = "127.0.0.1:8080"
+    )]
+    pub bind: SocketAddr,
 
-    /// Bearer token MCP clients must present when serving over HTTP.
+    /// Bearer token MCP clients must present. Required, so the Zendesk credentials are
+    /// not exposed to anyone who can reach the port.
     #[arg(
         long,
         env = "MCP_BEARER_TOKEN",
@@ -44,6 +49,13 @@ pub struct ServeArgs {
         value_name = "TOKEN"
     )]
     pub bearer_token: Option<String>,
+}
+
+/// How the server talks to its MCP client.
+#[derive(Debug, Clone)]
+pub enum Transport {
+    Stdio,
+    Http(HttpArgs),
 }
 
 #[derive(Clone)]
@@ -883,32 +895,35 @@ fn http_router(server: ZendeskServer, bearer_token: &str, ct: CancellationToken)
 }
 
 /// Authenticate up front (so a browser sign-in happens at startup, not mid-call), then
-/// serve over stdio or streamable HTTP.
-pub async fn run(args: ServeArgs, http: reqwest::Client) -> Result<()> {
+/// serve over the chosen transport.
+pub async fn run(transport: Transport, http: reqwest::Client) -> Result<()> {
     let credentials = crate::config::load_credentials()?;
     let server = ZendeskServer::new(credentials, http);
     if let Err(e) = server.client().await {
         tracing::error!("Zendesk authentication failed: {e:#}");
     }
 
-    let Some(addr) = args.http else {
-        tracing::info!("Serving MCP over stdio");
-        server
-            .serve(rmcp::transport::stdio())
-            .await?
-            .waiting()
-            .await?;
-        return Ok(());
+    let args = match transport {
+        Transport::Stdio => {
+            tracing::info!("Serving MCP over stdio");
+            server
+                .serve(rmcp::transport::stdio())
+                .await?
+                .waiting()
+                .await?;
+            return Ok(());
+        }
+        Transport::Http(args) => args,
     };
 
     let Some(token) = args.bearer_token else {
         bail!(
-            "MCP_BEARER_TOKEN is required when serving over HTTP so the Zendesk credentials are not exposed to anyone who can reach the port."
+            "MCP_BEARER_TOKEN (or --bearer-token) is required for the http transport so the Zendesk credentials are not exposed to anyone who can reach the port."
         );
     };
     let ct = CancellationToken::new();
     let router = http_router(server, &token, ct.clone());
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let listener = tokio::net::TcpListener::bind(args.bind).await?;
     tracing::info!(
         "Serving MCP over HTTP at http://{}/mcp",
         listener.local_addr()?

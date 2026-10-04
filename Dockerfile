@@ -26,12 +26,15 @@ RUN apt-get update \
 
 COPY --from=builder /zendesk-mcp-server /usr/local/bin/zendesk-mcp-server
 
+# Inside a container the network namespace is the boundary, so `http` listens on
+# every interface; publish the port with -p to expose it.
 ENV ZENDESK_TOKEN_FILE=/tokens/tokens.json \
-    ZENDESK_MOBILE_TOKEN_FILE=/tokens/mobile_token.json
+    ZENDESK_MOBILE_TOKEN_FILE=/tokens/mobile_token.json \
+    MCP_HTTP_ADDR=0.0.0.0:8080
 
 USER appuser
 EXPOSE 8080
 
-# Serves over stdio by default. Set MCP_HTTP_ADDR and MCP_BEARER_TOKEN for HTTP,
-# or pass `auth --manual` to authorize.
+# Serves over stdio by default. Pass `http` (with MCP_BEARER_TOKEN set) for streamable
+# HTTP, or `auth --manual` to authorize.
 ENTRYPOINT ["zendesk-mcp-server"]

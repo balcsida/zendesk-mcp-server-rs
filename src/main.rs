@@ -15,21 +15,21 @@ use tracing_subscriber::EnvFilter;
 
 /// Model Context Protocol server for Zendesk.
 ///
-/// With no subcommand the server runs, speaking MCP over stdio (or over streamable
-/// HTTP with --http). Configuration comes from the environment and a .env file in the
-/// working directory or any parent.
+/// Without a subcommand it serves over stdio. Configuration comes from the environment
+/// and a .env file in the working directory or any parent.
 #[derive(Parser)]
 #[command(name = "zendesk-mcp-server", version, about)]
 struct Cli {
-    #[command(flatten)]
-    serve: server::ServeArgs,
-
     #[command(subcommand)]
     command: Option<Command>,
 }
 
 #[derive(Subcommand)]
 enum Command {
+    /// Serve MCP over stdin/stdout (the default when no subcommand is given).
+    Stdio,
+    /// Serve MCP over streamable HTTP at /mcp, protected by a bearer token.
+    Http(server::HttpArgs),
     /// Authorize this machine with Zendesk OAuth (PKCE) and store the tokens for the server.
     Auth {
         /// Paste the redirect URL instead of running a local callback server.
@@ -58,12 +58,13 @@ async fn main() -> Result<()> {
         .timeout(Duration::from_secs(30))
         .build()?;
 
-    match cli.command {
-        Some(Command::Auth { manual }) => {
+    match cli.command.unwrap_or(Command::Stdio) {
+        Command::Stdio => server::run(server::Transport::Stdio, http).await,
+        Command::Http(args) => server::run(server::Transport::Http(args), http).await,
+        Command::Auth { manual } => {
             let code = auth_cli::run(http, manual).await?;
             std::process::exit(code);
         }
-        Some(Command::MobileAuth) => mobile_auth::run_auth_cli(http).await,
-        None => server::run(cli.serve, http).await,
+        Command::MobileAuth => mobile_auth::run_auth_cli(http).await,
     }
 }

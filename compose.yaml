@@ -1,10 +1,9 @@
 services:
   zendesk-mcp:
     build: .
+    command: ["http"]
+    # .env must also contain MCP_BEARER_TOKEN.
     env_file: .env
-    environment:
-      MCP_HTTP_ADDR: 0.0.0.0:8080
-      # MCP_BEARER_TOKEN comes from .env
     ports:
       - "8080:8080"
     volumes:
