@@ -74,7 +74,11 @@ pub struct ZendeskServer {
 const KB_TTL: Duration = Duration::from_secs(3600);
 const KB_URI: &str = "zendesk://knowledge-base";
 
-const INSTRUCTIONS: &str = "Zendesk server: read and manage tickets, users, organizations, views, macros, SLA data and Help Center articles. get_ticket_comments returns attachment URLs that can be passed to get_ticket_attachment to fetch the file.";
+const INSTRUCTIONS: &str = "Zendesk server. Tool families: tickets and comments; search (ZQL) with count_tickets; users and organizations; views, macros and triggers; custom objects; Help Center articles; SLA data.
+
+Conventions: list tools page with page/per_page or page_size/after_cursor and report has_more. Bulk tools return a job; follow it with get_job_status. Attachments: get_ticket_comments gives content_url for get_ticket_attachment; upload_attachment gives tokens to attach to comments.
+
+Cautions: delete_ticket, merge_tickets, mark_ticket_as_spam, redact_comment_text and update_tickets_bulk are destructive and flagged as such. apply_macro only previews; execute_macro saves. create_article makes drafts.";
 
 const TICKET_ANALYSIS_TEMPLATE: &str = "
 You are a helpful Zendesk support analyst. You've been asked to analyze ticket #{ticket_id}.

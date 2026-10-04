@@ -8,9 +8,9 @@ This is a Rust rewrite of [reminia/zendesk-mcp-server](https://github.com/remini
 
 It offers:
 
-- Tools for retrieving and managing Zendesk tickets, comments, users, organizations, views, macros and SLAs
+- Tools for tickets, comments and attachments; search and counts; users, organizations, groups and brands; views, macros and triggers; custom objects; Help Center reading and writing; SLA and satisfaction data
 - Specialized prompts for ticket analysis and response drafting
-- Full access to the Zendesk Help Center articles as a knowledge base
+- The Zendesk Help Center articles as a knowledge base resource
 - A single binary with no runtime dependencies, speaking stdio or streamable HTTP
 
 ## Setup
@@ -411,6 +411,8 @@ Draft a response to a Zendesk ticket.
 - `ticket_id` (required)
 
 ## Tools
+
+Tools carry MCP annotations (read-only, destructive) so clients can ask for confirmation before changes. The categories below cover tickets, ticket operations, search, users and organizations, views, macros and triggers, account, custom objects, the Help Center, and metrics and SLAs.
 
 ### Tickets
 
