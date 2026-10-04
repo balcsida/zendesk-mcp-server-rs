@@ -3,9 +3,27 @@ use super::*;
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct SearchArticlesParams {
     /// Search query string to find relevant articles
-    query: String,
+    query: Option<String>,
     /// Optional locale filter (e.g., 'en-us', 'fr', 'es')
     locale: Option<String>,
+    /// Only articles in this category ID
+    category: Option<u64>,
+    /// Only articles in this section ID
+    section: Option<u64>,
+    /// Only articles with these labels (sent comma-separated)
+    label_names: Option<Vec<String>>,
+    /// created_at or updated_at (defaults to relevance)
+    sort_by: Option<String>,
+    /// asc or desc (defaults to desc)
+    sort_order: Option<String>,
+    /// Only articles created after this date (YYYY-MM-DD)
+    created_after: Option<String>,
+    /// Only articles created before this date (YYYY-MM-DD)
+    created_before: Option<String>,
+    /// Only articles updated after this date (YYYY-MM-DD)
+    updated_after: Option<String>,
+    /// Only articles updated before this date (YYYY-MM-DD)
+    updated_before: Option<String>,
     /// Number of results per page (max 100)
     #[serde(default = "per_page_25")]
     per_page: u64,
@@ -109,7 +127,7 @@ struct UpdateArticleParams {
 #[tool_router(router = help_center_router, vis = "pub(super)")]
 impl ZendeskServer {
     #[tool(
-        description = "Search Zendesk help center articles by query string",
+        description = "Search Zendesk help center articles by text and/or filters. Give at least one of query, category, section or label_names. Returns each match with a snippet (matching text in <em> tags), promoted, label_names and vote_sum. Zendesk returns at most 1,000 results per search.",
         annotations(read_only_hint = true)
     )]
     async fn search_articles(
@@ -117,8 +135,23 @@ impl ZendeskServer {
         Parameters(p): Parameters<SearchArticlesParams>,
     ) -> CallToolResult {
         self.call_json(|c| async move {
-            c.search_articles(&p.query, p.locale.as_deref(), p.per_page, p.page)
-                .await
+            let labels = p.label_names.unwrap_or_default();
+            c.search_articles(&ArticleSearch {
+                query: p.query.as_deref(),
+                locale: p.locale.as_deref(),
+                category: p.category,
+                section: p.section,
+                label_names: &labels,
+                sort_by: p.sort_by.as_deref(),
+                sort_order: p.sort_order.as_deref(),
+                created_after: p.created_after.as_deref(),
+                created_before: p.created_before.as_deref(),
+                updated_after: p.updated_after.as_deref(),
+                updated_before: p.updated_before.as_deref(),
+                per_page: p.per_page,
+                page: p.page,
+            })
+            .await
         })
         .await
     }

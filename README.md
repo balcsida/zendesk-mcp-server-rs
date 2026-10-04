@@ -911,14 +911,20 @@ Get one custom object record.
 
 #### search_articles
 
-Search Help Center articles by query string.
+Search Help Center articles by text and/or filters. Give at least one of `query`, `category`, `section` or `label_names`. Zendesk returns at most 1,000 results per search.
 
-- `query` (string)
+- `query` (string, optional)
 - `locale` (string, optional): For example `en-us`, `fr`, `es`
+- `category` (integer, optional): Only articles in this category
+- `section` (integer, optional): Only articles in this section
+- `label_names` (array of strings, optional): Only articles with these labels
+- `sort_by` (string, optional): `created_at` or `updated_at` (defaults to relevance)
+- `sort_order` (string, optional): `asc` or `desc` (defaults to `desc`)
+- `created_after`, `created_before`, `updated_after`, `updated_before` (string, optional): Dates as `YYYY-MM-DD`
 - `per_page` (integer, optional): Max 100 (defaults to 25)
 - `page` (integer, optional): Page number (defaults to 1)
 
-Returns matching articles with id, title, body, author_id, section_id, locale, html_url, timestamps and draft status, plus pagination metadata.
+Returns matching articles with id, title, body, snippet (matching text in `<em>` tags), author_id, section_id, locale, html_url, timestamps, draft and promoted status, label_names and vote_sum, plus pagination metadata.
 
 #### list_articles
 

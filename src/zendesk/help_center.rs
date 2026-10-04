@@ -3,6 +3,24 @@ use serde_json::{Map, Value, json};
 
 use super::*;
 
+/// Inputs of `search_articles`; dates are `YYYY-MM-DD`.
+#[derive(Clone, Copy, Default)]
+pub struct ArticleSearch<'a> {
+    pub query: Option<&'a str>,
+    pub locale: Option<&'a str>,
+    pub category: Option<u64>,
+    pub section: Option<u64>,
+    pub label_names: &'a [String],
+    pub sort_by: Option<&'a str>,
+    pub sort_order: Option<&'a str>,
+    pub created_after: Option<&'a str>,
+    pub created_before: Option<&'a str>,
+    pub updated_after: Option<&'a str>,
+    pub updated_before: Option<&'a str>,
+    pub per_page: u64,
+    pub page: u64,
+}
+
 /// The article shape `get_article`, `create_article` and `update_article` return.
 fn article_detail(article: &Value) -> Value {
     let mut out = pick(
@@ -75,20 +93,71 @@ impl ZendeskClient {
         .map_err(ctx("Failed to fetch knowledge base"))
     }
 
-    pub async fn search_articles(
-        &self,
-        query: &str,
-        locale: Option<&str>,
-        per_page: u64,
-        page: u64,
-    ) -> Result<Value> {
+    /// Search is capped by Zendesk at 1,000 results. Needs a query, category, section or
+    /// label names.
+    pub async fn search_articles(&self, search: &ArticleSearch<'_>) -> Result<Value> {
         async {
+            let ArticleSearch {
+                query,
+                locale,
+                category,
+                section,
+                label_names,
+                sort_by,
+                sort_order,
+                created_after,
+                created_before,
+                updated_after,
+                updated_before,
+                per_page,
+                page,
+            } = *search;
+            if query.is_none_or(str::is_empty)
+                && category.is_none()
+                && section.is_none()
+                && label_names.is_empty()
+            {
+                bail!("Give at least one of query, category, section or label_names");
+            }
+            if let Some(sort_by) = sort_by
+                && !["created_at", "updated_at"].contains(&sort_by)
+            {
+                bail!("Invalid sort_by '{sort_by}'. Allowed: created_at, updated_at");
+            }
+            if let Some(sort_order) = sort_order
+                && !["asc", "desc"].contains(&sort_order)
+            {
+                bail!("Invalid sort_order '{sort_order}'. Allowed: asc, desc");
+            }
             let per_page = per_page.min(100);
+            let labels = label_names.join(",");
             let mut params: Vec<(&str, &(dyn Display + Sync))> =
-                vec![("query", &query), ("per_page", &per_page), ("page", &page)];
-            let locale = locale.filter(|l| !l.is_empty());
-            if let Some(locale) = &locale {
-                params.push(("locale", locale));
+                vec![("per_page", &per_page), ("page", &page)];
+            if let Some(v) = &query {
+                params.push(("query", v));
+            }
+            if let Some(v) = &category {
+                params.push(("category", v));
+            }
+            if let Some(v) = &section {
+                params.push(("section", v));
+            }
+            if !label_names.is_empty() {
+                params.push(("label_names", &labels));
+            }
+            let extras = [
+                ("locale", locale.filter(|l| !l.is_empty())),
+                ("sort_by", sort_by),
+                ("sort_order", sort_order),
+                ("created_after", created_after),
+                ("created_before", created_before),
+                ("updated_after", updated_after),
+                ("updated_before", updated_before),
+            ];
+            for (key, value) in &extras {
+                if let Some(v) = value {
+                    params.push((key, v));
+                }
             }
             let data = self
                 .api_get("help_center/articles/search.json", &params)
@@ -106,6 +175,8 @@ impl ZendeskClient {
                     "html_url",
                     "created_at",
                     "updated_at",
+                    "snippet",
+                    "vote_sum",
                 ],
                 &[],
             );
@@ -115,7 +186,10 @@ impl ZendeskClient {
                 .flatten()
                 .zip(data["results"].as_array().into_iter().flatten())
             {
-                article["draft"] = raw.get("draft").cloned().unwrap_or(json!(false));
+                for key in ["draft", "promoted"] {
+                    article[key] = raw.get(key).cloned().unwrap_or(json!(false));
+                }
+                article["label_names"] = raw.get("label_names").cloned().unwrap_or(json!([]));
             }
             let count = articles.as_array().map_or(0, Vec::len);
             Ok(json!({
@@ -533,5 +607,62 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("Nothing to update"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn search_articles_sends_filters_and_returns_snippets() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/help_center/articles/search.json"))
+            .and(query_param("section", "5"))
+            .and(query_param("label_names", "a,b"))
+            .and(query_param("sort_by", "updated_at"))
+            .and(query_param("updated_after", "2026-01-01"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": [{"id": 1, "title": "t", "snippet": "<em>x</em>", "vote_sum": 3,
+                    "promoted": true, "label_names": ["a"], "result_type": "article"}],
+                "count": 1, "next_page": null
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let c = client(&server);
+        let labels = ["a".to_string(), "b".to_string()];
+        let search = ArticleSearch {
+            section: Some(5),
+            label_names: &labels,
+            sort_by: Some("updated_at"),
+            updated_after: Some("2026-01-01"),
+            per_page: 25,
+            page: 1,
+            ..Default::default()
+        };
+        let out = c.search_articles(&search).await.unwrap();
+        assert!(out["query"].is_null());
+        let a = &out["articles"][0];
+        assert_eq!(a["snippet"], "<em>x</em>");
+        assert_eq!(a["promoted"], true);
+        assert_eq!(a["label_names"], json!(["a"]));
+        assert_eq!(a["vote_sum"], 3);
+        assert!(a.get("result_type").is_none());
+        for bad in [
+            ArticleSearch {
+                per_page: 25,
+                page: 1,
+                ..Default::default()
+            },
+            ArticleSearch {
+                query: Some("q"),
+                sort_by: Some("title"),
+                ..Default::default()
+            },
+            ArticleSearch {
+                query: Some("q"),
+                sort_order: Some("up"),
+                ..Default::default()
+            },
+        ] {
+            assert!(c.search_articles(&bad).await.is_err());
+        }
     }
 }

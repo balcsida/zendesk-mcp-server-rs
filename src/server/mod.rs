@@ -26,7 +26,7 @@ use tokio_util::sync::CancellationToken;
 use tower_http::validate_request::ValidateRequestHeaderLayer;
 
 use crate::config::Credentials;
-use crate::zendesk::ZendeskClient;
+use crate::zendesk::{ArticleSearch, ZendeskClient};
 
 /// Options for the `http` subcommand.
 #[derive(Debug, Clone, clap::Args)]

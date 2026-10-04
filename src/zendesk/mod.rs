@@ -617,6 +617,7 @@ pub(super) const TICKET_SUMMARY_KEYS: [&str; 9] = [
 
 mod custom_objects;
 mod help_center;
+pub use help_center::ArticleSearch;
 mod people;
 mod ticket_ops;
 mod tickets;
