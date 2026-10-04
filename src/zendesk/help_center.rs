@@ -64,7 +64,10 @@ impl ZendeskClient {
                 // (upstream issue #10).
                 let path = match section.get("locale").and_then(Value::as_str) {
                     Some(locale) => {
-                        format!("help_center/{locale}/sections/{id}/articles.json")
+                        format!(
+                            "help_center/{}/sections/{id}/articles.json",
+                            segment(locale)?
+                        )
                     }
                     None => format!("help_center/sections/{id}/articles.json"),
                 };
@@ -199,8 +202,7 @@ impl ZendeskClient {
                 "per_page": per_page,
                 "count": count,
                 "total_count": data.get("count").cloned().unwrap_or(json!(count)),
-                "next_page": data["next_page"],
-                "previous_page": data["previous_page"],
+                "has_more": !data["next_page"].is_null(),
             }))
         }
         .await
@@ -220,7 +222,7 @@ impl ZendeskClient {
             let section = section_id
                 .map(|id| format!("/sections/{id}"))
                 .unwrap_or_default();
-            let path = format!("{}{section}/articles.json", help_center_path(locale));
+            let path = format!("{}{section}/articles.json", help_center_path(locale)?);
             let data = self
                 .api_get(&path, &[("page", &page), ("per_page", &per_page)])
                 .await?;
@@ -253,9 +255,9 @@ impl ZendeskClient {
 
     pub async fn get_article(&self, article_id: u64, locale: Option<&str>) -> Result<Value> {
         async {
-            let path = format!("{}/articles/{article_id}.json", help_center_path(locale));
+            let path = format!("{}/articles/{article_id}.json", help_center_path(locale)?);
             let data = self.api_get(&path, &[]).await?;
-            Ok(article_detail(data.get("article").unwrap_or(&Value::Null)))
+            Ok(article_detail(object(&data, "article")?))
         }
         .await
         .map_err(ctx(format!("Failed to get article {article_id}")))
@@ -263,7 +265,7 @@ impl ZendeskClient {
 
     pub async fn list_categories(&self, locale: Option<&str>) -> Result<Value> {
         async {
-            let path = format!("{}/categories.json", help_center_path(locale));
+            let path = format!("{}/categories.json", help_center_path(locale)?);
             let categories = self.get_paged(&path, "categories").await?;
             Ok(pick_all(
                 &json!({ "categories": categories }),
@@ -293,7 +295,7 @@ impl ZendeskClient {
             let category = category_id
                 .map(|id| format!("/categories/{id}"))
                 .unwrap_or_default();
-            let path = format!("{}{category}/sections.json", help_center_path(locale));
+            let path = format!("{}{category}/sections.json", help_center_path(locale)?);
             let sections = self.get_paged(&path, "sections").await?;
             Ok(pick_all(
                 &json!({ "sections": sections }),
@@ -398,7 +400,7 @@ impl ZendeskClient {
             {
                 let path = format!(
                     "help_center/articles/{article_id}/translations/{}.json",
-                    help_center_path(Some(locale)).trim_start_matches("help_center/")
+                    segment(locale)?
                 );
                 self.api_put(&path, &json!({ "translation": translation }))
                     .await?;
@@ -639,6 +641,8 @@ mod tests {
         };
         let out = c.search_articles(&search).await.unwrap();
         assert!(out["query"].is_null());
+        assert_eq!(out["has_more"], false);
+        assert!(out.get("next_page").is_none());
         let a = &out["articles"][0];
         assert_eq!(a["snippet"], "<em>x</em>");
         assert_eq!(a["promoted"], true);
@@ -664,5 +668,23 @@ mod tests {
         ] {
             assert!(c.search_articles(&bad).await.is_err());
         }
+    }
+
+    #[tokio::test]
+    async fn get_article_without_an_article_object_is_an_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .mount(&server)
+            .await;
+        let err = client(&server).get_article(1, None).await.unwrap_err();
+        assert!(err.to_string().contains("no 'article' object"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn locales_that_could_change_the_route_are_rejected() {
+        let c = offline_client();
+        assert!(c.get_article(1, Some("..")).await.is_err());
+        assert!(c.list_categories(Some("a/b")).await.is_err());
     }
 }

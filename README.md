@@ -450,12 +450,12 @@ Retrieve all comments for a ticket. Each comment has `author_id` and, when Zende
 
 #### create_ticket_comment
 
-Create a new comment on an existing ticket.
+Create a new comment on an existing ticket. Returns `{"message": "Comment created", "comment": {"id", "public", "status"}}`; `id` is the new comment's ID (null if Zendesk's audit did not list it) and `status` appears only when you set one.
 
 - `ticket_id` (integer)
 - `comment` (string): Markdown, plain text and HTML are accepted
 - `public` (boolean, optional): Whether the comment is public (defaults to true)
-- `status` (string, optional): Also set the ticket status in the same update: `new`, `open`, `pending`, `hold`, `solved`. The result text mentions it.
+- `status` (string, optional): Also set the ticket status in the same update: `new`, `open`, `pending`, `hold`, `solved`
 - `upload_tokens` (array of strings, optional): Tokens from `upload_attachment` to attach to the comment
 
 #### get_ticket_attachment

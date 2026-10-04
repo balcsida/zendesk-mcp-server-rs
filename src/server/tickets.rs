@@ -353,14 +353,14 @@ impl ZendeskServer {
     }
 
     #[tool(
-        description = "Create a new comment on an existing Zendesk ticket. Set status to also change the ticket status in the same call, e.g. reply and set it pending.",
+        description = "Create a new comment on an existing Zendesk ticket. Set status to also change the ticket status in the same call, e.g. reply and set it pending. Returns the new comment's id.",
         annotations(destructive_hint = false)
     )]
     async fn create_ticket_comment(
         &self,
         Parameters(p): Parameters<CreateCommentParams>,
     ) -> CallToolResult {
-        self.call(|c| async move {
+        self.call_json(|c| async move {
             let comment = c
                 .post_comment(
                     p.ticket_id,
@@ -370,13 +370,7 @@ impl ZendeskServer {
                     &p.upload_tokens.unwrap_or_default(),
                 )
                 .await?;
-            let status_note = p
-                .status
-                .map(|s| format!(" (ticket status set to {s})"))
-                .unwrap_or_default();
-            Ok(ContentBlock::text(format!(
-                "Comment created successfully{status_note}: {comment}"
-            )))
+            Ok(wrapped("Comment created", "comment", comment))
         })
         .await
     }
@@ -509,12 +503,8 @@ impl ZendeskServer {
                     p.source_comment_is_public,
                 )
                 .await?;
-            let message = match result["status"].as_str() {
-                Some("completed") => "Tickets merged successfully",
-                Some("failed") => "Merge failed",
-                _ => "Merge is still running; check it with get_job_status",
-            };
-            Ok(wrapped(message, "result", result))
+            let message = job_message(&result, "Merge", "Tickets merged successfully");
+            Ok(wrapped(&message, "result", result))
         })
         .await
     }

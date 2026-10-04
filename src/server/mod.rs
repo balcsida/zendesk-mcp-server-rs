@@ -211,6 +211,21 @@ pub(super) fn wrapped(message: &str, key: &str, value: Value) -> Value {
     json!({ "message": message, key: value })
 }
 
+/// The result message for a job summary: what `subject` is doing while pending, how it
+/// ended if it failed or some items did, and `success` otherwise.
+pub(super) fn job_message(job: &Value, subject: &str, success: &str) -> String {
+    if job["pending"] == true {
+        let id = job["id"].as_str().unwrap_or_default();
+        format!("{subject} still running; call get_job_status with id {id}")
+    } else if job["status"] == "failed" {
+        format!("{subject} failed")
+    } else if let Some(failures) = job["failed_count"].as_u64().filter(|n| *n > 0) {
+        format!("{subject} completed with {failures} failures")
+    } else {
+        success.to_string()
+    }
+}
+
 fn prompt_result(template: &str, description: &str, ticket_id: u64) -> GetPromptResult {
     let text = template
         .replace("{ticket_id}", &ticket_id.to_string())
@@ -581,6 +596,27 @@ mod tests {
         }
         assert_eq!(hints("delete_ticket").destructive_hint, Some(true));
         assert_eq!(hints("get_ticket").read_only_hint, Some(true));
+    }
+
+    #[test]
+    fn job_messages_follow_the_job_summary() {
+        let job = |v: Value| job_message(&v, "Merge", "Merged");
+        assert_eq!(
+            job(json!({"id": "j1", "pending": true, "status": "working"})),
+            "Merge still running; call get_job_status with id j1"
+        );
+        assert_eq!(
+            job(json!({"status": "failed", "pending": false})),
+            "Merge failed"
+        );
+        assert_eq!(
+            job(json!({"status": "completed", "pending": false, "failed_count": 2})),
+            "Merge completed with 2 failures"
+        );
+        assert_eq!(
+            job(json!({"status": "completed", "pending": false, "failed_count": 0})),
+            "Merged"
+        );
     }
 
     #[test]

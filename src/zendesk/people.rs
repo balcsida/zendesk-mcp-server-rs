@@ -98,8 +98,8 @@ impl ZendeskClient {
         .map_err(ctx("Failed to get current user"))
     }
 
-    /// At least one of `query` and `external_id` is required. Zendesk returns at most
-    /// 10,000 matches.
+    /// At least one of `query` and `external_id` is required. Returns the first page of up
+    /// to 100 matches; `has_more` says there are more.
     pub async fn search_users(
         &self,
         query: Option<&str>,
@@ -117,7 +117,7 @@ impl ZendeskClient {
                 bail!("Give a query or an external_id");
             }
             let data = self.api_get("users/search.json", &params).await?;
-            Ok(pick_all(
+            let users = pick_all(
                 &data,
                 "users",
                 &[
@@ -131,7 +131,12 @@ impl ZendeskClient {
                     "suspended",
                 ],
                 &[],
-            ))
+            );
+            Ok(json!({
+                "count": users.as_array().map_or(0, Vec::len),
+                "users": users,
+                "has_more": !data["next_page"].is_null(),
+            }))
         }
         .await
         .map_err(ctx("User search failed"))
@@ -148,17 +153,24 @@ impl ZendeskClient {
         .map_err(ctx(format!("Failed to get organization {organization_id}")))
     }
 
+    /// Organizations whose name starts with `query`: the first page only; `has_more`
+    /// says there are more.
     pub async fn search_organizations(&self, query: &str) -> Result<Value> {
         async {
             let data = self
                 .api_get("organizations/autocomplete.json", &[("name", &query)])
                 .await?;
-            Ok(pick_all(
+            let organizations = pick_all(
                 &data,
                 "organizations",
                 &["id", "name", "domain_names"],
                 &["domain_names"],
-            ))
+            );
+            Ok(json!({
+                "count": organizations.as_array().map_or(0, Vec::len),
+                "organizations": organizations,
+                "has_more": !data["next_page"].is_null(),
+            }))
         }
         .await
         .map_err(ctx("Organization search failed"))
@@ -166,9 +178,9 @@ impl ZendeskClient {
 
     pub async fn list_groups(&self) -> Result<Value> {
         async {
-            let data = self.api_get("groups/assignable.json", &[]).await?;
+            let groups = self.get_paged("groups/assignable.json", "groups").await?;
             Ok(pick_all(
-                &data,
+                &json!({ "groups": groups }),
                 "groups",
                 &["id", "name", "description"],
                 &[],
@@ -472,16 +484,59 @@ mod tests {
             .and(query_param("external_id", "crm-7"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({"users": [
                 {"id": 1, "external_id": "crm-7", "suspended": false, "extra": 1}
-            ]})))
+            ], "next_page": "https://x/next"})))
             .mount(&server)
             .await;
         let c = client(&server);
         let out = c.search_users(None, Some("crm-7")).await.unwrap();
-        assert_eq!(out[0]["external_id"], "crm-7");
-        assert_eq!(out[0]["suspended"], false);
-        assert!(out[0].get("extra").is_none());
+        assert_eq!(out["count"], 1);
+        assert_eq!(out["has_more"], true);
+        assert_eq!(out["users"][0]["external_id"], "crm-7");
+        assert_eq!(out["users"][0]["suspended"], false);
+        assert!(out["users"][0].get("extra").is_none());
         let err = c.search_users(None, None).await.unwrap_err();
         assert!(err.to_string().contains("query or an external_id"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn search_organizations_reports_count_and_has_more() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/organizations/autocomplete.json"))
+            .and(query_param("name", "ac"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "organizations": [{"id": 1, "name": "Acme", "extra": 1}],
+                "next_page": null,
+            })))
+            .mount(&server)
+            .await;
+        let out = client(&server).search_organizations("ac").await.unwrap();
+        assert_eq!(
+            out,
+            json!({"count": 1, "has_more": false,
+                   "organizations": [{"id": 1, "name": "Acme", "domain_names": []}]})
+        );
+    }
+
+    #[tokio::test]
+    async fn list_groups_collects_every_page() {
+        let server = MockServer::start().await;
+        let next = format!("{}/api/v2/groups/assignable.json?page=2", server.uri());
+        Mock::given(method("GET"))
+            .and(query_param("page", "2"))
+            .respond_with(json_page("groups", json!([{"id": 2, "name": "B"}]), None))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(json_page(
+                "groups",
+                json!([{"id": 1, "name": "A"}]),
+                Some(next),
+            ))
+            .mount(&server)
+            .await;
+        let out = client(&server).list_groups().await.unwrap();
+        assert_eq!(out.as_array().unwrap().len(), 2);
     }
 
     #[tokio::test]

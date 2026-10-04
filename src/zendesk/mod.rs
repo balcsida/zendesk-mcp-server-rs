@@ -5,7 +5,7 @@
 
 use std::collections::HashSet;
 use std::fmt::Display;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
 use base64::Engine;
@@ -20,7 +20,7 @@ pub const MAX_ATTACHMENT_BYTES: usize = 10 * 1024 * 1024;
 /// Image types a tool may return. SVG is excluded: it can contain active content.
 pub const ALLOWED_IMAGE_TYPES: [&str; 4] = ["image/jpeg", "image/png", "image/gif", "image/webp"];
 
-/// Retries of an idempotent request answered 429 or 503.
+/// Retries of a request answered 429, or 503 when it is a GET or DELETE.
 const MAX_RETRIES: u32 = 3;
 /// Longest `Retry-After` honoured, in seconds.
 const MAX_RETRY_AFTER_SECS: u64 = 30;
@@ -33,8 +33,21 @@ const MAX_DAYS_BACK: u64 = 36_500;
 ///
 /// CommonMark plus tables and strikethrough; a single newline becomes `<br>` so plain
 /// text keeps its line breaks; raw HTML in the input is passed through for Zendesk to
-/// sanitize server-side.
+/// sanitize server-side, and input that is entirely HTML is returned unchanged.
 pub fn markdown_to_html(text: &str) -> String {
+    // ponytail: text that starts with a tag and ends with `>` is taken to be HTML already
+    // (e.g. a `get_article` body written back); Markdown that happens to look like that is
+    // left unconverted. Upgrade to a real HTML check if that bites.
+    let trimmed = text.trim();
+    let mut chars = trimmed.chars();
+    if chars.next() == Some('<')
+        && chars
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '!')
+        && trimmed.ends_with('>')
+    {
+        return text.to_string();
+    }
     let options = Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH;
     let events = Parser::new_ext(text, options).map(|event| match event {
         Event::SoftBreak => Event::HardBreak,
@@ -226,6 +239,7 @@ pub(super) fn job_summary(job: &Value) -> Value {
             item
         })
         .collect();
+    out["failed_count"] = json!(results.iter().filter(|r| r["success"] == false).count());
     out["results"] = Value::Array(results);
     out
 }
@@ -272,17 +286,29 @@ pub(super) fn status_error(status: reqwest::StatusCode, label: &str, body: &[u8]
     anyhow!("Zendesk API error HTTP {status} for {label}: {text}")
 }
 
+/// A path segment that came from the model or from Zendesk: percent-encode everything but
+/// unreserved characters so it cannot change the route, and refuse `.` and `..`.
+pub(super) fn segment(value: &str) -> Result<String> {
+    if matches!(value, "" | "." | "..") {
+        bail!("'{value}' is not a valid path segment");
+    }
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || b"-._~".contains(&byte) {
+            out.push(char::from(byte));
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    Ok(out)
+}
+
 /// `help_center`, or `help_center/{locale}` when a locale is given: Zendesk takes the
 /// locale as a path segment, not a query parameter.
-pub(super) fn help_center_path(locale: Option<&str>) -> String {
+pub(super) fn help_center_path(locale: Option<&str>) -> Result<String> {
     match locale.filter(|l| !l.is_empty()) {
-        Some(locale) => {
-            let locale: String = url::form_urlencoded::byte_serialize(locale.as_bytes())
-                .collect::<String>()
-                .replace('+', "%20");
-            format!("help_center/{locale}")
-        }
-        None => "help_center".into(),
+        Some(locale) => Ok(format!("help_center/{}", segment(locale)?)),
+        None => Ok("help_center".into()),
     }
 }
 
@@ -360,9 +386,16 @@ impl ZendeskClient {
             resp = fresh.apply(make()).send().await?;
         }
 
-        let idempotent = request.method() != reqwest::Method::POST;
+        // A 503 may come after Zendesk processed a write, so only reads and deletes are
+        // retried on it; a 429 was rejected before processing, so it is retried for all.
+        let retry_503 = matches!(
+            *request.method(),
+            reqwest::Method::GET | reqwest::Method::DELETE
+        );
         let mut attempt = 0;
-        while idempotent && attempt < MAX_RETRIES && matches!(resp.status().as_u16(), 429 | 503) {
+        while attempt < MAX_RETRIES
+            && (resp.status().as_u16() == 429 || (retry_503 && resp.status().as_u16() == 503))
+        {
             let delay = resp
                 .headers()
                 .get(reqwest::header::RETRY_AFTER)
@@ -550,8 +583,11 @@ impl ZendeskClient {
         max_items: usize,
     ) -> Result<Vec<Value>> {
         let mut items = Vec::new();
-        let mut seen = HashSet::new();
-        let mut data = self.get_cursor_page(path, params, 100, None).await?;
+        let mut first_params = params.to_vec();
+        first_params.push(("page[size]", &100u64));
+        let first = self.url(path, &first_params)?;
+        let mut seen = HashSet::from([first.to_string()]);
+        let mut data = self.get_url(first).await?;
         loop {
             if let Some(page) = data.get(key).and_then(Value::as_array) {
                 items.extend(page.iter().cloned());
@@ -577,7 +613,7 @@ impl ZendeskClient {
     pub async fn get_job_status(&self, job_id: &str) -> Result<Value> {
         async {
             let data = self
-                .api_get(&format!("job_statuses/{job_id}.json"), &[])
+                .api_get(&format!("job_statuses/{}.json", segment(job_id)?), &[])
                 .await?;
             Ok(job_summary(object(&data, "job_status")?))
         }
@@ -586,19 +622,31 @@ impl ZendeskClient {
     }
 
     /// Poll the job in a Zendesk response (`{"job_status": {...}}`) every
-    /// `job_poll_interval` until it is `completed` or `failed`, or `timeout` elapses.
-    /// Returns the trimmed job status; `pending` is true if it is still running.
+    /// `job_poll_interval` until it is `completed` or `failed`, or `timeout` elapses
+    /// (retry waits inside a poll count against it). Returns the trimmed job status;
+    /// `pending` is true if it is still running. A failed poll does not lose the accepted
+    /// job: the last known status comes back with `pending: true` and a `poll_error`.
     pub(super) async fn wait_for_job(&self, job: &Value, timeout: Duration) -> Result<Value> {
         let mut status = job_summary(object(job, "job_status")?);
         let id = status["id"]
             .as_str()
             .ok_or_else(|| anyhow!("Zendesk job status has no id"))?
             .to_string();
-        let deadline = Instant::now() + timeout;
-        while status["pending"] == true && Instant::now() < deadline {
-            tokio::time::sleep(self.job_poll_interval).await;
-            status = self.get_job_status(&id).await?;
-        }
+        let poll = async {
+            while status["pending"] == true {
+                tokio::time::sleep(self.job_poll_interval).await;
+                match self.get_job_status(&id).await {
+                    Ok(latest) => status = latest,
+                    Err(e) => {
+                        status["pending"] = json!(true);
+                        status["poll_error"] = json!(format!("{e:#}"));
+                        break;
+                    }
+                }
+            }
+        };
+        // Err means the deadline passed mid-poll; `status` is still the last known one.
+        let _ = tokio::time::timeout(timeout, poll).await;
         Ok(status)
     }
 }
@@ -703,18 +751,54 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn post_429_is_not_retried() {
+    async fn post_and_put_429_are_retried() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "0"))
             .mount(&server)
             .await;
-        let err = client(&server)
-            .api_post("tickets.json", &json!({}))
-            .await
-            .unwrap_err();
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "0"))
+            .mount(&server)
+            .await;
+        let c = client(&server);
+        let err = c.api_post("tickets.json", &json!({})).await.unwrap_err();
         assert!(err.to_string().contains("429"), "{err}");
-        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            1 + MAX_RETRIES as usize
+        );
+        assert!(c.api_put("tickets/1.json", &json!({})).await.is_err());
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            2 * (1 + MAX_RETRIES as usize)
+        );
+    }
+
+    #[tokio::test]
+    async fn get_retries_503_but_put_does_not() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/users/me.json"))
+            .respond_with(ResponseTemplate::new(503).insert_header("retry-after", "0"))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/users/me.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"user": {"id": 1}})))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(503).insert_header("retry-after", "0"))
+            .mount(&server)
+            .await;
+        let c = client(&server);
+        assert_eq!(c.get_current_user().await.unwrap()["id"], 1);
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+        let err = c.api_put("tickets/1.json", &json!({})).await.unwrap_err();
+        assert!(err.to_string().contains("503"), "{err}");
+        assert_eq!(server.received_requests().await.unwrap().len(), 3);
     }
 
     #[tokio::test]
@@ -818,6 +902,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cursor_next_pointing_back_at_the_first_page_is_rejected() {
+        let server = MockServer::start().await;
+        let first = format!("{}/api/v2/things.json?page%5Bsize%5D=100", server.uri());
+        Mock::given(method("GET"))
+            .respond_with(cursor_page(json!([{"id": 1}]), Some(first)))
+            .mount(&server)
+            .await;
+        let err = client(&server)
+            .get_cursor_paged("things.json", &[], "things", 1000)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("already returned"), "{err}");
+    }
+
+    #[tokio::test]
     async fn cursor_next_on_another_host_is_rejected() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -903,6 +1002,82 @@ mod tests {
             .unwrap();
         assert_eq!(out["status"], "working");
         assert_eq!(out["pending"], true);
+    }
+
+    #[tokio::test]
+    async fn wait_for_job_poll_error_keeps_the_accepted_job_pending() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "0"))
+            .mount(&server)
+            .await;
+        let first = json!({"job_status": {"id": "j1", "status": "queued", "total": 2}});
+        let out = client(&server)
+            .wait_for_job(&first, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(out["status"], "queued");
+        assert_eq!(out["total"], 2);
+        assert_eq!(out["pending"], true);
+        assert!(out["poll_error"].as_str().unwrap().contains("429"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn wait_for_job_is_bounded_by_retry_after_waits() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "30"))
+            .mount(&server)
+            .await;
+        let first = json!({"job_status": {"id": "j1", "status": "queued"}});
+        let started = std::time::Instant::now();
+        let out = client(&server)
+            .wait_for_job(&first, Duration::from_millis(100))
+            .await
+            .unwrap();
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(out["pending"], true);
+        assert_eq!(out["status"], "queued");
+    }
+
+    #[test]
+    fn job_summary_counts_failed_results() {
+        let out = job_summary(&json!({"id": "j", "status": "completed", "results": [
+            {"id": 1, "success": true}, {"id": 2, "success": false}, {"id": 3, "success": false}
+        ]}));
+        assert_eq!(out["failed_count"], 2);
+        assert_eq!(job_summary(&json!({"id": "j"}))["failed_count"], 0);
+    }
+
+    #[tokio::test]
+    async fn job_ids_that_could_change_the_route_are_rejected() {
+        let c = offline_client();
+        assert!(c.get_job_status("..").await.is_err());
+        assert!(c.get_job_status("").await.is_err());
+    }
+
+    #[test]
+    fn segment_encodes_everything_but_unreserved_characters() {
+        assert_eq!(segment("a-b_c.d~e1").unwrap(), "a-b_c.d~e1");
+        assert_eq!(segment("a/b").unwrap(), "a%2Fb");
+        assert_eq!(segment("a b?é").unwrap(), "a%20b%3F%C3%A9");
+        for bad in ["", ".", ".."] {
+            assert!(segment(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn markdown_html_documents_round_trip_unchanged() {
+        let html = "<div>\n    <p>One</p>\n\n    <ul>\n      <li>a</li>\n    </ul>\n</div>\n";
+        assert_eq!(markdown_to_html(html), html);
+        let doc = "<!-- note -->\n<p>x</p>";
+        assert_eq!(markdown_to_html(doc), doc);
+    }
+
+    #[test]
+    fn markdown_that_only_looks_like_a_tag_is_still_converted() {
+        assert_eq!(markdown_to_html("<3 you"), "<p>&lt;3 you</p>\n");
+        assert!(markdown_to_html("<b>x</b> and **y**").contains("<strong>y</strong>"));
     }
 
     #[test]

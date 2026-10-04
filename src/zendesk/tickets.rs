@@ -225,6 +225,8 @@ impl ZendeskClient {
     }
 
     /// `status`, when given, is set in the same update: new, open, pending, hold or solved.
+    /// Returns `{id, public, status?}`; `id` is the new comment's, null if Zendesk's
+    /// audit did not list it.
     pub async fn post_comment(
         &self,
         ticket_id: u64,
@@ -232,7 +234,7 @@ impl ZendeskClient {
         public: bool,
         status: Option<&str>,
         upload_tokens: &[String],
-    ) -> Result<String> {
+    ) -> Result<Value> {
         async {
             if let Some(status) = status
                 && !["new", "open", "pending", "hold", "solved"].contains(&status)
@@ -251,9 +253,20 @@ impl ZendeskClient {
             if !upload_tokens.is_empty() {
                 body["ticket"]["comment"]["uploads"] = json!(upload_tokens);
             }
-            self.api_put(&format!("tickets/{ticket_id}.json"), &body)
+            let data = self
+                .api_put(&format!("tickets/{ticket_id}.json"), &body)
                 .await?;
-            Ok(comment.to_string())
+            let id = data["audit"]["events"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|e| e["type"] == "Comment")
+                .map_or(Value::Null, |e| e["id"].clone());
+            let mut out = json!({ "id": id, "public": public });
+            if let Some(status) = status {
+                out["status"] = json!(status);
+            }
+            Ok(out)
         }
         .await
         .map_err(ctx(format!("Failed to post comment on ticket {ticket_id}")))
@@ -415,6 +428,16 @@ impl ZendeskClient {
         async {
             let fields: Map<String, Value> =
                 fields.into_iter().filter(|(_, v)| !v.is_null()).collect();
+            if fields.is_empty() {
+                bail!("Give at least one field to update");
+            }
+            if let Some(ccs) = fields.get("email_ccs").and_then(Value::as_array)
+                && ccs
+                    .iter()
+                    .any(|cc| cc.get("user_id").is_none() && cc.get("user_email").is_none())
+            {
+                bail!("Each email_ccs entry needs a user_id or a user_email");
+            }
             if fields.get("safe_update") == Some(&json!(true))
                 && !fields.get("updated_stamp").is_some_and(Value::is_string)
             {
@@ -563,6 +586,15 @@ impl ZendeskClient {
         source_comment_is_public: Option<bool>,
     ) -> Result<Value> {
         async {
+            if source_ids.is_empty() {
+                bail!("Give at least one source ticket to merge");
+            }
+            if source_ids.contains(&target_id) {
+                bail!("A source ticket cannot be the target ticket");
+            }
+            if source_ids.iter().collect::<HashSet<_>>().len() != source_ids.len() {
+                bail!("source_ids must not contain duplicates");
+            }
             let mut body = json!({
                 "ids": source_ids,
                 "target_comment": target_comment,
@@ -604,13 +636,15 @@ impl ZendeskClient {
                     &[("page", &page), ("per_page", &per_page)],
                 )
                 .await?;
+            let tickets = pick_all(
+                &data,
+                "tickets",
+                &["id", "subject", "status", "priority", "created_at", "updated_at"],
+                &[],
+            );
             Ok(json!({
-                "tickets": pick_all(
-                    &data,
-                    "tickets",
-                    &["id", "subject", "status", "priority", "created_at", "updated_at"],
-                    &[],
-                ),
+                "count": tickets.as_array().map_or(0, Vec::len),
+                "tickets": tickets,
                 "has_more": !data["next_page"].is_null(),
             }))
         }
@@ -737,12 +771,23 @@ impl ZendeskClient {
             let followers = self
                 .api_get(&format!("tickets/{ticket_id}/followers.json"), &[])
                 .await?;
-            let email_ccs = self
+            // Without the CCs feature the email_ccs endpoint fails; Zendesk then keeps the
+            // CCs under the older collaborators endpoint.
+            let (email_ccs, source) = match self
                 .api_get(&format!("tickets/{ticket_id}/email_ccs.json"), &[])
-                .await?;
+                .await
+            {
+                Ok(data) => (data, "email_ccs"),
+                Err(_) => (
+                    self.api_get(&format!("tickets/{ticket_id}/collaborators.json"), &[])
+                        .await?,
+                    "collaborators",
+                ),
+            };
             Ok(json!({
                 "followers": pick_all(&followers, "users", &keys, &[]),
                 "email_ccs": pick_all(&email_ccs, "users", &keys, &[]),
+                "source": source,
             }))
         }
         .await
@@ -826,7 +871,14 @@ impl ZendeskClient {
             if !remove.is_empty() {
                 data = self
                     .api_delete_json(&path, &[("tags", &remove.join(","))])
-                    .await?;
+                    .await
+                    .map_err(|e| {
+                        if add.is_empty() {
+                            e
+                        } else {
+                            anyhow!("tags added but removing failed: {e:#}")
+                        }
+                    })?;
             }
             Ok(json!({ "tags": data.get("tags").cloned().unwrap_or(json!([])) }))
         }
@@ -894,8 +946,32 @@ mod tests {
             json!({
                 "followers": [{"id": 1, "name": "A", "email": "a@x.com", "role": "agent"}],
                 "email_ccs": [{"id": 2, "name": "B", "email": null, "role": null}],
+                "source": "email_ccs",
             })
         );
+    }
+
+    #[tokio::test]
+    async fn collaborators_fall_back_to_the_collaborators_endpoint() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/tickets/4/followers.json"))
+            .respond_with(json_page("users", json!([]), None))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/tickets/4/email_ccs.json"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/tickets/4/collaborators.json"))
+            .respond_with(json_page("users", json!([{"id": 7, "name": "C"}]), None))
+            .mount(&server)
+            .await;
+        let out = client(&server).get_ticket_collaborators(4).await.unwrap();
+        assert_eq!(out["source"], "collaborators");
+        assert_eq!(out["email_ccs"][0]["id"], 7);
     }
 
     #[tokio::test]
@@ -1237,14 +1313,19 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("PUT"))
             .and(path("/api/v2/tickets/3.json"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"audit": {"events": [
+                    {"id": 76, "type": "Change"},
+                    {"id": 77, "type": "Comment"},
+                ]}})),
+            )
             .mount(&server)
             .await;
         let out = client(&server)
             .post_comment(3, "a\nb", false, Some("pending"), &["tok".into()])
             .await
             .unwrap();
-        assert_eq!(out, "a\nb");
+        assert_eq!(out, json!({"id": 77, "public": false, "status": "pending"}));
         let requests = server.received_requests().await.unwrap();
         let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
         let comment = &body["ticket"]["comment"];
@@ -1393,6 +1474,76 @@ mod tests {
         assert!(err.to_string().contains("requires updated_stamp"), "{err}");
     }
 
+    #[tokio::test]
+    async fn update_ticket_rejects_empty_updates_and_cc_entries_without_a_user() {
+        let c = offline_client();
+        let err = c.update_ticket(4, Map::new()).await.unwrap_err();
+        assert!(err.to_string().contains("at least one field"), "{err}");
+        let err = c
+            .update_ticket(
+                4,
+                json!({"email_ccs": [{"action": "put"}]})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("user_id or a user_email"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn post_comment_without_an_audit_comment_has_a_null_id() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let out = client(&server)
+            .post_comment(3, "x", true, None, &[])
+            .await
+            .unwrap();
+        assert_eq!(out, json!({"id": null, "public": true}));
+    }
+
+    #[tokio::test]
+    async fn merge_rejects_empty_self_and_duplicate_sources() {
+        let c = offline_client();
+        for sources in [&[][..], &[9][..], &[1, 2, 1][..]] {
+            assert!(
+                c.merge_tickets(9, sources, "t", "s", None, None)
+                    .await
+                    .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn tag_removal_failure_after_a_successful_add_says_so() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"tags": ["a"]})))
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .respond_with(ResponseTemplate::new(422))
+            .mount(&server)
+            .await;
+        let c = client(&server);
+        let err = c
+            .update_ticket_tags(3, &["a".into()], &["b".into()])
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("tags added but removing failed"), "{err}");
+        let err = c
+            .update_ticket_tags(3, &[], &["b".into()])
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(!err.contains("tags added"), "{err}");
+    }
+
     #[test]
     fn attachment_url_rejects_http() {
         let err = offline_client()
@@ -1535,6 +1686,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out["tickets"][0]["id"], 1);
+        assert_eq!(out["count"], 1);
     }
 
     #[tokio::test]

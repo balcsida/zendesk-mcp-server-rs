@@ -145,7 +145,7 @@ impl ZendeskServer {
     }
 
     #[tool(
-        description = "Search Zendesk users by name, email or other properties (query) or by exact external_id; give at least one. Zendesk returns at most 10,000 matches.",
+        description = "Search Zendesk users by name, email or other properties (query) or by exact external_id; give at least one. Returns the first page of up to 100 matches with has_more; narrow the query for more.",
         annotations(read_only_hint = true)
     )]
     async fn search_users(&self, Parameters(p): Parameters<SearchUsersParams>) -> CallToolResult {
@@ -169,7 +169,7 @@ impl ZendeskServer {
     }
 
     #[tool(
-        description = "Search Zendesk organizations by name",
+        description = "Search Zendesk organizations whose name starts with the query. Returns the first page of matches with has_more; narrow the query for more.",
         annotations(read_only_hint = true)
     )]
     async fn search_organizations(

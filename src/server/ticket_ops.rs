@@ -213,12 +213,8 @@ impl ZendeskServer {
                     .map(|f| Value::Array(f.into_iter().map(Value::Object).collect())),
             );
             let job = c.update_tickets_bulk(&p.ticket_ids, fields).await?;
-            let message = match job["status"].as_str() {
-                Some("completed") => "Tickets updated",
-                Some("failed") => "Bulk update failed",
-                _ => "Bulk update is still running; check it with get_job_status",
-            };
-            Ok(wrapped(message, "job", job))
+            let message = job_message(&job, "Bulk update", "Tickets updated");
+            Ok(wrapped(&message, "job", job))
         })
         .await
     }

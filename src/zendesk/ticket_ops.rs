@@ -137,8 +137,8 @@ impl ZendeskClient {
         text: &str,
     ) -> Result<Value> {
         async {
-            if text.is_empty() {
-                bail!("text to redact must not be empty");
+            if text.trim().is_empty() {
+                bail!("text to redact must not be blank");
             }
             let data = self
                 .api_put(
@@ -368,6 +368,7 @@ mod tests {
         let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
         assert_eq!(body, json!({"text": "1234"}));
         assert!(c.redact_comment_text(5, 6, "").await.is_err());
+        assert!(c.redact_comment_text(5, 6, " \n").await.is_err());
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 

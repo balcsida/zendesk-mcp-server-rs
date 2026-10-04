@@ -29,12 +29,60 @@ const MACRO_DETAIL_KEYS: [&str; 9] = [
     "updated_at",
 ];
 
+/// The `{id, value}` custom fields of the macro preview whose value differs from the
+/// current ticket's. The preview carries them as `custom_fields` or `fields`; the spec
+/// shows `fields` as a single object in its example.
+fn changed_custom_fields(current: &Value, after: &Value) -> Vec<Value> {
+    let previewed = match (&after["custom_fields"], &after["fields"]) {
+        (Value::Array(fields), _) | (_, Value::Array(fields)) => fields.clone(),
+        (_, field @ Value::Object(_)) => vec![field.clone()],
+        _ => Vec::new(),
+    };
+    let current_fields = current["custom_fields"].as_array();
+    previewed
+        .iter()
+        .filter(|f| f["id"].is_u64())
+        .filter(|f| {
+            let existing = current_fields
+                .into_iter()
+                .flatten()
+                .find(|c| c["id"] == f["id"]);
+            existing.is_none_or(|c| c["value"] != f["value"])
+        })
+        .map(|f| pick(f, &["id", "value"], &[]))
+        .collect()
+}
+
+/// The comment a macro adds, as a ticket-update comment: `body`/`html_body`, or the
+/// `channel:all` entry of `scoped_body`. Private unless the macro says public; `scoped_body`
+/// itself is never sent.
+fn macro_comment(comment: &Value) -> Option<Value> {
+    let mut out = Map::new();
+    for key in ["body", "html_body"] {
+        if let Some(v) = comment.get(key).filter(|v| v.is_string()) {
+            out.insert(key.into(), v.clone());
+        }
+    }
+    if out.is_empty() {
+        let all = comment["scoped_body"]
+            .as_array()?
+            .iter()
+            .find(|e| e[0] == "channel:all" && e[1].is_string())?;
+        out.insert("body".into(), all[1].clone());
+    }
+    out.insert(
+        "public".into(),
+        json!(comment["public"].as_bool().unwrap_or(false)),
+    );
+    Some(Value::Object(out))
+}
+
 impl ZendeskClient {
     pub async fn list_views(&self) -> Result<Value> {
         async {
-            let data = self.api_get("views.json", &[]).await?;
+            let views = self.get_paged("views.json", "views").await?;
             Ok(pick_all(
-                &data,
+                &json!({ "views": views }),
                 "views",
                 &["id", "title", "active", "position"],
                 &[],
@@ -154,7 +202,7 @@ impl ZendeskClient {
             let result = &data["result"];
             Ok(json!({
                 "ticket_changes": result.get("ticket").cloned().unwrap_or(json!({})),
-                "comment": result["comment"],
+                "comment": result["ticket"]["comment"],
             }))
         }
         .await
@@ -226,17 +274,27 @@ impl ZendeskClient {
         .map_err(ctx("Failed to search macros"))
     }
 
-    /// Applies a macro for real: previews it, then saves the previewed changes with a
-    /// ticket update that records the macro in the audit.
+    /// Applies a macro for real. The preview endpoint returns the whole ticket as it would
+    /// be after the macro, so only the fields that differ from the current ticket are
+    /// written back, plus the macro's comment, in a `safe_update` that Zendesk rejects
+    /// with a 409 if the ticket changed since it was read. `macro_ids` records the macro
+    /// in the audit.
     pub async fn execute_macro(&self, ticket_id: u64, macro_id: u64) -> Result<Value> {
         async {
+            let path = format!("tickets/{ticket_id}.json");
+            let current = self.api_get(&path, &[]).await?;
+            let current = object(&current, "ticket")?;
+            let updated_at = current["updated_at"]
+                .as_str()
+                .ok_or_else(|| anyhow!("Zendesk ticket has no updated_at"))?;
             let preview = self
                 .api_get(
                     &format!("tickets/{ticket_id}/macros/{macro_id}/apply.json"),
                     &[],
                 )
                 .await?;
-            let changes = &preview["result"]["ticket"];
+            let after = &preview["result"]["ticket"];
+
             let mut ticket = Map::new();
             for key in [
                 "status",
@@ -247,42 +305,28 @@ impl ZendeskClient {
                 "group_id",
                 "tags",
                 "custom_status_id",
+                "ticket_form_id",
+                "brand_id",
+                "due_at",
+                "requester_id",
             ] {
-                if let Some(v) = changes.get(key).filter(|v| !v.is_null()) {
+                if let Some(v) = after.get(key).filter(|v| !v.is_null())
+                    && current.get(key) != Some(v)
+                {
                     ticket.insert(key.into(), v.clone());
                 }
             }
-            if let Some(comment) = changes.get("comment").filter(|c| c.is_object()) {
-                let mut out = Map::new();
-                for key in ["body", "html_body", "public"] {
-                    if let Some(v) = comment.get(key).filter(|v| !v.is_null()) {
-                        out.insert(key.into(), v.clone());
-                    }
-                }
-                ticket.insert("comment".into(), Value::Object(out));
+            let changed_fields = changed_custom_fields(current, after);
+            if !changed_fields.is_empty() {
+                ticket.insert("custom_fields".into(), Value::Array(changed_fields));
             }
-            // `fields` is documented as an array but the spec example shows one object.
-            let fields = changes
-                .get("custom_fields")
-                .filter(|f| f.is_array())
-                .or_else(|| changes.get("fields").filter(|f| f.is_array()))
-                .cloned()
-                .or_else(|| {
-                    changes
-                        .get("fields")
-                        .filter(|f| f.is_object())
-                        .map(|f| json!([f]))
-                });
-            if let Some(fields) = fields {
-                ticket.insert("custom_fields".into(), fields);
+            if let Some(comment) = macro_comment(&after["comment"]) {
+                ticket.insert("comment".into(), comment);
             }
             ticket.insert("macro_ids".into(), json!([macro_id]));
-            let data = self
-                .api_put(
-                    &format!("tickets/{ticket_id}.json"),
-                    &json!({ "ticket": ticket }),
-                )
-                .await?;
+            ticket.insert("safe_update".into(), json!(true));
+            ticket.insert("updated_stamp".into(), json!(updated_at));
+            let data = self.api_put(&path, &json!({ "ticket": ticket })).await?;
             full_ticket(&data)
         }
         .await
@@ -576,21 +620,29 @@ mod tests {
         assert!(found[0].get("extra").is_none());
     }
 
-    #[tokio::test]
-    async fn execute_macro_saves_previewed_changes_and_records_the_macro() {
-        let server = MockServer::start().await;
+    fn current_ticket() -> Value {
+        json!({"ticket": {
+            "id": 7, "subject": "Help", "status": "open", "priority": "high", "type": "question",
+            "assignee_id": 3, "requester_id": 4, "group_id": 5, "brand_id": 6,
+            "ticket_form_id": 8, "custom_status_id": 9, "due_at": null,
+            "tags": ["vip", "billing"], "updated_at": "2026-01-02T03:04:05Z",
+            "custom_fields": [{"id": 1, "value": "keep"}, {"id": 2, "value": "old"}],
+            "url": "https://x/7.json"
+        }})
+    }
+
+    async fn mount_macro_ticket(server: &MockServer, preview: Value) {
+        Mock::given(method("GET"))
+            .and(path("/api/v2/tickets/7.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(current_ticket()))
+            .expect(1)
+            .mount(server)
+            .await;
         Mock::given(method("GET"))
             .and(path("/api/v2/tickets/7/macros/25/apply.json"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(json!({"result": {"ticket": {
-                    "status": "solved", "assignee_id": 3, "priority": null, "url": "ignored",
-                    "comment": {"body": "Done", "public": false,
-                                "scoped_body": [["channel:all", "Done"]]},
-                    "fields": [{"id": 9, "value": "x"}]
-                }}})),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(preview))
             .expect(1)
-            .mount(&server)
+            .mount(server)
             .await;
         Mock::given(method("PUT"))
             .and(path("/api/v2/tickets/7.json"))
@@ -598,25 +650,115 @@ mod tests {
                 "id": 7, "status": "solved"
             }})))
             .expect(1)
-            .mount(&server)
+            .mount(server)
             .await;
-        let out = client(&server).execute_macro(7, 25).await.unwrap();
-        assert_eq!(out["status"], "solved");
+    }
+
+    async fn put_body(server: &MockServer) -> Value {
         let requests = server.received_requests().await.unwrap();
         let put = requests
             .iter()
             .find(|r| r.method.as_str() == "PUT")
             .unwrap();
-        let body: Value = serde_json::from_slice(&put.body).unwrap();
+        serde_json::from_slice(&put.body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn execute_macro_sends_only_what_the_preview_changes() {
+        let server = MockServer::start().await;
+        let mut after = current_ticket()["ticket"].clone();
+        after["status"] = json!("solved");
+        after["assignee_id"] = json!(11);
+        after["custom_fields"] = json!([{"id": 1, "value": "keep"}, {"id": 2, "value": "new"}]);
+        after["comment"] = json!({"body": "Done", "html_body": "<p>Done</p>",
+            "scoped_body": [["channel:all", "Done"]]});
+        mount_macro_ticket(&server, json!({"result": {"ticket": after}})).await;
+        let out = client(&server).execute_macro(7, 25).await.unwrap();
+        assert_eq!(out["status"], "solved");
         assert_eq!(
-            body,
+            put_body(&server).await,
             json!({"ticket": {
-                "status": "solved", "assignee_id": 3,
-                "comment": {"body": "Done", "public": false},
-                "custom_fields": [{"id": 9, "value": "x"}],
-                "macro_ids": [25]
+                "status": "solved", "assignee_id": 11,
+                "custom_fields": [{"id": 2, "value": "new"}],
+                "comment": {"body": "Done", "html_body": "<p>Done</p>", "public": false},
+                "macro_ids": [25],
+                "safe_update": true, "updated_stamp": "2026-01-02T03:04:05Z"
             }})
         );
+    }
+
+    #[tokio::test]
+    async fn execute_macro_sends_tags_only_when_they_changed_and_the_all_channel_comment() {
+        let server = MockServer::start().await;
+        let after = json!({
+            "tags": ["vip", "billing", "closed"],
+            "fields": {"id": 2, "value": "old"},
+            "comment": {"public": true, "scoped_body": [["channel:email", "Mail"], ["channel:all", "Hi"]]},
+        });
+        mount_macro_ticket(&server, json!({"result": {"ticket": after}})).await;
+        client(&server).execute_macro(7, 25).await.unwrap();
+        assert_eq!(
+            put_body(&server).await,
+            json!({"ticket": {
+                "tags": ["vip", "billing", "closed"],
+                "comment": {"body": "Hi", "public": true},
+                "macro_ids": [25],
+                "safe_update": true, "updated_stamp": "2026-01-02T03:04:05Z"
+            }})
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_macro_without_changes_still_records_the_macro() {
+        let server = MockServer::start().await;
+        let after = current_ticket()["ticket"].clone();
+        mount_macro_ticket(&server, json!({"result": {"ticket": after}})).await;
+        client(&server).execute_macro(7, 25).await.unwrap();
+        assert_eq!(
+            put_body(&server).await,
+            json!({"ticket": {
+                "macro_ids": [25],
+                "safe_update": true, "updated_stamp": "2026-01-02T03:04:05Z"
+            }})
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_macro_reads_the_comment_from_the_previewed_ticket() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/tickets/7/macros/25/apply.json"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"result": {"ticket": {
+                    "status": "solved", "comment": {"body": "Done", "public": false}
+                }}})),
+            )
+            .mount(&server)
+            .await;
+        let out = client(&server).apply_macro(7, 25).await.unwrap();
+        assert_eq!(out["ticket_changes"]["status"], "solved");
+        assert_eq!(out["comment"]["body"], "Done");
+    }
+
+    #[tokio::test]
+    async fn list_views_collects_every_page() {
+        let server = MockServer::start().await;
+        let next = format!("{}/api/v2/views.json?page=2", server.uri());
+        Mock::given(method("GET"))
+            .and(query_param("page", "2"))
+            .respond_with(json_page("views", json!([{"id": 2, "title": "B"}]), None))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(json_page(
+                "views",
+                json!([{"id": 1, "title": "A"}]),
+                Some(next),
+            ))
+            .mount(&server)
+            .await;
+        let out = client(&server).list_views().await.unwrap();
+        assert_eq!(out.as_array().unwrap().len(), 2);
     }
 
     #[tokio::test]

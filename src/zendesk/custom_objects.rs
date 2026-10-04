@@ -21,13 +21,6 @@ const RECORD_KEYS: [&str; 6] = [
     "updated_at",
 ];
 
-/// Path segments come from the model: encode them so a key cannot change the route.
-fn segment(value: &str) -> String {
-    url::form_urlencoded::byte_serialize(value.as_bytes())
-        .collect::<String>()
-        .replace('+', "%20")
-}
-
 fn field_detail(field: &Value) -> Value {
     let mut out = pick(
         field,
@@ -65,7 +58,7 @@ impl ZendeskClient {
 
     pub async fn get_custom_object(&self, key: &str) -> Result<Value> {
         async {
-            let key = segment(key);
+            let key = segment(key)?;
             let data = self
                 .api_get(&format!("custom_objects/{key}.json"), &[])
                 .await?;
@@ -97,7 +90,7 @@ impl ZendeskClient {
         after_cursor: Option<&str>,
     ) -> Result<Value> {
         async {
-            let base = format!("custom_objects/{}/records", segment(key));
+            let base = format!("custom_objects/{}/records", segment(key)?);
             let mut params: Vec<(&str, &(dyn std::fmt::Display + Sync))> = Vec::new();
             if let Some(query) = &query {
                 params.push(("query", query));
@@ -145,16 +138,12 @@ impl ZendeskClient {
 
     pub async fn get_custom_object_record(&self, key: &str, record_id: &str) -> Result<Value> {
         async {
-            let data = self
-                .api_get(
-                    &format!(
-                        "custom_objects/{}/records/{}.json",
-                        segment(key),
-                        segment(record_id)
-                    ),
-                    &[],
-                )
-                .await?;
+            let path = format!(
+                "custom_objects/{}/records/{}.json",
+                segment(key)?,
+                segment(record_id)?
+            );
+            let data = self.api_get(&path, &[]).await?;
             Ok(pick(
                 object(&data, "custom_object_record")?,
                 &RECORD_KEYS,
@@ -302,6 +291,13 @@ mod tests {
             requests[0].headers.get("content-type").unwrap(),
             "application/json"
         );
+    }
+
+    #[tokio::test]
+    async fn dot_segments_are_rejected() {
+        let c = offline_client();
+        assert!(c.get_custom_object("..").await.is_err());
+        assert!(c.get_custom_object_record("k", "..").await.is_err());
     }
 
     #[tokio::test]
