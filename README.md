@@ -64,7 +64,7 @@ create a client:
 | --- | --- |
 | Client kind | **Public**. This server runs on each operator's machine, so there is no secret it could keep. PKCE is used instead. |
 | Redirect URLs | `http://localhost:4567/callback` |
-| Allowed scopes | `tickets:read tickets:write ticket_attachments:read users:read hc:read` |
+| Allowed scopes | `read tickets:write ticket_attachments:write users:write organizations:write hc:write` |
 
 Setting **Allowed scopes** is optional but recommended. It caps what any token
 from this client can ever request, even if the code changes.
@@ -143,20 +143,18 @@ The default scopes cover every tool this server exposes:
 
 | Scope | Needed for |
 | --- | --- |
-| `tickets:read` | `get_ticket`, `get_tickets`, `get_ticket_comments` |
-| `tickets:write` | `create_ticket`, `update_ticket`, `create_ticket_comment` |
-| `ticket_attachments:read` | `get_ticket_attachment` |
-| `users:read` | requester and assignee details on tickets |
-| `hc:read` | `list_articles` and the `zendesk://knowledge-base` resource |
+| `read` | every read tool, including search, views, macros, groups, organizations, ticket audits, SLA data and the knowledge base |
+| `tickets:write` | `create_ticket`, `update_ticket`, `create_ticket_comment`, `delete_ticket`, `merge_tickets` and other ticket changes |
+| `ticket_attachments:write` | uploading files to attach to tickets |
+| `users:write` | creating or updating users |
+| `organizations:write` | updating organizations |
+| `hc:write` | creating or editing Help Center articles |
 
-Narrow them with `ZENDESK_OAUTH_SCOPES` if you do not need every tool. For
-read-only access, use `tickets:read users:read hc:read`.
-
-The views, macros, organizations, groups, forms, search and SLA tools were
-added after this table was written and have not been checked against each
-Zendesk scope. If one of them answers `403`, widen `ZENDESK_OAUTH_SCOPES` (for
-example with `organizations:read`, `macros:read` or the broad `read`), update
-the OAuth client's allowed scopes to match, and re-run `zendesk-mcp-server auth`.
+`read` alone is the read-only configuration. Zendesk gives search, job statuses
+and ticket audits no narrow read scope (`tickets:read` is not enough for audits),
+so the broad `read` is requested and covers all of these. Narrow the write
+scopes with `ZENDESK_OAUTH_SCOPES` if you do not need every tool, and update the
+OAuth client's allowed scopes to match.
 
 Scopes are a ceiling, not a grant. A token can never do more than the
 authorizing operator is allowed to do. Zendesk accepts unrecognised scope names
@@ -341,7 +339,7 @@ Everyone who holds the bearer token acts as that Zendesk user.
 | --- | --- | --- |
 | `ZENDESK_SUBDOMAIN` | none | Zendesk subdomain (`acme` for `acme.zendesk.com`). Required for credentials 1 to 4. |
 | `ZENDESK_CLIENT_ID` | none | Identifier of a public OAuth client. Enables OAuth. |
-| `ZENDESK_OAUTH_SCOPES` | `tickets:read tickets:write ticket_attachments:read users:read hc:read` | Scopes requested at sign-in. |
+| `ZENDESK_OAUTH_SCOPES` | `read tickets:write ticket_attachments:write users:write organizations:write hc:write` | Scopes requested at sign-in. |
 | `ZENDESK_OAUTH_REDIRECT_URI` | `http://localhost:4567/callback` | Redirect URL registered on the OAuth client. |
 | `ZENDESK_TOKEN_FILE` | `~/.config/zendesk-mcp/tokens.json` | OAuth token store. |
 | `ZENDESK_OAUTH_TOKEN` | none | Fixed bearer token. |

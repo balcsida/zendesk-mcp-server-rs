@@ -15,10 +15,12 @@ use std::path::PathBuf;
 
 use anyhow::{Result, bail};
 
-/// Scopes every tool in this server needs. Zendesk accepts unknown scope names when
-/// issuing a token but then rejects every request with 403, so keep these exact.
+/// The broad `read` (every GET endpoint, including ticket audits and search, which have
+/// no narrow scope) plus the narrow write scopes the write tools need. Zendesk accepts
+/// unknown scope names when issuing a token but then rejects every request with 403,
+/// so keep these exact.
 pub const DEFAULT_OAUTH_SCOPES: &str =
-    "tickets:read tickets:write ticket_attachments:read users:read hc:read";
+    "read tickets:write ticket_attachments:write users:write organizations:write hc:write";
 
 /// Must match a redirect URL registered on the OAuth client in Admin Center.
 pub const DEFAULT_REDIRECT_URI: &str = "http://localhost:4567/callback";
@@ -247,6 +249,10 @@ mod tests {
             Credentials::OAuth(s) => {
                 assert_eq!(s.subdomain, "acme");
                 assert_eq!(s.scopes, DEFAULT_OAUTH_SCOPES);
+                assert_eq!(
+                    s.scopes,
+                    "read tickets:write ticket_attachments:write users:write organizations:write hc:write"
+                );
                 assert_eq!(s.redirect_uri, DEFAULT_REDIRECT_URI);
                 assert_eq!(s.token_endpoint(), "https://acme.zendesk.com/oauth/tokens");
             }
