@@ -1,0 +1,17 @@
+/target
+
+.env
+.env.*
+!.env.example
+
+# Zendesk tokens. The default store lives in $XDG_CONFIG_HOME/zendesk-mcp/, outside
+# the repo; these patterns catch a token file pointed in here.
+tokens.json
+*.tokens.json
+tokens.json.lock
+mobile_token.json
+.zendesk_token
+
+.idea/
+.vscode/
+.DS_Store

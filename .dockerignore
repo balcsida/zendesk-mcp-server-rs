@@ -1,0 +1,10 @@
+target
+.git
+.github
+.env
+.env.*
+*.json
+.zendesk_token
+.idea
+.vscode
+README.md

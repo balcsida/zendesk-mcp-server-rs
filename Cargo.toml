@@ -1,0 +1,46 @@
+[package]
+name = "zendesk-mcp-server"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "Model Context Protocol server for Zendesk"
+license = "Apache-2.0"
+repository = "https://github.com/balcsida/zendesk-mcp-server-rs"
+publish = false
+
+[dependencies]
+# MCP protocol: stdio and streamable HTTP server transports.
+rmcp = { version = "3.5", features = ["server", "macros", "transport-io", "transport-streamable-http-server"] }
+schemars = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "sync", "time", "signal", "net"] }
+tokio-util = "0.7"
+axum = "0.8"
+tower-http = { version = "0.6", features = ["validate-request"] }
+# Zendesk HTTP client. reqwest 0.13 defaults to rustls with the platform verifier,
+# so the Docker image only needs ca-certificates.
+reqwest = { version = "0.13", features = ["json", "form"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive", "env"] }
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
+chrono = { version = "0.4", features = ["serde"] }
+dotenvy = "0.15"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+webbrowser = "1"
+sha2 = "0.11"
+base64 = "0.23"
+rand = "0.10"
+url = "2"
+uuid = { version = "1", features = ["v4"] }
+rpassword = "7"
+anyhow = "1"
+
+[dev-dependencies]
+wiremock = "0.6"
+tempfile = "3"
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
