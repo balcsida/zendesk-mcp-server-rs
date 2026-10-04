@@ -391,7 +391,7 @@ mod tests {
             .mount(&server)
             .await;
         let c = client(&server);
-        let fields = json!({"status": "solved", "tags": ["a"]})
+        let fields = json!({"status": "solved", "additional_tags": ["a"], "remove_tags": ["b"]})
             .as_object()
             .unwrap()
             .clone();
@@ -400,7 +400,10 @@ mod tests {
         assert_eq!(out["pending"], false);
         let requests = server.received_requests().await.unwrap();
         let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
-        assert_eq!(body, json!({"ticket": {"status": "solved", "tags": ["a"]}}));
+        assert_eq!(
+            body,
+            json!({"ticket": {"status": "solved", "additional_tags": ["a"], "remove_tags": ["b"]}})
+        );
 
         let one = json!({"status": "open"}).as_object().unwrap().clone();
         let too_many: Vec<u64> = (1..=101).collect();

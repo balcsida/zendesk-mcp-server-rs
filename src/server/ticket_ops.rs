@@ -75,6 +75,10 @@ struct UpdateTicketsBulkParams {
     custom_status_id: Option<u64>,
     /// Replaces all tags on every ticket
     tags: Option<Vec<String>>,
+    /// Tags to add to every ticket, keeping the existing ones
+    additional_tags: Option<Vec<String>>,
+    /// Tags to remove from every ticket
+    remove_tags: Option<Vec<String>>,
     /// Custom field values as [{"id": 1, "value": "x"}]
     custom_fields: Option<Vec<serde_json::Map<String, Value>>>,
 }
@@ -201,6 +205,8 @@ impl ZendeskServer {
             set("group_id", p.group_id.map(Value::from));
             set("custom_status_id", p.custom_status_id.map(Value::from));
             set("tags", p.tags.map(Value::from));
+            set("additional_tags", p.additional_tags.map(Value::from));
+            set("remove_tags", p.remove_tags.map(Value::from));
             set(
                 "custom_fields",
                 p.custom_fields

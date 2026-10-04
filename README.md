@@ -648,6 +648,8 @@ Apply the same change to up to 100 tickets. Waits up to 30 seconds for Zendesk's
 - `group_id` (integer, optional)
 - `custom_status_id` (integer, optional)
 - `tags` (array of strings, optional): Replaces all tags on every ticket
+- `additional_tags` (array of strings, optional): Tags to add, keeping the existing ones
+- `remove_tags` (array of strings, optional): Tags to remove
 - `custom_fields` (array of objects, optional): `[{"id": 1, "value": "x"}]`
 
 At least one field is required.
