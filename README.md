@@ -709,6 +709,71 @@ Search organizations by name.
 
 - `query` (string)
 
+#### get_users_bulk
+
+Get many users by ID in one call, to resolve many requester or assignee IDs at once. Returns `id`, `name`, `email`, `role`, `organization_id`, `external_id`, `active`, `suspended`, `time_zone` and `locale`.
+
+- `user_ids` (array of integers): Fetched in requests of 100
+
+#### get_user_identities
+
+List the emails, phone numbers and other identities of a user with their verification and deliverability state. Returns `count` and `identities` (`id`, `type`, `value`, `primary`, `verified`, `verification_method`, `deliverable_state`, `undeliverable_count`).
+
+- `user_id` (integer)
+
+#### get_user_organizations
+
+List the organizations a user belongs to as `{id, name, default, view_tickets}`. A user can belong to several; `default` marks the primary one.
+
+- `user_id` (integer)
+
+#### create_or_update_user
+
+Create a user, or update the existing one that matches the email or external_id. A new user is an end user; this tool never changes the role. Returns the user as `get_user` does.
+
+- `name` (string)
+- `email` (string)
+- `external_id` (string, optional)
+- `phone` (string, optional)
+- `organization_id` (integer, optional)
+- `tags` (array of strings, optional)
+- `notes` (string, optional)
+- `details` (string, optional)
+- `user_fields` (object, optional): Custom user field values as `{"field_key": value}`
+- `locale` (string, optional): For example `en-US`
+- `time_zone` (string, optional): For example `Europe/Budapest`
+
+#### update_user
+
+Update a user's profile. Role, suspension and password changes are deliberately not supported. A new email is added as a secondary identity (Zendesk behaviour), not made primary. At least one field is required.
+
+- `user_id` (integer)
+- `name`, `email`, `phone`, `external_id`, `notes`, `details`, `alias`, `locale`, `time_zone` (string, optional)
+- `organization_id` (integer, optional)
+- `tags` (array of strings, optional): Replaces the whole tag list
+- `user_fields` (object, optional): Custom user field values as `{"field_key": value}`
+
+#### list_organization_users
+
+List the users of an organization as `{id, name, email, role, active, suspended, external_id, phone}`.
+
+- `organization_id` (integer)
+- `page` (integer, optional): Defaults to 1
+- `per_page` (integer, optional): Defaults to 25, max 100
+
+#### update_organization
+
+Update an organization. Agents without extra permission can usually change only `notes`. At least one field is required. Returns the organization as `get_organization` does.
+
+- `organization_id` (integer)
+- `name`, `details`, `notes`, `external_id` (string, optional)
+- `domain_names` (array of strings, optional): Replaces the whole list
+- `group_id` (integer, optional)
+- `tags` (array of strings, optional): Replaces the whole tag list
+- `organization_fields` (object, optional): Custom organization field values as `{"field_key": value}`
+- `shared_tickets` (boolean, optional)
+- `shared_comments` (boolean, optional)
+
 ### Views, fields, forms, groups, macros
 
 #### list_views
