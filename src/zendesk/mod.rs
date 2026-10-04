@@ -1,0 +1,650 @@
+//! Zendesk REST API client.
+//!
+//! Every method returns `serde_json::Value` shaped exactly like the Python server's
+//! output, so MCP clients see no difference after the rewrite.
+
+use std::collections::HashSet;
+use std::fmt::Display;
+use std::time::Duration;
+
+use anyhow::{Result, anyhow, bail};
+use base64::Engine;
+use pulldown_cmark::{Event, Options, Parser, html};
+use serde_json::{Map, Value, json};
+
+use crate::auth::Auth;
+
+/// 10 MB hard cap on attachments, against image bombs and token budget blowout.
+pub const MAX_ATTACHMENT_BYTES: usize = 10 * 1024 * 1024;
+
+/// Image types a tool may return. SVG is excluded: it can contain active content.
+pub const ALLOWED_IMAGE_TYPES: [&str; 4] = ["image/jpeg", "image/png", "image/gif", "image/webp"];
+
+/// Retries of an idempotent request answered 429 or 503.
+const MAX_RETRIES: u32 = 3;
+/// Longest `Retry-After` honoured, in seconds.
+const MAX_RETRY_AFTER_SECS: u64 = 30;
+/// Pages followed per listing before returning what was collected.
+const MAX_PAGES: usize = 1000;
+/// Largest `days_back` accepted by `get_sla_breaches` (100 years).
+const MAX_DAYS_BACK: u64 = 36_500;
+
+/// Render Markdown (or plain text) to the HTML Zendesk stores as `html_body`.
+///
+/// CommonMark plus tables and strikethrough; a single newline becomes `<br>` so plain
+/// text keeps its line breaks; raw HTML in the input is passed through for Zendesk to
+/// sanitize server-side.
+pub fn markdown_to_html(text: &str) -> String {
+    let options = Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH;
+    let events = Parser::new_ext(text, options).map(|event| match event {
+        Event::SoftBreak => Event::HardBreak,
+        other => other,
+    });
+    let mut out = String::new();
+    html::push_html(&mut out, events);
+    out
+}
+
+/// A fetched, validated image attachment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Attachment {
+    pub content_type: String,
+    /// Base64 (standard alphabet, padded) of the file bytes.
+    pub data_base64: String,
+}
+
+/// Fields accepted when creating a ticket.
+#[derive(Debug, Clone, Default)]
+pub struct CreateTicket {
+    pub subject: String,
+    pub description: String,
+    pub requester_id: Option<u64>,
+    pub assignee_id: Option<u64>,
+    pub priority: Option<String>,
+    pub ticket_type: Option<String>,
+    pub tags: Option<Vec<String>>,
+    pub custom_fields: Option<Vec<Value>>,
+}
+
+#[derive(Clone)]
+pub struct ZendeskClient {
+    http: reqwest::Client,
+    subdomain: String,
+    /// `https://{subdomain}.zendesk.com/api/v2` in production; tests point it at a mock.
+    base_url: String,
+    auth: Auth,
+}
+
+/// Copy `keys` out of `obj`, defaulting to null (or `[]` for `array_keys`) when absent.
+pub(super) fn pick(obj: &Value, keys: &[&str], array_keys: &[&str]) -> Value {
+    let mut out = Map::new();
+    for key in keys {
+        let value = match obj.get(*key) {
+            Some(v) if !v.is_null() => v.clone(),
+            _ if array_keys.contains(key) => json!([]),
+            _ => Value::Null,
+        };
+        out.insert((*key).to_string(), value);
+    }
+    Value::Object(out)
+}
+
+/// `pick` applied to every element of `data[key]`.
+pub(super) fn pick_all(data: &Value, key: &str, keys: &[&str], array_keys: &[&str]) -> Value {
+    let items = data
+        .get(key)
+        .and_then(Value::as_array)
+        .map_or(&[][..], |a| a);
+    Value::Array(items.iter().map(|i| pick(i, keys, array_keys)).collect())
+}
+
+/// `[{id, value}]` from a ticket's raw `custom_fields`.
+pub(super) fn custom_fields(ticket: &Value) -> Value {
+    let items = ticket.get("custom_fields").and_then(Value::as_array);
+    Value::Array(
+        items
+            .map_or(&[][..], |a| a)
+            .iter()
+            .map(|f| pick(f, &["id", "value"], &[]))
+            .collect(),
+    )
+}
+
+/// The shape `create_ticket` and `update_ticket` return.
+pub(super) fn full_ticket(data: &Value) -> Result<Value> {
+    let ticket = data
+        .get("ticket")
+        .ok_or_else(|| anyhow!("Zendesk response has no 'ticket' object"))?;
+    let mut out = pick(
+        ticket,
+        &[
+            "id",
+            "subject",
+            "description",
+            "status",
+            "priority",
+            "type",
+            "created_at",
+            "updated_at",
+            "requester_id",
+            "assignee_id",
+            "organization_id",
+            "tags",
+        ],
+        &["tags"],
+    );
+    out["custom_fields"] = custom_fields(ticket);
+    Ok(out)
+}
+
+pub(super) fn object<'a>(data: &'a Value, key: &str) -> Result<&'a Value> {
+    data.get(key)
+        .ok_or_else(|| anyhow!("Zendesk response has no '{key}' object"))
+}
+
+/// `id -> name` from the `users` Zendesk side-loads when a request asks for `include=users`.
+pub(super) fn side_loaded_user_names(data: &Value) -> std::collections::HashMap<u64, String> {
+    data.get("users")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|u| Some((u.get("id")?.as_u64()?, u.get("name")?.as_str()?.to_string())))
+        .collect()
+}
+
+/// Add `requester_name`/`assignee_name` to `out` by resolving `raw`'s `requester_id` and
+/// `assignee_id` against the side-loaded `names`. Left unset when Zendesk didn't side-load
+/// the user (e.g. it was deleted, or the caller didn't request `include=users`).
+pub(super) fn with_user_names(
+    mut out: Value,
+    raw: &Value,
+    names: &std::collections::HashMap<u64, String>,
+) -> Value {
+    for (id_key, name_key) in [
+        ("requester_id", "requester_name"),
+        ("assignee_id", "assignee_name"),
+    ] {
+        if let Some(name) = raw
+            .get(id_key)
+            .and_then(Value::as_u64)
+            .and_then(|id| names.get(&id))
+        {
+            out[name_key] = json!(name);
+        }
+    }
+    out
+}
+
+/// Prefix an error the way the Python server worded it.
+pub(super) fn ctx(prefix: impl Display) -> impl FnOnce(anyhow::Error) -> anyhow::Error {
+    move |e| anyhow!("{prefix}: {e:#}")
+}
+
+pub(super) fn magic_matches(content_type: &str, bytes: &[u8]) -> bool {
+    match content_type {
+        "image/jpeg" => bytes.starts_with(&[0xFF, 0xD8, 0xFF]),
+        "image/png" => bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]),
+        "image/gif" => bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a"),
+        "image/webp" => bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP"),
+        _ => false,
+    }
+}
+
+/// Fail on a non-success status with Zendesk's body (truncated), never the request headers.
+pub(super) async fn ensure_success(
+    resp: reqwest::Response,
+    label: &str,
+) -> Result<reqwest::Response> {
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(resp);
+    }
+    let body = resp.bytes().await.unwrap_or_default();
+    Err(status_error(status, label, &body))
+}
+
+pub(super) fn status_error(status: reqwest::StatusCode, label: &str, body: &[u8]) -> anyhow::Error {
+    let text: String = String::from_utf8_lossy(body).chars().take(500).collect();
+    anyhow!("Zendesk API error HTTP {status} for {label}: {text}")
+}
+
+/// `help_center`, or `help_center/{locale}` when a locale is given: Zendesk takes the
+/// locale as a path segment, not a query parameter.
+pub(super) fn help_center_path(locale: Option<&str>) -> String {
+    match locale.filter(|l| !l.is_empty()) {
+        Some(locale) => {
+            let locale: String = url::form_urlencoded::byte_serialize(locale.as_bytes())
+                .collect::<String>()
+                .replace('+', "%20");
+            format!("help_center/{locale}")
+        }
+        None => "help_center".into(),
+    }
+}
+
+impl ZendeskClient {
+    pub fn new(subdomain: &str, auth: Auth, http: reqwest::Client) -> Self {
+        let base_url = format!("https://{subdomain}.zendesk.com/api/v2");
+        Self::with_base_url(subdomain, auth, http, base_url)
+    }
+
+    pub fn with_base_url(
+        subdomain: &str,
+        auth: Auth,
+        http: reqwest::Client,
+        base_url: String,
+    ) -> Self {
+        ZendeskClient {
+            http,
+            subdomain: subdomain.to_string(),
+            base_url,
+            auth,
+        }
+    }
+
+    pub(super) fn url(
+        &self,
+        path: &str,
+        params: &[(&str, &(dyn Display + Sync))],
+    ) -> Result<url::Url> {
+        let mut url = url::Url::parse(&format!("{}/{path}", self.base_url))?;
+        if !params.is_empty() {
+            let mut pairs = url.query_pairs_mut();
+            for (key, value) in params {
+                pairs.append_pair(key, &value.to_string());
+            }
+        }
+        Ok(url)
+    }
+
+    /// Send an authenticated request. After a 401 `invalid_token` under OAuth the token is
+    /// renewed and the request sent exactly once more.
+    pub(super) async fn send(
+        &self,
+        make: impl Fn() -> reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response> {
+        let request = make().build()?;
+        let label = format!("{} {}", request.method(), request.url().path());
+
+        let value = self.auth.value().await?;
+        let mut resp = value.apply(make()).send().await?;
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED
+            && let Some(provider) = self.auth.oauth()
+        {
+            let body = resp.bytes().await.unwrap_or_default();
+            if !crate::oauth::is_invalid_token_body(&body) {
+                return Err(status_error(
+                    reqwest::StatusCode::UNAUTHORIZED,
+                    &label,
+                    &body,
+                ));
+            }
+            provider
+                .renew(
+                    "Zendesk reported the access token as invalid",
+                    value.bearer_token(),
+                )
+                .await?;
+            let fresh = self.auth.value().await?;
+            resp = fresh.apply(make()).send().await?;
+        }
+
+        let idempotent = request.method() != reqwest::Method::POST;
+        let mut attempt = 0;
+        while idempotent && attempt < MAX_RETRIES && matches!(resp.status().as_u16(), 429 | 503) {
+            let delay = resp
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .map_or(1 << attempt, |secs| secs.min(MAX_RETRY_AFTER_SECS));
+            tracing::debug!(
+                "{label} answered HTTP {}, retry {} of {MAX_RETRIES} in {delay}s",
+                resp.status(),
+                attempt + 1
+            );
+            let _ = resp.bytes().await;
+            tokio::time::sleep(Duration::from_secs(delay)).await;
+            resp = self.auth.value().await?.apply(make()).send().await?;
+            attempt += 1;
+        }
+        ensure_success(resp, &label).await
+    }
+
+    pub(super) async fn get_url(&self, url: url::Url) -> Result<Value> {
+        Ok(self
+            .send(|| self.http.get(url.clone()))
+            .await?
+            .json()
+            .await?)
+    }
+
+    pub(super) async fn api_get(
+        &self,
+        path: &str,
+        params: &[(&str, &(dyn Display + Sync))],
+    ) -> Result<Value> {
+        self.get_url(self.url(path, params)?).await
+    }
+
+    pub(super) async fn api_post(&self, path: &str, body: &Value) -> Result<Value> {
+        let url = self.url(path, &[])?;
+        let resp = self.send(|| self.http.post(url.clone()).json(body)).await?;
+        Ok(resp.json().await?)
+    }
+
+    pub(super) async fn api_put(&self, path: &str, body: &Value) -> Result<Value> {
+        let url = self.url(path, &[])?;
+        let resp = self.send(|| self.http.put(url.clone()).json(body)).await?;
+        Ok(resp.json().await?)
+    }
+
+    pub(super) async fn api_delete(&self, path: &str) -> Result<()> {
+        let url = self.url(path, &[])?;
+        self.send(|| self.http.delete(url.clone())).await?;
+        Ok(())
+    }
+
+    /// Validate a `next_page` link: same scheme, host and port as `base_url`, and not a
+    /// page already fetched. `seen` holds the URLs fetched so far; the link is added to it.
+    /// Returns `None` (after a warning) once `MAX_PAGES` pages have been fetched.
+    pub(super) fn next_page(
+        &self,
+        seen: &mut HashSet<String>,
+        link: &str,
+    ) -> Result<Option<url::Url>> {
+        let next = url::Url::parse(link)?;
+        let base = url::Url::parse(&self.base_url)?;
+        if next.scheme() != base.scheme()
+            || next.host_str() != base.host_str()
+            || next.port_or_known_default() != base.port_or_known_default()
+        {
+            bail!(
+                "Zendesk returned a next_page link on another host: {}",
+                next.host_str().unwrap_or("")
+            );
+        }
+        if seen.len() >= MAX_PAGES {
+            tracing::warn!("Stopped following next_page after {MAX_PAGES} pages");
+            return Ok(None);
+        }
+        if !seen.insert(next.to_string()) {
+            bail!("Zendesk pagination returned a page it already returned");
+        }
+        Ok(Some(next))
+    }
+
+    /// Collect `key` from a listing, following the absolute `next_page` URLs until null.
+    pub(super) async fn get_paged(&self, path: &str, key: &str) -> Result<Vec<Value>> {
+        let mut items = Vec::new();
+        let mut url = self.url(path, &[])?;
+        let mut seen = HashSet::from([url.to_string()]);
+        loop {
+            let data = self.get_url(url).await?;
+            if let Some(page) = data.get(key).and_then(Value::as_array) {
+                items.extend(page.iter().cloned());
+            }
+            let Some(link) = data.get("next_page").and_then(Value::as_str) else {
+                break;
+            };
+            match self.next_page(&mut seen, link)? {
+                Some(next) => url = next,
+                None => break,
+            }
+        }
+        Ok(items)
+    }
+}
+
+pub(super) const TICKET_SUMMARY_KEYS: [&str; 9] = [
+    "id",
+    "subject",
+    "status",
+    "priority",
+    "requester_id",
+    "assignee_id",
+    "group_id",
+    "created_at",
+    "updated_at",
+];
+
+mod help_center;
+mod people;
+mod tickets;
+mod workflows;
+
+#[cfg(test)]
+pub(super) mod test_support {
+    use super::*;
+    use wiremock::{MockServer, ResponseTemplate};
+
+    pub fn client(server: &MockServer) -> ZendeskClient {
+        ZendeskClient::with_base_url(
+            "acme",
+            Auth::bearer("t"),
+            reqwest::Client::new(),
+            format!("{}/api/v2", server.uri()),
+        )
+    }
+
+    pub fn offline_client() -> ZendeskClient {
+        ZendeskClient::new("acme", Auth::bearer("t"), reqwest::Client::new())
+    }
+
+    pub fn json_page(items_key: &str, items: Value, next: Option<String>) -> ResponseTemplate {
+        ResponseTemplate::new(200).set_body_json(json!({ items_key: items, "next_page": next }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::*;
+    use super::*;
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn invalid_token_without_oauth_is_not_retried() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(401).set_body_json(json!({"error": "invalid_token"})),
+            )
+            .mount(&server)
+            .await;
+        let err = client(&server).get_ticket(1).await.unwrap_err().to_string();
+        assert!(err.contains("Failed to get ticket 1: "), "{err}");
+        assert!(err.contains("HTTP 401"), "{err}");
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn forbidden_passes_body_through() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(403).set_body_string("nope scope"))
+            .mount(&server)
+            .await;
+        let err = client(&server).list_views().await.unwrap_err().to_string();
+        assert!(
+            err.contains("HTTP 403 Forbidden for GET /api/v2/views.json: nope scope"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_retries_429_then_succeeds() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/users/me.json"))
+            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "0"))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/users/me.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"user": {"id": 1}})))
+            .mount(&server)
+            .await;
+        let user = client(&server).get_current_user().await.unwrap();
+        assert_eq!(user["id"], 1);
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn post_429_is_not_retried() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "0"))
+            .mount(&server)
+            .await;
+        let err = client(&server)
+            .api_post("tickets.json", &json!({}))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("429"), "{err}");
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn next_page_on_another_host_is_rejected() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(json_page(
+                "comments",
+                json!([]),
+                Some("https://evil.example/api/v2/next".into()),
+            ))
+            .mount(&server)
+            .await;
+        let err = client(&server).get_ticket_comments(1).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("next_page link on another host: evil.example"),
+            "{err}"
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn next_page_cycle_terminates() {
+        let server = MockServer::start().await;
+        let first = format!("{}/api/v2/tickets/1/comments.json", server.uri());
+        Mock::given(method("GET"))
+            .and(query_param("p", "b"))
+            .respond_with(json_page("comments", json!([]), Some(first.clone())))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(json_page(
+                "comments",
+                json!([]),
+                Some(format!("{first}?p=b")),
+            ))
+            .mount(&server)
+            .await;
+        let err = client(&server).get_ticket_comments(1).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Zendesk pagination returned a page it already returned"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn markdown_newline_becomes_br() {
+        assert!(markdown_to_html("a\nb").contains("<br"));
+    }
+
+    #[test]
+    fn markdown_bold_and_table() {
+        assert!(markdown_to_html("**b**").contains("<strong>b</strong>"));
+        assert!(markdown_to_html("|a|b|\n|-|-|\n|1|2|").contains("<table>"));
+    }
+
+    #[test]
+    fn markdown_keeps_raw_html() {
+        assert!(markdown_to_html("<b>x</b>").contains("<b>x</b>"));
+    }
+
+    #[test]
+    fn markdown_empty_is_empty() {
+        assert_eq!(markdown_to_html(""), "");
+    }
+
+    /// The one cross-module path: Zendesk rejects the stored token, the provider
+    /// refreshes and persists the new pair, and the request is retried exactly once.
+    #[tokio::test]
+    async fn invalid_token_401_renews_once_and_retries() {
+        use wiremock::matchers::{body_string_contains, header};
+
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let settings = crate::config::OAuthSettings {
+            subdomain: "acme".into(),
+            client_id: "cid".into(),
+            token_file: dir.path().join("tokens.json"),
+            scopes: "tickets:read".into(),
+            redirect_uri: "http://localhost:4567/callback".into(),
+        };
+        let store = crate::tokens::TokenStore::new(settings.token_file.clone());
+        store
+            .save(&crate::tokens::TokenSet {
+                access_token: "old".into(),
+                refresh_token: Some("r1".into()),
+                expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+                refresh_token_expires_at: None,
+                subdomain: "acme".into(),
+                client_id: "cid".into(),
+                scope: None,
+            })
+            .unwrap();
+        let provider = crate::oauth::OAuthProvider::with_store(
+            settings,
+            store.clone(),
+            reqwest::Client::new(),
+        )
+        .with_token_endpoint(&format!("{}/oauth/tokens", server.uri()));
+
+        Mock::given(method("GET"))
+            .and(path("/api/v2/users/me.json"))
+            .and(header("authorization", "Bearer old"))
+            .respond_with(
+                ResponseTemplate::new(401).set_body_json(json!({"error": "invalid_token"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/oauth/tokens"))
+            .and(body_string_contains("grant_type=refresh_token"))
+            .and(body_string_contains("refresh_token=r1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "new", "refresh_token": "r2",
+                "expires_in": 1800, "refresh_token_expires_in": 7776000
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/users/me.json"))
+            .and(header("authorization", "Bearer new"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"user": {"id": 1}})))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = ZendeskClient::with_base_url(
+            "acme",
+            Auth::OAuth(std::sync::Arc::new(provider)),
+            reqwest::Client::new(),
+            format!("{}/api/v2", server.uri()),
+        );
+        let user = client.get_current_user().await.unwrap();
+        assert_eq!(user["id"], 1);
+        // The rotated pair reached disk before the retry was sent.
+        let stored = store.load().unwrap();
+        assert_eq!(stored.access_token, "new");
+        assert_eq!(stored.refresh_token.as_deref(), Some("r2"));
+    }
+}
