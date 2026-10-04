@@ -808,6 +808,12 @@ List custom ticket statuses with `id`, `status_category`, `agent_label`, `end_us
 
 List assignable groups for ticket routing. No inputs.
 
+#### get_group_members
+
+List the members of a group as `{id, name, email, role, active, suspended}`. Group IDs come from `list_groups`.
+
+- `group_id` (integer)
+
 #### list_macros
 
 List available macros (canned responses and actions). Returns every page.
@@ -820,6 +826,16 @@ Preview the result of applying a macro to a ticket. Does not save changes.
 
 - `ticket_id` (integer)
 - `macro_id` (integer)
+
+### Account
+
+#### list_brands
+
+List the brands of the account as `{id, name, subdomain, brand_url, default, active, has_help_center, help_center_state, ticket_form_ids}`; it maps `brand_id` on tickets to names. Agents may see only their own brands. No inputs.
+
+#### get_account_settings
+
+Get feature flags and defaults: `active_features` (such as `custom_objects_activated`, `business_hours`, `allow_ccs`), `brands`, `tickets`, `agents`, `localization`, `limits`, `routing` and `users`, each as Zendesk returns it (null when absent). They tell you which other tools apply. No inputs.
 
 ### Help Center
 

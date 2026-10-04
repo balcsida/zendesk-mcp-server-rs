@@ -27,6 +27,12 @@ struct SearchOrganizationsParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct GroupIdParams {
+    /// The group ID from list_groups
+    group_id: u64,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct UserIdsParams {
     /// The user IDs to fetch (chunked into requests of 100)
     user_ids: Vec<u64>,
@@ -311,5 +317,32 @@ impl ZendeskServer {
             ))
         })
         .await
+    }
+
+    #[tool(
+        description = "List the members of a group (id, name, email, role, active, suspended). Group IDs come from list_groups.",
+        annotations(read_only_hint = true)
+    )]
+    async fn get_group_members(&self, Parameters(p): Parameters<GroupIdParams>) -> CallToolResult {
+        self.call_json(|c| async move { c.get_group_members(p.group_id).await })
+            .await
+    }
+
+    #[tool(
+        description = "List the brands of the account (id, name, subdomain, brand_url, default, active, has_help_center, help_center_state, ticket_form_ids). Maps brand_id on tickets to names; agents may see only their own brands.",
+        annotations(read_only_hint = true)
+    )]
+    async fn list_brands(&self) -> CallToolResult {
+        self.call_json(|c| async move { c.list_brands().await })
+            .await
+    }
+
+    #[tool(
+        description = "Get account settings: active_features (such as custom_objects_activated, business_hours, allow_ccs) and the brands, tickets, agents, localization, limits, routing and users defaults. Tells you which other tools apply to this account.",
+        annotations(read_only_hint = true)
+    )]
+    async fn get_account_settings(&self) -> CallToolResult {
+        self.call_json(|c| async move { c.get_account_settings().await })
+            .await
     }
 }

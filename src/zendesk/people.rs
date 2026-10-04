@@ -363,6 +363,79 @@ impl ZendeskClient {
             "Failed to update organization {organization_id}"
         )))
     }
+
+    pub async fn get_group_members(&self, group_id: u64) -> Result<Value> {
+        async {
+            let items = self
+                .get_paged(&format!("groups/{group_id}/users.json"), "users")
+                .await?;
+            let users = pick_all(
+                &json!({ "users": items }),
+                "users",
+                &["id", "name", "email", "role", "active", "suspended"],
+                &[],
+            );
+            Ok(json!({ "count": items.len(), "users": users }))
+        }
+        .await
+        .map_err(ctx(format!("Failed to get members of group {group_id}")))
+    }
+
+    /// Brands use cursor pagination only; at most 1000 are returned.
+    pub async fn list_brands(&self) -> Result<Value> {
+        async {
+            let brands = self
+                .get_cursor_paged("brands.json", &[], "brands", 1000)
+                .await?;
+            Ok(pick_all(
+                &json!({ "brands": brands }),
+                "brands",
+                &[
+                    "id",
+                    "name",
+                    "subdomain",
+                    "brand_url",
+                    "default",
+                    "active",
+                    "has_help_center",
+                    "help_center_state",
+                    "ticket_form_ids",
+                ],
+                &["ticket_form_ids"],
+            ))
+        }
+        .await
+        .map_err(ctx("Failed to list brands"))
+    }
+
+    pub async fn get_account_settings(&self) -> Result<Value> {
+        async {
+            let data = self.api_get("account/settings.json", &[]).await?;
+            let settings = object(&data, "settings")?;
+            let mut out = pick(
+                settings,
+                &[
+                    "active_features",
+                    "brands",
+                    "tickets",
+                    "agents",
+                    "localization",
+                    "limits",
+                    "routing",
+                ],
+                &[],
+            );
+            // The spec names this sub-object `user`; accept `users` too.
+            out["users"] = [&settings["users"], &settings["user"]]
+                .into_iter()
+                .find(|v| !v.is_null())
+                .cloned()
+                .unwrap_or(Value::Null);
+            Ok(out)
+        }
+        .await
+        .map_err(ctx("Failed to get account settings"))
+    }
 }
 
 #[cfg(test)]
@@ -566,5 +639,72 @@ mod tests {
         );
         assert!(c.update_organization(7, Map::new()).await.is_err());
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn group_members_are_trimmed() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/groups/3/users.json"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    json!({"users": [{"id": 1, "name": "A", "role": "agent", "x": 1}]}),
+                ),
+            )
+            .mount(&server)
+            .await;
+        let out = client(&server).get_group_members(3).await.unwrap();
+        assert_eq!(out["count"], 1);
+        assert_eq!(out["users"][0]["role"], "agent");
+        assert!(out["users"][0]["email"].is_null());
+        assert!(out["users"][0].get("x").is_none());
+    }
+
+    #[tokio::test]
+    async fn brands_follow_the_cursor_and_are_trimmed() {
+        let server = MockServer::start().await;
+        let next = format!("{}/api/v2/brands.json?page%5Bafter%5D=c1", server.uri());
+        Mock::given(method("GET"))
+            .and(path("/api/v2/brands.json"))
+            .and(query_param("page[after]", "c1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "brands": [{"id": 2, "name": "Two"}], "meta": {"has_more": false}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/brands.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "brands": [{"id": 1, "name": "One", "default": true, "logo": {}}],
+                "meta": {"has_more": true}, "links": {"next": next}
+            })))
+            .mount(&server)
+            .await;
+        let out = client(&server).list_brands().await.unwrap();
+        assert_eq!(out.as_array().unwrap().len(), 2);
+        assert_eq!(out[0]["default"], true);
+        assert_eq!(out[1]["ticket_form_ids"], json!([]));
+        assert!(out[0].get("logo").is_none());
+    }
+
+    #[tokio::test]
+    async fn account_settings_return_only_the_chosen_sections() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/account/settings.json"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"settings": {
+                    "active_features": {"custom_objects_activated": true},
+                    "tickets": {"allow_ccs": true}, "user": {"tagging": true},
+                    "billing": {"secret": 1}
+                }})),
+            )
+            .mount(&server)
+            .await;
+        let out = client(&server).get_account_settings().await.unwrap();
+        assert_eq!(out["active_features"]["custom_objects_activated"], true);
+        assert_eq!(out["users"], json!({"tagging": true}));
+        assert!(out["routing"].is_null());
+        assert!(out.get("billing").is_none());
     }
 }

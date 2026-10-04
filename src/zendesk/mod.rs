@@ -542,7 +542,6 @@ impl ZendeskClient {
 
     /// Collect `key` from a cursor-paginated listing, following `links.next` while
     /// `meta.has_more` is true, until `max_items` have been collected.
-    #[allow(dead_code)] // only tests call it until a cursor-paginated tool lands
     pub(super) async fn get_cursor_paged(
         &self,
         path: &str,
