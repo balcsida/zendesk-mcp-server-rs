@@ -120,6 +120,16 @@ struct MergeTicketsParams {
     target_comment: String,
     #[serde(default = "default_source_comment")]
     source_comment: String,
+    /// Whether the comment on the target ticket is public (Zendesk defaults to private)
+    target_comment_is_public: Option<bool>,
+    /// Whether the comments on the source tickets are public (Zendesk defaults to private)
+    source_comment_is_public: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct JobStatusParams {
+    /// The job status ID returned by merge_tickets or a bulk operation
+    job_id: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -289,7 +299,7 @@ impl ZendeskServer {
     }
 
     #[tool(
-        description = "Fetch multiple tickets by IDs in a single request (max 100)",
+        description = "Fetch multiple tickets by IDs (requested in batches of 100)",
         annotations(read_only_hint = true)
     )]
     async fn get_tickets_bulk(
@@ -301,7 +311,7 @@ impl ZendeskServer {
     }
 
     #[tool(
-        description = "Merge source tickets into a target ticket",
+        description = "Merge source tickets into a target ticket. Irreversible. Waits up to 20 seconds for Zendesk's background job; if it is still running the result says so, and get_job_status checks it later.",
         annotations(destructive_hint = true)
     )]
     async fn merge_tickets(&self, Parameters(p): Parameters<MergeTicketsParams>) -> CallToolResult {
@@ -312,9 +322,16 @@ impl ZendeskServer {
                     &p.source_ids,
                     &p.target_comment,
                     &p.source_comment,
+                    p.target_comment_is_public,
+                    p.source_comment_is_public,
                 )
                 .await?;
-            Ok(wrapped("Tickets merged successfully", "result", result))
+            let message = match result["status"].as_str() {
+                Some("completed") => "Tickets merged successfully",
+                Some("failed") => "Merge failed",
+                _ => "Merge is still running; check it with get_job_status",
+            };
+            Ok(wrapped(message, "result", result))
         })
         .await
     }
@@ -376,6 +393,15 @@ impl ZendeskServer {
         Parameters(p): Parameters<TicketIdParams>,
     ) -> CallToolResult {
         self.call_json(|c| async move { c.get_linked_incidents(p.ticket_id).await })
+            .await
+    }
+
+    #[tool(
+        description = "Get the status of a Zendesk background job (status, progress, per-item results), e.g. a merge_tickets job that was still running. 'pending' is true while it is queued or working.",
+        annotations(read_only_hint = true)
+    )]
+    async fn get_job_status(&self, Parameters(p): Parameters<JobStatusParams>) -> CallToolResult {
+        self.call_json(|c| async move { c.get_job_status(&p.job_id).await })
             .await
     }
 }

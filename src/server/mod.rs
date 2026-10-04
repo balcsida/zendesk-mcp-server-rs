@@ -446,7 +446,7 @@ async fn shutdown_signal() {
 mod tests {
     use super::*;
 
-    const TOOLS: [&str; 33] = [
+    const TOOLS: [&str; 34] = [
         "get_ticket",
         "create_ticket",
         "get_tickets",
@@ -480,6 +480,7 @@ mod tests {
         "get_linked_incidents",
         "get_sla_breaches",
         "get_sla_policies",
+        "get_job_status",
     ];
 
     fn server() -> ZendeskServer {
@@ -493,7 +494,7 @@ mod tests {
     }
 
     #[test]
-    fn lists_exactly_the_33_tools() {
+    fn lists_exactly_the_34_tools() {
         let mut names: Vec<String> = server()
             .tool_router
             .list_all()

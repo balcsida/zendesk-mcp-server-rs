@@ -370,38 +370,59 @@ impl ZendeskClient {
         .map_err(ctx("Search failed"))
     }
 
+    /// Fetches in chunks of 100 ids, the `show_many` limit.
     pub async fn get_tickets_bulk(&self, ticket_ids: &[u64]) -> Result<Value> {
         async {
-            let ids = ticket_ids
-                .iter()
-                .take(100)
-                .map(u64::to_string)
-                .collect::<Vec<_>>()
-                .join(",");
-            let data = self
-                .api_get("tickets/show_many.json", &[("ids", &ids)])
-                .await?;
-            Ok(pick_all(&data, "tickets", &TICKET_SUMMARY_KEYS, &[]))
+            let mut tickets = Vec::new();
+            for chunk in ticket_ids.chunks(100) {
+                let ids = chunk
+                    .iter()
+                    .map(u64::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let data = self
+                    .api_get("tickets/show_many.json", &[("ids", &ids)])
+                    .await?;
+                if let Value::Array(page) = pick_all(&data, "tickets", &TICKET_SUMMARY_KEYS, &[]) {
+                    tickets.extend(page);
+                }
+            }
+            Ok(Value::Array(tickets))
         }
         .await
         .map_err(ctx("Bulk ticket fetch failed"))
     }
 
+    /// Merges and waits up to 20 seconds for Zendesk's background job; returns its
+    /// trimmed status (`pending` is true if the merge is still running).
     pub async fn merge_tickets(
         &self,
         target_id: u64,
         source_ids: &[u64],
         target_comment: &str,
         source_comment: &str,
+        target_comment_is_public: Option<bool>,
+        source_comment_is_public: Option<bool>,
     ) -> Result<Value> {
-        let body = json!({
-            "ids": source_ids,
-            "target_comment": target_comment,
-            "source_comment": source_comment,
-        });
-        self.api_post(&format!("tickets/{target_id}/merge.json"), &body)
-            .await
-            .map_err(ctx(format!("Failed to merge tickets into {target_id}")))
+        async {
+            let mut body = json!({
+                "ids": source_ids,
+                "target_comment": target_comment,
+                "source_comment": source_comment,
+            });
+            if let Some(public) = target_comment_is_public {
+                body["target_comment_is_public"] = json!(public);
+            }
+            if let Some(public) = source_comment_is_public {
+                body["source_comment_is_public"] = json!(public);
+            }
+            let job = self
+                .api_post(&format!("tickets/{target_id}/merge.json"), &body)
+                .await?;
+            self.wait_for_job(&job, Duration::from_secs(20)).await
+        }
+        .await
+        .map_err(ctx(format!("Failed to merge tickets into {target_id}")))
     }
 
     /// `role` must be one of `requested`, `assigned`, `ccd`.
@@ -528,6 +549,59 @@ mod tests {
     use crate::zendesk::test_support::*;
     use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+    #[tokio::test]
+    async fn bulk_fetch_splits_150_ids_into_two_requests() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/tickets/show_many.json"))
+            .respond_with(json_page("tickets", json!([{"id": 1}]), None))
+            .mount(&server)
+            .await;
+        let ids: Vec<u64> = (1..=150).collect();
+        let out = client(&server).get_tickets_bulk(&ids).await.unwrap();
+        assert_eq!(out.as_array().unwrap().len(), 2);
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2);
+        let counts: Vec<usize> = requests
+            .iter()
+            .map(|r| {
+                let (_, ids) = r.url.query_pairs().find(|(k, _)| k == "ids").unwrap();
+                ids.split(',').count()
+            })
+            .collect();
+        assert_eq!(counts, [100, 50]);
+    }
+
+    #[tokio::test]
+    async fn merge_waits_for_the_job_and_sends_privacy_flags() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v2/tickets/9/merge.json"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"job_status": {"id": "j1", "status": "queued"}})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/job_statuses/j1.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"job_status": {"id": "j1", "status": "completed", "progress": 1, "total": 1}}),
+            ))
+            .mount(&server)
+            .await;
+        let out = client(&server)
+            .merge_tickets(9, &[1], "t", "s", Some(true), None)
+            .await
+            .unwrap();
+        assert_eq!(out["status"], "completed");
+        assert_eq!(out["pending"], false);
+        let requests = server.received_requests().await.unwrap();
+        let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["target_comment_is_public"], true);
+        assert!(body.get("source_comment_is_public").is_none());
+    }
 
     const PNG: &[u8] = &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0];
 

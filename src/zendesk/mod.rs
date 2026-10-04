@@ -5,7 +5,7 @@
 
 use std::collections::HashSet;
 use std::fmt::Display;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow, bail};
 use base64::Engine;
@@ -73,6 +73,8 @@ pub struct ZendeskClient {
     /// `https://{subdomain}.zendesk.com/api/v2` in production; tests point it at a mock.
     base_url: String,
     auth: Auth,
+    /// Delay between polls of a background job.
+    pub(super) job_poll_interval: Duration,
 }
 
 /// Copy `keys` out of `obj`, defaulting to null (or `[]` for `array_keys`) when absent.
@@ -175,9 +177,49 @@ pub(super) fn with_user_names(
     out
 }
 
+/// Trim a Zendesk `job_status` object to the shape the job tools return.
+/// `pending` is true while the job is `queued` or `working`.
+pub(super) fn job_summary(job: &Value) -> Value {
+    let mut out = pick(
+        job,
+        &["id", "status", "progress", "total", "message", "url"],
+        &[],
+    );
+    out["pending"] = json!(matches!(
+        job.get("status").and_then(Value::as_str),
+        Some("queued" | "working")
+    ));
+    let results: Vec<Value> = job
+        .get("results")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|r| {
+            let mut item = pick(r, &["id", "action", "status", "success"], &[]);
+            for key in ["errors", "error"] {
+                if let Some(v) = r.get(key).filter(|v| !v.is_null()) {
+                    item[key] = v.clone();
+                }
+            }
+            item
+        })
+        .collect();
+    out["results"] = Value::Array(results);
+    out
+}
+
 /// Prefix an error the way the Python server worded it.
 pub(super) fn ctx(prefix: impl Display) -> impl FnOnce(anyhow::Error) -> anyhow::Error {
     move |e| anyhow!("{prefix}: {e:#}")
+}
+
+/// Parse a response body as JSON; some Zendesk endpoints answer 200 with no body.
+async fn json_or_null(resp: reqwest::Response) -> Result<Value> {
+    let bytes = resp.bytes().await?;
+    if bytes.trim_ascii().is_empty() {
+        return Ok(Value::Null);
+    }
+    Ok(serde_json::from_slice(&bytes)?)
 }
 
 pub(super) fn magic_matches(content_type: &str, bytes: &[u8]) -> bool {
@@ -239,7 +281,14 @@ impl ZendeskClient {
             subdomain: subdomain.to_string(),
             base_url,
             auth,
+            job_poll_interval: Duration::from_secs(1),
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_job_poll_interval(mut self, interval: Duration) -> Self {
+        self.job_poll_interval = interval;
+        self
     }
 
     pub(super) fn url(
@@ -330,13 +379,13 @@ impl ZendeskClient {
     pub(super) async fn api_post(&self, path: &str, body: &Value) -> Result<Value> {
         let url = self.url(path, &[])?;
         let resp = self.send(|| self.http.post(url.clone()).json(body)).await?;
-        Ok(resp.json().await?)
+        json_or_null(resp).await
     }
 
     pub(super) async fn api_put(&self, path: &str, body: &Value) -> Result<Value> {
         let url = self.url(path, &[])?;
         let resp = self.send(|| self.http.put(url.clone()).json(body)).await?;
-        Ok(resp.json().await?)
+        json_or_null(resp).await
     }
 
     pub(super) async fn api_delete(&self, path: &str) -> Result<()> {
@@ -394,6 +443,87 @@ impl ZendeskClient {
         }
         Ok(items)
     }
+
+    /// One page of a cursor-paginated listing; `page_size` is capped at 100.
+    #[allow(dead_code)] // only tests call it until a cursor-paginated tool lands
+    pub(super) async fn get_cursor_page(
+        &self,
+        path: &str,
+        params: &[(&str, &(dyn Display + Sync))],
+        page_size: u64,
+        after: Option<&str>,
+    ) -> Result<Value> {
+        let size = page_size.min(100);
+        let mut all = params.to_vec();
+        all.push(("page[size]", &size));
+        if let Some(after) = &after {
+            all.push(("page[after]", after));
+        }
+        self.api_get(path, &all).await
+    }
+
+    /// Collect `key` from a cursor-paginated listing, following `links.next` while
+    /// `meta.has_more` is true, until `max_items` have been collected.
+    #[allow(dead_code)] // only tests call it until a cursor-paginated tool lands
+    pub(super) async fn get_cursor_paged(
+        &self,
+        path: &str,
+        params: &[(&str, &(dyn Display + Sync))],
+        key: &str,
+        max_items: usize,
+    ) -> Result<Vec<Value>> {
+        let mut items = Vec::new();
+        let mut seen = HashSet::new();
+        let mut data = self.get_cursor_page(path, params, 100, None).await?;
+        loop {
+            if let Some(page) = data.get(key).and_then(Value::as_array) {
+                items.extend(page.iter().cloned());
+            }
+            if items.len() >= max_items {
+                items.truncate(max_items);
+                break;
+            }
+            if data["meta"]["has_more"].as_bool() != Some(true) {
+                break;
+            }
+            let Some(link) = data["links"]["next"].as_str() else {
+                break;
+            };
+            match self.next_page(&mut seen, link)? {
+                Some(next) => data = self.get_url(next).await?,
+                None => break,
+            }
+        }
+        Ok(items)
+    }
+
+    pub async fn get_job_status(&self, job_id: &str) -> Result<Value> {
+        async {
+            let data = self
+                .api_get(&format!("job_statuses/{job_id}.json"), &[])
+                .await?;
+            Ok(job_summary(object(&data, "job_status")?))
+        }
+        .await
+        .map_err(ctx(format!("Failed to get job status {job_id}")))
+    }
+
+    /// Poll the job in a Zendesk response (`{"job_status": {...}}`) every
+    /// `job_poll_interval` until it is `completed` or `failed`, or `timeout` elapses.
+    /// Returns the trimmed job status; `pending` is true if it is still running.
+    pub(super) async fn wait_for_job(&self, job: &Value, timeout: Duration) -> Result<Value> {
+        let mut status = job_summary(object(job, "job_status")?);
+        let id = status["id"]
+            .as_str()
+            .ok_or_else(|| anyhow!("Zendesk job status has no id"))?
+            .to_string();
+        let deadline = Instant::now() + timeout;
+        while status["pending"] == true && Instant::now() < deadline {
+            tokio::time::sleep(self.job_poll_interval).await;
+            status = self.get_job_status(&id).await?;
+        }
+        Ok(status)
+    }
 }
 
 pub(super) const TICKET_SUMMARY_KEYS: [&str; 9] = [
@@ -425,6 +555,7 @@ pub(super) mod test_support {
             reqwest::Client::new(),
             format!("{}/api/v2", server.uri()),
         )
+        .with_job_poll_interval(Duration::from_millis(1))
     }
 
     pub fn offline_client() -> ZendeskClient {
@@ -549,6 +680,143 @@ mod tests {
                 .contains("Zendesk pagination returned a page it already returned"),
             "{err}"
         );
+    }
+
+    #[tokio::test]
+    async fn empty_put_and_post_bodies_are_null() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(" \n"))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let c = client(&server);
+        assert_eq!(c.api_put("x.json", &json!({})).await.unwrap(), Value::Null);
+        assert_eq!(c.api_post("x.json", &json!({})).await.unwrap(), Value::Null);
+    }
+
+    fn cursor_page(items: Value, next: Option<String>) -> ResponseTemplate {
+        ResponseTemplate::new(200).set_body_json(json!({
+            "things": items,
+            "meta": { "has_more": next.is_some() },
+            "links": { "next": next },
+        }))
+    }
+
+    #[tokio::test]
+    async fn cursor_pages_are_concatenated_following_links_next() {
+        let server = MockServer::start().await;
+        let next = format!(
+            "{}/api/v2/things.json?page%5Bsize%5D=100&page%5Bafter%5D=abc",
+            server.uri()
+        );
+        Mock::given(method("GET"))
+            .and(query_param("page[after]", "abc"))
+            .respond_with(cursor_page(json!([{"id": 2}]), None))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(query_param("page[size]", "100"))
+            .respond_with(cursor_page(json!([{"id": 1}]), Some(next)))
+            .mount(&server)
+            .await;
+        let items = client(&server)
+            .get_cursor_paged("things.json", &[], "things", 1000)
+            .await
+            .unwrap();
+        assert_eq!(items, vec![json!({"id": 1}), json!({"id": 2})]);
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn cursor_next_on_another_host_is_rejected() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(cursor_page(
+                json!([]),
+                Some("https://evil.example/api/v2/things.json".into()),
+            ))
+            .mount(&server)
+            .await;
+        let err = client(&server)
+            .get_cursor_paged("things.json", &[], "things", 1000)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("another host: evil.example"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cursor_paging_stops_at_max_items() {
+        let server = MockServer::start().await;
+        let next = format!("{}/api/v2/things.json?page%5Bafter%5D=abc", server.uri());
+        Mock::given(method("GET"))
+            .respond_with(cursor_page(json!([{"id": 1}, {"id": 2}]), Some(next)))
+            .mount(&server)
+            .await;
+        let items = client(&server)
+            .get_cursor_paged("things.json", &[], "things", 1)
+            .await
+            .unwrap();
+        assert_eq!(items, vec![json!({"id": 1})]);
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    fn job(status: &str) -> ResponseTemplate {
+        ResponseTemplate::new(200).set_body_json(json!({"job_status": {
+            "id": "j1", "status": status, "progress": 1, "total": 2,
+            "results": [{"id": 5, "action": "merge", "status": "Merged", "success": true, "extra": 1}],
+        }}))
+    }
+
+    #[tokio::test]
+    async fn wait_for_job_polls_until_completed() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/job_statuses/j1.json"))
+            .respond_with(job("working"))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/job_statuses/j1.json"))
+            .respond_with(job("completed"))
+            .mount(&server)
+            .await;
+        let first = json!({"job_status": {"id": "j1", "status": "queued"}});
+        let done = client(&server)
+            .wait_for_job(&first, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(done["status"], "completed");
+        assert_eq!(done["pending"], false);
+        assert_eq!(done["message"], Value::Null);
+        assert_eq!(
+            done["results"],
+            json!([{"id": 5, "action": "merge", "status": "Merged", "success": true}])
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn wait_for_job_still_working_at_timeout_is_pending() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(job("working"))
+            .mount(&server)
+            .await;
+        let first = json!({"job_status": {"id": "j1", "status": "queued"}});
+        let out = client(&server)
+            .wait_for_job(&first, Duration::from_millis(30))
+            .await
+            .unwrap();
+        assert_eq!(out["status"], "working");
+        assert_eq!(out["pending"], true);
     }
 
     #[test]

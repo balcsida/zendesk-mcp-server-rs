@@ -437,7 +437,7 @@ Includes `requester_name` and `assignee_name` when Zendesk returns the users.
 
 #### get_tickets_bulk
 
-Fetch multiple tickets by IDs in a single request (max 100).
+Fetch multiple tickets by IDs, requested from Zendesk in batches of 100.
 
 - `ticket_ids` (array[integer])
 
@@ -497,12 +497,20 @@ Permanently delete a ticket. Use with caution.
 
 #### merge_tickets
 
-Merge source tickets into a target ticket.
+Merge source tickets into a target ticket. Zendesk merges in a background job; the tool waits up to 20 seconds and reports whether it completed or is still running (use `get_job_status` to check later).
 
 - `target_id` (integer): The ticket to merge into
 - `source_ids` (array[integer]): Tickets to merge from
 - `target_comment` (string, optional): Defaults to `Merged from related tickets.`
 - `source_comment` (string, optional): Defaults to `This ticket has been merged.`
+- `target_comment_is_public` (boolean, optional): Whether the comment on the target ticket is public (Zendesk defaults to private)
+- `source_comment_is_public` (boolean, optional): Whether the comments on the source tickets are public (Zendesk defaults to private)
+
+#### get_job_status
+
+Get the status of a Zendesk background job, such as a merge that was still running. Returns `id`, `status`, `progress`, `total`, `message`, `url`, `pending` (true while queued or working) and per-item `results`.
+
+- `job_id` (string): The job status ID returned by `merge_tickets` or a bulk operation
 
 #### get_user_tickets
 
