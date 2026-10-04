@@ -814,6 +814,24 @@ List the members of a group as `{id, name, email, role, active, suspended}`. Gro
 
 - `group_id` (integer)
 
+#### get_view_counts
+
+Get ticket counts for up to 20 views at once, as `{view_id, value, pretty, fresh}`. `value` is null while Zendesk is still computing it, so retry later. Limited to 6 calls per minute.
+
+- `view_ids` (array of integers): 1 to 20 view IDs, from `list_views`
+
+#### get_macro
+
+Get one macro with its `actions` (`{field, value}`). Shows exactly what a macro changes before `apply_macro` (preview) or `execute_macro` (save).
+
+- `macro_id` (integer)
+
+#### search_macros
+
+Find macros by title, with their actions. Returns one page of up to 100; `list_macros` returns all of them.
+
+- `query` (string): Text to match against macro titles
+
 #### list_macros
 
 List available macros (canned responses and actions). Returns every page.
@@ -826,6 +844,28 @@ Preview the result of applying a macro to a ticket. Does not save changes.
 
 - `ticket_id` (integer)
 - `macro_id` (integer)
+
+#### execute_macro
+
+Apply a macro to a ticket for real. The changes and comment the macro previews are saved and the macro is recorded in the ticket audit. `apply_macro` only previews. Returns the updated ticket.
+
+- `ticket_id` (integer)
+- `macro_id` (integer)
+
+### Triggers
+
+#### list_triggers
+
+List ticket triggers, the business rules that change tickets automatically, as `{id, title, active, category_id, position, description, updated_at}`. Use with `get_trigger` to explain changes seen in `get_ticket_audits`. Returns every page.
+
+- `active_only` (boolean, optional): Only active triggers (defaults to true)
+- `category_id` (string, optional): Only triggers in this trigger category
+
+#### get_trigger
+
+Get one ticket trigger with its `conditions` (`{all, any}`) and `actions`.
+
+- `trigger_id` (integer)
 
 ### Account
 

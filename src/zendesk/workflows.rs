@@ -17,6 +17,18 @@ const SATISFACTION_SCORES: [&str; 11] = [
     "bad_without_comment",
 ];
 
+const MACRO_DETAIL_KEYS: [&str; 9] = [
+    "id",
+    "title",
+    "description",
+    "active",
+    "position",
+    "restriction",
+    "actions",
+    "created_at",
+    "updated_at",
+];
+
 impl ZendeskClient {
     pub async fn list_views(&self) -> Result<Value> {
         async {
@@ -149,6 +161,200 @@ impl ZendeskClient {
         .map_err(ctx(format!(
             "Failed to apply macro {macro_id} to ticket {ticket_id}"
         )))
+    }
+
+    pub async fn get_view_counts(&self, view_ids: &[u64]) -> Result<Value> {
+        async {
+            if view_ids.is_empty() || view_ids.len() > 20 {
+                bail!(
+                    "view_ids must contain 1 to 20 view IDs, got {}",
+                    view_ids.len()
+                );
+            }
+            let ids = view_ids
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            let data = self
+                .api_get("views/count_many.json", &[("ids", &ids)])
+                .await?;
+            Ok(pick_all(
+                &data,
+                "view_counts",
+                &["view_id", "value", "pretty", "fresh"],
+                &[],
+            ))
+        }
+        .await
+        .map_err(ctx("Failed to get view counts"))
+    }
+
+    pub async fn get_macro(&self, macro_id: u64) -> Result<Value> {
+        async {
+            let data = self
+                .api_get(&format!("macros/{macro_id}.json"), &[])
+                .await?;
+            Ok(pick(
+                object(&data, "macro")?,
+                &MACRO_DETAIL_KEYS,
+                &["actions"],
+            ))
+        }
+        .await
+        .map_err(ctx(format!("Failed to get macro {macro_id}")))
+    }
+
+    /// One page (up to 100) of macros whose title matches `query`; the endpoint is
+    /// offset-only.
+    pub async fn search_macros(&self, query: &str) -> Result<Value> {
+        async {
+            let data = self
+                .api_get(
+                    "macros/search.json",
+                    &[("query", &query), ("per_page", &100)],
+                )
+                .await?;
+            Ok(pick_all(
+                &data,
+                "macros",
+                &["id", "title", "description", "active", "actions"],
+                &["actions"],
+            ))
+        }
+        .await
+        .map_err(ctx("Failed to search macros"))
+    }
+
+    /// Applies a macro for real: previews it, then saves the previewed changes with a
+    /// ticket update that records the macro in the audit.
+    pub async fn execute_macro(&self, ticket_id: u64, macro_id: u64) -> Result<Value> {
+        async {
+            let preview = self
+                .api_get(
+                    &format!("tickets/{ticket_id}/macros/{macro_id}/apply.json"),
+                    &[],
+                )
+                .await?;
+            let changes = &preview["result"]["ticket"];
+            let mut ticket = Map::new();
+            for key in [
+                "status",
+                "priority",
+                "type",
+                "subject",
+                "assignee_id",
+                "group_id",
+                "tags",
+                "custom_status_id",
+            ] {
+                if let Some(v) = changes.get(key).filter(|v| !v.is_null()) {
+                    ticket.insert(key.into(), v.clone());
+                }
+            }
+            if let Some(comment) = changes.get("comment").filter(|c| c.is_object()) {
+                let mut out = Map::new();
+                for key in ["body", "html_body", "public"] {
+                    if let Some(v) = comment.get(key).filter(|v| !v.is_null()) {
+                        out.insert(key.into(), v.clone());
+                    }
+                }
+                ticket.insert("comment".into(), Value::Object(out));
+            }
+            // `fields` is documented as an array but the spec example shows one object.
+            let fields = changes
+                .get("custom_fields")
+                .filter(|f| f.is_array())
+                .or_else(|| changes.get("fields").filter(|f| f.is_array()))
+                .cloned()
+                .or_else(|| {
+                    changes
+                        .get("fields")
+                        .filter(|f| f.is_object())
+                        .map(|f| json!([f]))
+                });
+            if let Some(fields) = fields {
+                ticket.insert("custom_fields".into(), fields);
+            }
+            ticket.insert("macro_ids".into(), json!([macro_id]));
+            let data = self
+                .api_put(
+                    &format!("tickets/{ticket_id}.json"),
+                    &json!({ "ticket": ticket }),
+                )
+                .await?;
+            full_ticket(&data)
+        }
+        .await
+        .map_err(ctx(format!(
+            "Failed to execute macro {macro_id} on ticket {ticket_id}"
+        )))
+    }
+
+    /// Triggers, active ones only by default. Zendesk lists `category_id` only on the
+    /// unfiltered endpoint, so a category filter goes there with `active=true`.
+    pub async fn list_triggers(
+        &self,
+        active_only: bool,
+        category_id: Option<&str>,
+    ) -> Result<Value> {
+        async {
+            let mut params: Vec<(&str, &(dyn Display + Sync))> = Vec::new();
+            let path = match (active_only, &category_id) {
+                (true, None) => "triggers/active.json",
+                (true, Some(_)) => {
+                    params.push(("active", &true));
+                    "triggers.json"
+                }
+                (false, _) => "triggers.json",
+            };
+            if let Some(category_id) = &category_id {
+                params.push(("category_id", category_id));
+            }
+            let triggers = self.get_paged_with(path, &params, "triggers").await?;
+            Ok(pick_all(
+                &json!({ "triggers": triggers }),
+                "triggers",
+                &[
+                    "id",
+                    "title",
+                    "active",
+                    "category_id",
+                    "position",
+                    "description",
+                    "updated_at",
+                ],
+                &[],
+            ))
+        }
+        .await
+        .map_err(ctx("Failed to list triggers"))
+    }
+
+    pub async fn get_trigger(&self, trigger_id: u64) -> Result<Value> {
+        async {
+            let data = self
+                .api_get(&format!("triggers/{trigger_id}.json"), &[])
+                .await?;
+            Ok(pick(
+                object(&data, "trigger")?,
+                &[
+                    "id",
+                    "title",
+                    "description",
+                    "active",
+                    "category_id",
+                    "position",
+                    "conditions",
+                    "actions",
+                    "created_at",
+                    "updated_at",
+                ],
+                &["actions"],
+            ))
+        }
+        .await
+        .map_err(ctx(format!("Failed to get trigger {trigger_id}")))
     }
 
     pub async fn get_sla_breaches(&self, days_back: u64, metric: Option<&str>) -> Result<Value> {
@@ -311,6 +517,150 @@ mod tests {
     use crate::zendesk::test_support::*;
     use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn view_counts_join_ids_and_reject_bad_sizes() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/views/count_many.json"))
+            .and(query_param("ids", "25,78"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"view_counts": [
+                    {"view_id": 25, "value": 719, "pretty": "~700", "fresh": true, "url": "u"},
+                    {"view_id": 78, "value": null, "pretty": "...", "fresh": false}
+                ]})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let c = client(&server);
+        let out = c.get_view_counts(&[25, 78]).await.unwrap();
+        assert_eq!(
+            out[0],
+            json!({"view_id": 25, "value": 719, "pretty": "~700", "fresh": true})
+        );
+        assert!(out[1]["value"].is_null());
+        assert!(c.get_view_counts(&[]).await.is_err());
+        assert!(c.get_view_counts(&[1; 21]).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn get_and_search_macros_include_actions() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/macros/25.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"macro": {
+                "id": 25, "title": "Close", "active": true, "position": 4, "url": "u",
+                "actions": [{"field": "status", "value": "solved"}]
+            }})))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/macros/search.json"))
+            .and(query_param("query", "close"))
+            .respond_with(json_page(
+                "macros",
+                json!([{"id": 25, "title": "Close", "extra": 1}]),
+                None,
+            ))
+            .mount(&server)
+            .await;
+        let c = client(&server);
+        let m = c.get_macro(25).await.unwrap();
+        assert_eq!(m["actions"][0]["field"], "status");
+        assert_eq!(m["position"], 4);
+        assert!(m.get("url").is_none());
+        let found = c.search_macros("close").await.unwrap();
+        assert_eq!(found[0]["id"], 25);
+        assert_eq!(found[0]["actions"], json!([]));
+        assert!(found[0].get("extra").is_none());
+    }
+
+    #[tokio::test]
+    async fn execute_macro_saves_previewed_changes_and_records_the_macro() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/tickets/7/macros/25/apply.json"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"result": {"ticket": {
+                    "status": "solved", "assignee_id": 3, "priority": null, "url": "ignored",
+                    "comment": {"body": "Done", "public": false,
+                                "scoped_body": [["channel:all", "Done"]]},
+                    "fields": [{"id": 9, "value": "x"}]
+                }}})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/api/v2/tickets/7.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ticket": {
+                "id": 7, "status": "solved"
+            }})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let out = client(&server).execute_macro(7, 25).await.unwrap();
+        assert_eq!(out["status"], "solved");
+        let requests = server.received_requests().await.unwrap();
+        let put = requests
+            .iter()
+            .find(|r| r.method.as_str() == "PUT")
+            .unwrap();
+        let body: Value = serde_json::from_slice(&put.body).unwrap();
+        assert_eq!(
+            body,
+            json!({"ticket": {
+                "status": "solved", "assignee_id": 3,
+                "comment": {"body": "Done", "public": false},
+                "custom_fields": [{"id": 9, "value": "x"}],
+                "macro_ids": [25]
+            }})
+        );
+    }
+
+    #[tokio::test]
+    async fn list_triggers_uses_active_endpoint_or_filters_by_category() {
+        let server = MockServer::start().await;
+        let trigger = json!([{"id": 1, "title": "t", "active": true, "category_id": "5",
+            "position": 1, "conditions": {}, "updated_at": "u"}]);
+        Mock::given(method("GET"))
+            .and(path("/api/v2/triggers/active.json"))
+            .respond_with(json_page("triggers", trigger.clone(), None))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/triggers.json"))
+            .and(query_param("category_id", "5"))
+            .and(query_param("active", "true"))
+            .respond_with(json_page("triggers", trigger, None))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let c = client(&server);
+        let out = c.list_triggers(true, None).await.unwrap();
+        assert_eq!(out[0]["category_id"], "5");
+        assert!(out[0].get("conditions").is_none());
+        c.list_triggers(true, Some("5")).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn get_trigger_returns_conditions_and_actions() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/triggers/25.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"trigger": {
+                "id": 25, "title": "Close", "conditions": {"all": [{"field": "status"}], "any": []},
+                "actions": [{"field": "status", "value": "solved"}], "url": "u"
+            }})))
+            .mount(&server)
+            .await;
+        let out = client(&server).get_trigger(25).await.unwrap();
+        assert_eq!(out["conditions"]["all"][0]["field"], "status");
+        assert_eq!(out["actions"][0]["value"], "solved");
+        assert!(out.get("url").is_none());
+    }
 
     #[tokio::test]
     async fn list_macros_concatenates_pages() {

@@ -456,8 +456,14 @@ async fn shutdown_signal() {
 mod tests {
     use super::*;
 
-    const TOOLS: [&str; 64] = [
+    const TOOLS: [&str; 70] = [
         "get_ticket",
+        "get_view_counts",
+        "get_macro",
+        "search_macros",
+        "execute_macro",
+        "list_triggers",
+        "get_trigger",
         "create_ticket",
         "get_tickets",
         "get_ticket_comments",
@@ -534,7 +540,7 @@ mod tests {
     }
 
     #[test]
-    fn lists_exactly_the_64_tools() {
+    fn lists_exactly_the_70_tools() {
         let mut names: Vec<String> = server()
             .tool_router
             .list_all()
