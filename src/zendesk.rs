@@ -142,6 +142,39 @@ fn object<'a>(data: &'a Value, key: &str) -> Result<&'a Value> {
         .ok_or_else(|| anyhow!("Zendesk response has no '{key}' object"))
 }
 
+/// `id -> name` from the `users` Zendesk side-loads when a request asks for `include=users`.
+fn side_loaded_user_names(data: &Value) -> std::collections::HashMap<u64, String> {
+    data.get("users")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|u| Some((u.get("id")?.as_u64()?, u.get("name")?.as_str()?.to_string())))
+        .collect()
+}
+
+/// Add `requester_name`/`assignee_name` to `out` by resolving `raw`'s `requester_id` and
+/// `assignee_id` against the side-loaded `names`. Left unset when Zendesk didn't side-load
+/// the user (e.g. it was deleted, or the caller didn't request `include=users`).
+fn with_user_names(
+    mut out: Value,
+    raw: &Value,
+    names: &std::collections::HashMap<u64, String>,
+) -> Value {
+    for (id_key, name_key) in [
+        ("requester_id", "requester_name"),
+        ("assignee_id", "assignee_name"),
+    ] {
+        if let Some(name) = raw
+            .get(id_key)
+            .and_then(Value::as_u64)
+            .and_then(|id| names.get(&id))
+        {
+            out[name_key] = json!(name);
+        }
+    }
+    out
+}
+
 /// Prefix an error the way the Python server worded it.
 fn ctx(prefix: impl Display) -> impl FnOnce(anyhow::Error) -> anyhow::Error {
     move |e| anyhow!("{prefix}: {e:#}")
@@ -333,7 +366,10 @@ impl ZendeskClient {
     pub async fn get_ticket(&self, ticket_id: u64) -> Result<Value> {
         async {
             let data = self
-                .api_get(&format!("tickets/{ticket_id}.json"), &[])
+                .api_get(
+                    &format!("tickets/{ticket_id}.json"),
+                    &[("include", &"users")],
+                )
                 .await?;
             let ticket = object(&data, "ticket")?;
             let mut out = pick(
@@ -353,6 +389,7 @@ impl ZendeskClient {
                 &[],
             );
             out["custom_fields"] = custom_fields(ticket);
+            out = with_user_names(out, ticket, &side_loaded_user_names(&data));
             Ok(out)
         }
         .await
@@ -501,9 +538,11 @@ impl ZendeskClient {
                         ("per_page", &per_page),
                         ("sort_by", &sort_by),
                         ("sort_order", &sort_order),
+                        ("include", &"users"),
                     ],
                 )
                 .await?;
+            let names = side_loaded_user_names(&data);
             let tickets: Vec<Value> = data
                 .get("tickets")
                 .and_then(Value::as_array)
@@ -527,7 +566,7 @@ impl ZendeskClient {
                     );
                     out["custom_fields"] =
                         t.get("custom_fields").cloned().unwrap_or_else(|| json!([]));
-                    out
+                    with_user_names(out, t, &names)
                 })
                 .collect();
             let has_next = !data["next_page"].is_null();
@@ -757,11 +796,26 @@ impl ZendeskClient {
                         ("per_page", &per_page),
                         ("sort_by", &sort_by),
                         ("sort_order", &sort_order),
+                        ("include", &"tickets(users)"),
                     ],
                 )
                 .await?;
+            let names = side_loaded_user_names(&data);
+            let results = data
+                .get("results")
+                .and_then(Value::as_array)
+                .map(|results| {
+                    results
+                        .iter()
+                        .map(|r| match r.get("result_type").and_then(Value::as_str) {
+                            Some("ticket") => with_user_names(r.clone(), r, &names),
+                            _ => r.clone(),
+                        })
+                        .collect()
+                })
+                .unwrap_or_else(|| json!([]));
             Ok(json!({
-                "results": data.get("results").cloned().unwrap_or(json!([])),
+                "results": results,
                 "count": data.get("count").cloned().unwrap_or(json!(0)),
                 "page": page,
                 "per_page": per_page,
@@ -1307,6 +1361,45 @@ mod tests {
                 "custom_fields": [{"id": 9, "value": "x"}]
             })
         );
+    }
+
+    #[tokio::test]
+    async fn get_ticket_adds_requester_and_assignee_names_from_side_loaded_users() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/tickets/7.json"))
+            .and(query_param("include", "users"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ticket": {
+                    "id": 7, "subject": "s", "description": "d", "status": "open",
+                    "created_at": "c", "updated_at": "u",
+                    "requester_id": 1, "assignee_id": 2
+                },
+                "users": [
+                    {"id": 1, "name": "Alice"},
+                    {"id": 2, "name": "Bob"}
+                ]
+            })))
+            .mount(&server)
+            .await;
+        let out = client(&server).get_ticket(7).await.unwrap();
+        assert_eq!(out["requester_name"], "Alice");
+        assert_eq!(out["assignee_name"], "Bob");
+    }
+
+    #[tokio::test]
+    async fn get_ticket_omits_names_when_zendesk_did_not_side_load_users() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/tickets/7.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ticket": {
+                "id": 7, "requester_id": 1, "assignee_id": null
+            }})))
+            .mount(&server)
+            .await;
+        let out = client(&server).get_ticket(7).await.unwrap();
+        assert!(out.get("requester_name").is_none());
+        assert!(out.get("assignee_name").is_none());
     }
 
     #[tokio::test]

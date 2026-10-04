@@ -417,13 +417,15 @@ Fetch the latest tickets with pagination support.
 - `sort_by` (string, optional): `created_at`, `updated_at`, `priority` or `status` (defaults to `created_at`)
 - `sort_order` (string, optional): `asc` or `desc` (defaults to `desc`)
 
-Returns tickets with id, subject, status, priority, description, timestamps and assignee, plus pagination metadata.
+Returns tickets with id, subject, status, priority, description, timestamps, requester and assignee (with `requester_name` and `assignee_name` when Zendesk returns the users), plus pagination metadata.
 
 #### get_ticket
 
 Retrieve a Zendesk ticket by its ID.
 
 - `ticket_id` (integer)
+
+Includes `requester_name` and `assignee_name` when Zendesk returns the users.
 
 #### get_tickets_bulk
 
@@ -514,6 +516,8 @@ Search with Zendesk Query Language (ZQL) across tickets, users and organizations
 - `per_page` (integer, optional): Max 100 (defaults to 25)
 - `sort_by` (string, optional): `relevance`, `updated_at`, `created_at`, `priority`, `status`, `ticket_type` (defaults to `relevance`)
 - `sort_order` (string, optional): `asc` or `desc` (defaults to `desc`)
+
+Ticket results include `requester_name` and `assignee_name` when Zendesk returns the users.
 
 ### Users and organizations
 
