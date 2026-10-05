@@ -252,7 +252,8 @@ The first match wins:
    docker build -t zendesk-mcp-server-rs .
    ```
 
-The image runs as the non-root user `appuser` (uid 10001). It stores tokens in
+The image is built on distroless (`gcr.io/distroless/cc-debian12`), so it has no shell, and
+runs as the non-root user `nonroot` (uid 65532). It stores tokens in
 `/tokens` (`ZENDESK_TOKEN_FILE=/tokens/tokens.json` and
 `ZENDESK_MOBILE_TOKEN_FILE=/tokens/mobile_token.json`). Mount a named volume there
 so tokens survive restarts. The server rewrites the file each time it rotates the
