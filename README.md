@@ -264,7 +264,8 @@ runs as the non-root user `nonroot` (uid 65532). It stores tokens in
 `/tokens` (`ZENDESK_TOKEN_FILE=/tokens/tokens.json` and
 `ZENDESK_MOBILE_TOKEN_FILE=/tokens/mobile_token.json`). Mount a named volume there
 so tokens survive restarts. The server rewrites the file each time it rotates the
-refresh token, so the mount must be writable.
+refresh token, so the mount must be writable. A bind-mounted directory must be
+writable by uid 65532 (for example `chown 65532:65532 ./tokens`).
 
 ### Authorize on a headless server
 

@@ -32,5 +32,6 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
       - run: |
-          docker run --rm zendesk-mcp-server-rs:ci --help
+          docker run --rm zendesk-mcp-server-rs:ci --version |
+            grep '^zendesk-mcp-server '
           docker image inspect -f '{{.Size}} bytes' zendesk-mcp-server-rs:ci

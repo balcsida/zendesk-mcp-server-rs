@@ -21,7 +21,7 @@ FROM gcr.io/distroless/cc-debian12:nonroot AS runtime
 
 COPY --from=builder /src/target/release/zendesk-mcp-server /usr/local/bin/zendesk-mcp-server
 # Distroless has no shell, so the token directory is created in the builder stage.
-COPY --from=builder --chown=65532:65532 /tokens /tokens
+COPY --from=builder --chown=65532:65532 --chmod=700 /tokens /tokens
 
 # Inside a container the network namespace is the boundary, so `http` listens on
 # every interface; publish the port with -p to expose it.
