@@ -15,7 +15,8 @@ It offers:
 
 ## Setup
 
-- Build: `cargo install --path .` or `cargo build --release` (the binary is `target/release/zendesk-mcp-server`).
+- Install: download the archive for your platform from the [releases](https://github.com/balcsida/zendesk-mcp-server-rs/releases) page: `zendesk-mcp-server-x86_64-unknown-linux-gnu.tar.gz`, `zendesk-mcp-server-aarch64-unknown-linux-gnu.tar.gz`, `zendesk-mcp-server-aarch64-apple-darwin.tar.gz`, `zendesk-mcp-server-x86_64-apple-darwin.tar.gz` or `zendesk-mcp-server-x86_64-pc-windows-msvc.zip` (each has a `.sha256` file). Unpack it and put `zendesk-mcp-server` on your `PATH`.
+- Build from source: `cargo install --path .` or `cargo build --release` (the binary is `target/release/zendesk-mcp-server`).
 - Configure authentication: see [Authentication](#authentication).
 - Configure Claude Desktop (or any MCP client that runs a command over stdio):
 
@@ -246,24 +247,32 @@ The first match wins:
 ## Docker
 
 1. Copy `.env.example` to `.env` and fill in your Zendesk configuration. Keep this file outside version control.
-2. Build the image:
+2. Pull the published image (`ghcr.io/balcsida/zendesk-mcp-server-rs`; tags `latest`, `0.1` and `0.1.0`; linux/amd64 and linux/arm64):
 
    ```bash
-   docker build -t zendesk-mcp-server-rs .
+   docker pull ghcr.io/balcsida/zendesk-mcp-server-rs:latest
    ```
 
-The image runs as the non-root user `appuser` (uid 10001). It stores tokens in
+   Or build it locally:
+
+   ```bash
+   docker build -t ghcr.io/balcsida/zendesk-mcp-server-rs .
+   ```
+
+The image is built on distroless (`gcr.io/distroless/cc-debian12`), so it has no shell, and
+runs as the non-root user `nonroot` (uid 65532). It stores tokens in
 `/tokens` (`ZENDESK_TOKEN_FILE=/tokens/tokens.json` and
 `ZENDESK_MOBILE_TOKEN_FILE=/tokens/mobile_token.json`). Mount a named volume there
 so tokens survive restarts. The server rewrites the file each time it rotates the
-refresh token, so the mount must be writable.
+refresh token, so the mount must be writable. A bind-mounted directory must be
+writable by uid 65532 (for example `chown 65532:65532 ./tokens`).
 
 ### Authorize on a headless server
 
 Run the paste-based flow once, with the token volume mounted:
 
 ```bash
-docker run -it --rm --env-file .env -v zendesk-tokens:/tokens zendesk-mcp-server-rs auth --manual
+docker run -it --rm --env-file .env -v zendesk-tokens:/tokens ghcr.io/balcsida/zendesk-mcp-server-rs auth --manual
 ```
 
 ### stdio
@@ -271,7 +280,7 @@ docker run -it --rm --env-file .env -v zendesk-tokens:/tokens zendesk-mcp-server
 Add `-i` when wiring the container to an MCP client over stdin/stdout:
 
 ```bash
-docker run --rm -i --env-file .env -v zendesk-tokens:/tokens zendesk-mcp-server-rs
+docker run --rm -i --env-file .env -v zendesk-tokens:/tokens ghcr.io/balcsida/zendesk-mcp-server-rs
 ```
 
 Claude Code or Claude Desktop configuration:
@@ -285,7 +294,7 @@ Claude Code or Claude Desktop configuration:
         "run", "--rm", "-i",
         "--env-file", "/path/to/.env",
         "-v", "zendesk-tokens:/tokens",
-        "zendesk-mcp-server-rs"
+        "ghcr.io/balcsida/zendesk-mcp-server-rs"
       ]
     }
   }
@@ -300,7 +309,7 @@ docker run -d --name zendesk-mcp \
   -e MCP_BEARER_TOKEN=change-me \
   -v zendesk-tokens:/tokens \
   -p 8080:8080 \
-  zendesk-mcp-server-rs http
+  ghcr.io/balcsida/zendesk-mcp-server-rs http
 ```
 
 Inside the image `http` listens on `0.0.0.0:8080` by default.
@@ -409,6 +418,12 @@ cargo fmt --check
 ```
 
 The tests use mocked HTTP and never contact Zendesk.
+
+### Releasing
+
+Bump `version` in `Cargo.toml`, commit, tag `vX.Y.Z` and push the tag. The release
+workflow builds the five binaries and the two-arch image, then publishes the draft
+release once everything has succeeded.
 
 ## Troubleshooting
 

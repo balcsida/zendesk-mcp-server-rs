@@ -27,4 +27,11 @@ jobs:
       - uses: docker/build-push-action@v6
         with:
           context: .
-          push: false
+          load: true
+          tags: zendesk-mcp-server-rs:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - run: |
+          docker run --rm zendesk-mcp-server-rs:ci --version |
+            grep '^zendesk-mcp-server '
+          docker image inspect -f '{{.Size}} bytes' zendesk-mcp-server-rs:ci
