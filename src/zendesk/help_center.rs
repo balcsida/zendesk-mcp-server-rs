@@ -1,3 +1,5 @@
+use std::collections::{BTreeSet, HashMap};
+
 use anyhow::{Result, bail};
 use serde_json::{Map, Value, json};
 
@@ -51,39 +53,51 @@ fn article_detail(article: &Value) -> Value {
 }
 
 impl ZendeskClient {
+    /// Every article in the sections the caller can view, grouped by section ID.
     pub async fn get_all_articles(&self) -> Result<Value> {
         async {
-            let mut kb = Map::new();
-            for section in self
-                .get_paged("help_center/sections.json", "sections")
-                .await?
-            {
-                let id = &section["id"];
-                // A section's articles live under its own locale; the locale-less path only
-                // serves the default one, so non-English help centers came back empty
-                // (upstream issue #10).
-                let path = match section.get("locale").and_then(Value::as_str) {
-                    Some(locale) => {
-                        format!(
-                            "help_center/{}/sections/{id}/articles.json",
-                            segment(locale)?
-                        )
-                    }
-                    None => format!("help_center/sections/{id}/articles.json"),
-                };
-                let articles = self.get_paged(&path, "articles").await?;
-                let articles: Vec<Value> = articles
-                    .iter()
-                    .map(|a| {
-                        let mut out = pick(a, &["id", "title", "body", "updated_at"], &[]);
+            let sections = self
+                .get_cursor_paged("help_center/sections.json", &[], "sections", usize::MAX)
+                .await?;
+            // A section's articles live under its own locale; the locale-less path only
+            // serves the default one, so non-English help centers came back empty
+            // (upstream issue #10).
+            let locale_of: HashMap<u64, Option<&str>> = sections
+                .iter()
+                .filter_map(|s| Some((s["id"].as_u64()?, s["locale"].as_str())))
+                .collect();
+            let locales: BTreeSet<Option<&str>> = locale_of.values().copied().collect();
+            // One listing per locale rather than one per section: tens of requests, not
+            // hundreds.
+            let mut by_section: HashMap<u64, Vec<Value>> = HashMap::new();
+            for locale in locales {
+                let path = format!("{}/articles.json", help_center_path(locale)?);
+                for a in self
+                    .get_cursor_paged(&path, &[], "articles", usize::MAX)
+                    .await?
+                {
+                    let Some(section_id) = a["section_id"].as_u64() else {
+                        continue;
+                    };
+                    // Skip translations whose section is listed under another locale, and
+                    // articles in sections the caller cannot view.
+                    if locale_of.get(&section_id) == Some(&locale) {
+                        let mut out = pick(&a, &["id", "title", "body", "updated_at"], &[]);
                         out["url"] = a["html_url"].clone();
-                        out
-                    })
-                    .collect();
+                        by_section.entry(section_id).or_default().push(out);
+                    }
+                }
+            }
+            let mut kb = Map::new();
+            for section in &sections {
+                let articles = section["id"]
+                    .as_u64()
+                    .and_then(|id| by_section.remove(&id))
+                    .unwrap_or_default();
                 // Keyed by ID: names repeat across categories, and a name key let a later
                 // section overwrite an earlier one.
                 kb.insert(
-                    id.to_string(),
+                    section["id"].to_string(),
                     json!({
                         "name": section["name"],
                         "description": section["description"],
@@ -428,7 +442,7 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[tokio::test]
-    async fn knowledge_base_keeps_sections_that_share_a_name() {
+    async fn knowledge_base_lists_articles_once_per_section_locale() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/v2/help_center/sections.json"))
@@ -436,28 +450,52 @@ mod tests {
                 "sections",
                 json!([
                     {"id": 1, "name": "FAQ", "description": "a", "locale": "en-us"},
-                    {"id": 2, "name": "FAQ", "description": "b", "locale": "en-us"}
+                    {"id": 2, "name": "FAQ", "description": "b", "locale": "en-us"},
+                    {"id": 3, "name": "Ajuda", "description": "c", "locale": "pt-br"}
                 ]),
                 None,
             ))
             .mount(&server)
             .await;
-        for id in [1, 2] {
+        let article = |id: u64, section_id: u64| {
+            json!({"id": id, "section_id": section_id, "title": "t", "body": "b",
+                "updated_at": "u", "html_url": "h"})
+        };
+        // Article 30 is in a section the caller cannot view; the pt-br listing also holds a
+        // translation of article 10, whose section is listed under en-us.
+        for (locale, articles) in [
+            (
+                "en-us",
+                json!([article(10, 1), article(20, 2), article(30, 9)]),
+            ),
+            ("pt-br", json!([article(40, 3), article(10, 1)])),
+        ] {
             Mock::given(method("GET"))
-                .and(path(format!("/api/v2/help_center/en-us/sections/{id}/articles.json")))
-                .respond_with(json_page(
-                    "articles",
-                    json!([{"id": id * 10, "title": "t", "body": "b", "updated_at": "u", "html_url": "h"}]),
-                    None,
-                ))
+                .and(path(format!("/api/v2/help_center/{locale}/articles.json")))
+                .and(query_param("page[size]", "100"))
+                .respond_with(json_page("articles", articles, None))
+                .expect(1)
                 .mount(&server)
                 .await;
         }
         let kb = client(&server).get_all_articles().await.unwrap();
+        let ids = |section: &str| -> Vec<Value> {
+            kb[section]["articles"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|a| a["id"].clone())
+                .collect()
+        };
         assert_eq!(kb["1"]["name"], "FAQ");
         assert_eq!(kb["2"]["name"], "FAQ");
-        assert_eq!(kb["1"]["articles"][0]["id"], 10);
-        assert_eq!(kb["2"]["articles"][0]["id"], 20);
+        assert_eq!(ids("1"), [json!(10)]);
+        assert_eq!(ids("2"), [json!(20)]);
+        assert_eq!(ids("3"), [json!(40)]);
+        assert_eq!(
+            kb["1"]["articles"][0],
+            json!({"id": 10, "title": "t", "body": "b", "updated_at": "u", "url": "h"})
+        );
     }
 
     #[tokio::test]
