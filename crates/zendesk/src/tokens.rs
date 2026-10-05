@@ -256,13 +256,13 @@ impl TokenStore {
     }
 
     /// Read and parse the token file. The error for a missing file tells the operator
-    /// to run `zendesk-mcp-server auth`.
+    /// to run `zendesk-mcp-server auth` (or `zendesk auth`).
     pub fn load(&self) -> Result<TokenSet> {
         let path = self.path.display();
         let raw = fs::read_to_string(&self.path).map_err(|err| {
             if err.kind() == std::io::ErrorKind::NotFound {
                 anyhow!(
-                    "No Zendesk OAuth tokens found at {path}. Run zendesk-mcp-server auth to \
+                    "No Zendesk OAuth tokens found at {path}. Run zendesk-mcp-server auth (or zendesk auth) to \
                      authorize this machine."
                 )
             } else {
@@ -272,7 +272,7 @@ impl TokenStore {
         serde_json::from_str(&raw).map_err(|err| {
             anyhow!(
                 "Token store at {path} is not valid JSON or is missing a field ({err}). \
-                 Re-run zendesk-mcp-server auth to recreate it."
+                 Re-run zendesk-mcp-server auth (or zendesk auth) to recreate it."
             )
         })
     }

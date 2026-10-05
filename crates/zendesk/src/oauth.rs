@@ -123,7 +123,7 @@ fn token_error(status: u16, body: &[u8]) -> anyhow::Error {
     match error {
         Some("invalid_grant") => anyhow!(
             "{message}\nThe authorization code or refresh token is expired, revoked or already \
-             used. Run zendesk-mcp-server auth to authorize again."
+             used. Run zendesk-mcp-server auth (or zendesk auth) to authorize again."
         ),
         Some("invalid_scope") => anyhow!(
             "{message}\nThe requested scopes exceed the OAuth client's allowed scopes. Widen \
@@ -195,7 +195,7 @@ async fn refresh_at(
     let Some(refresh_token) = tokens.refresh_token.as_deref() else {
         bail!(
             "No refresh token is stored, so the access token cannot be renewed. Run \
-             zendesk-mcp-server auth to authorize again."
+             zendesk-mcp-server auth (or zendesk auth) to authorize again."
         );
     };
     let issued_at = Utc::now();
@@ -297,7 +297,7 @@ impl OAuthProvider {
                 {
                     tracing::warn!(
                         "The stored Zendesk tokens were issued for subdomain {} and client {}, \
-                         not the configured {} and {}. Re-run zendesk-mcp-server auth if \
+                         not the configured {} and {}. Re-run zendesk-mcp-server auth (or zendesk auth) if \
                          requests fail.",
                         tokens.subdomain,
                         tokens.client_id,
@@ -329,7 +329,7 @@ impl OAuthProvider {
     /// "this really does need refreshing", since a rejected token can still look unexpired.
     /// Without a rejected token, an unexpired stored token counts as already renewed.
     ///
-    /// Fails with a message telling the operator to run `zendesk-mcp-server auth` when
+    /// Fails with a message telling the operator to run `zendesk-mcp-server auth` (or `zendesk auth`) when
     /// the refresh token is missing or expired, or Zendesk answers `invalid_grant`.
     pub async fn renew(&self, reason: &str, rejected_token: Option<&str>) -> Result<TokenSet> {
         let mut cached = self.tokens.lock().await;
@@ -357,7 +357,7 @@ impl OAuthProvider {
         if !stored.can_refresh() {
             bail!(
                 "The Zendesk refresh token is missing or expired, so access cannot be renewed \
-                 ({reason}). Run zendesk-mcp-server auth to authorize this machine again."
+                 ({reason}). Run zendesk-mcp-server auth (or zendesk auth) to authorize this machine again."
             );
         }
 

@@ -29,8 +29,6 @@ enum Command {
         #[arg(long)]
         manual: bool,
     },
-    /// Sign in through the Zendesk mobile app's OAuth flow (no OAuth client needed).
-    MobileAuth,
 }
 
 #[tokio::main]
@@ -58,6 +56,5 @@ async fn main() -> Result<()> {
             let code = zendesk::authorize::run(http, manual).await?;
             std::process::exit(code);
         }
-        Command::MobileAuth => zendesk::mobile_auth::run_auth_cli(http).await,
     }
 }

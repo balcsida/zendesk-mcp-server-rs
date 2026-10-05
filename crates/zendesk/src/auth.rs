@@ -9,7 +9,6 @@ use anyhow::Result;
 use base64::Engine;
 
 use crate::config::Credentials;
-use crate::mobile_auth;
 use crate::oauth::OAuthProvider;
 
 // `OAuth` is the protocol's name, not a stutter of the enum's.
@@ -85,14 +84,9 @@ impl Auth {
         }
     }
 
-    /// Build the credential described by the environment. For `Credentials::Mobile` this
-    /// may verify a saved token or open a browser. Returns the subdomain to talk to as well,
-    /// because the mobile flow can supply it from the saved token.
-    pub async fn from_credentials(
-        creds: &Credentials,
-        http: &reqwest::Client,
-    ) -> Result<(String, Auth)> {
-        Ok(match creds {
+    /// Build the credential described by the environment, with the subdomain to talk to.
+    pub fn from_credentials(creds: &Credentials, http: &reqwest::Client) -> (String, Auth) {
+        match creds {
             Credentials::OAuth(settings) => (
                 settings.subdomain.clone(),
                 Auth::OAuth(Arc::new(OAuthProvider::new(settings.clone(), http.clone()))),
@@ -109,11 +103,7 @@ impl Auth {
             Credentials::SessionCookie { subdomain, cookie } => {
                 (subdomain.clone(), Auth::session_cookie(cookie))
             }
-            Credentials::Mobile { subdomain } => {
-                let token = mobile_auth::ensure_auth(http, subdomain.as_deref()).await?;
-                (token.subdomain.clone(), Auth::bearer(&token.access_token))
-            }
-        })
+        }
     }
 
     /// The credential to attach right now. For OAuth this refreshes a token that is

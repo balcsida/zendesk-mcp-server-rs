@@ -22,7 +22,7 @@ use rmcp::{
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::sync::{Mutex, OnceCell};
+use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tower_http::validate_request::ValidateRequestHeaderLayer;
 
@@ -78,12 +78,7 @@ pub struct ZendeskServer {
 /// Whose Zendesk login the tools act with.
 enum Login {
     /// The server's own, described by the environment.
-    Shared {
-        credentials: Credentials,
-        /// Built on first use so a configuration or sign-in problem surfaces as a tool
-        /// error the MCP client can display, and is retried on the next call.
-        client: OnceCell<Arc<ZendeskClient>>,
-    },
+    Shared(Arc<ZendeskClient>),
     /// Each caller's own: the Zendesk token their HTTP request carries as its bearer
     /// token, held in [`CALLER`] while the request is served.
     PerUser {
@@ -143,13 +138,9 @@ mod workflows;
 impl ZendeskServer {
     /// A server acting with its own Zendesk login, described by `credentials`.
     pub fn new(credentials: Credentials, http: reqwest::Client) -> Self {
-        Self::with_login(
-            Login::Shared {
-                credentials,
-                client: OnceCell::new(),
-            },
-            http,
-        )
+        let (subdomain, auth) = Auth::from_credentials(&credentials, &http);
+        let client = Arc::new(ZendeskClient::new(&subdomain, auth, http.clone()));
+        Self::with_login(Login::Shared(client), http)
     }
 
     /// A server acting as each caller, with the Zendesk token their request carries.
@@ -184,7 +175,7 @@ impl ZendeskServer {
     }
 
     /// The client to act through: in per-user mode the caller's own, otherwise the
-    /// shared one, authenticating on first use.
+    /// shared one.
     pub async fn client(&self) -> Result<Arc<ZendeskClient>> {
         match &*self.login {
             Login::PerUser {
@@ -202,20 +193,7 @@ impl ZendeskServer {
                     base_url.clone(),
                 )))
             }
-            Login::Shared {
-                credentials,
-                client,
-            } => client
-                .get_or_try_init(|| async {
-                    let (subdomain, auth) = Auth::from_credentials(credentials, &self.http).await?;
-                    Ok(Arc::new(ZendeskClient::new(
-                        &subdomain,
-                        auth,
-                        self.http.clone(),
-                    )))
-                })
-                .await
-                .cloned(),
+            Login::Shared(client) => Ok(client.clone()),
         }
     }
 
@@ -610,7 +588,7 @@ fn http_router(
 pub async fn run(transport: Transport, http: reqwest::Client) -> Result<()> {
     let args = match transport {
         Transport::Stdio => {
-            let server = signed_in_server(http).await?;
+            let server = signed_in_server(http)?;
             tracing::info!("Serving MCP over stdio");
             server
                 .serve(rmcp::transport::stdio())
@@ -637,7 +615,7 @@ pub async fn run(transport: Transport, http: reqwest::Client) -> Result<()> {
                 "MCP_BEARER_TOKEN (or --bearer-token) is required for the http transport so the Zendesk credentials are not exposed to anyone who can reach the port. To have each caller use their own Zendesk token instead, set MCP_PER_USER_AUTH=true."
             );
         };
-        (signed_in_server(http).await?, Some(token))
+        (signed_in_server(http)?, Some(token))
     };
     let ct = CancellationToken::new();
     let router = http_router(server, shared_token.as_deref(), ct.clone());
@@ -655,14 +633,14 @@ pub async fn run(transport: Transport, http: reqwest::Client) -> Result<()> {
     Ok(())
 }
 
-/// A server acting with its own Zendesk login from the environment, authenticated up
-/// front so a browser sign-in happens at startup, not mid-call.
-async fn signed_in_server(http: reqwest::Client) -> Result<ZendeskServer> {
-    let server = ZendeskServer::new(config::load_credentials()?, http);
-    if let Err(e) = server.client().await {
-        tracing::error!("Zendesk authentication failed: {e:#}");
-    }
-    Ok(server)
+/// A server acting with its own Zendesk login from the environment.
+fn signed_in_server(http: reqwest::Client) -> Result<ZendeskServer> {
+    let credentials = config::load_credentials()?.ok_or_else(|| {
+        anyhow!(
+            "No Zendesk credentials are configured. Set ZENDESK_CLIENT_ID and run `zendesk-mcp-server auth`, or set ZENDESK_OAUTH_TOKEN, ZENDESK_EMAIL + ZENDESK_API_KEY, or ZENDESK_SESSION_COOKIE. A token from `zendesk mobile-auth` can be passed as ZENDESK_OAUTH_TOKEN=$(zendesk token)."
+        )
+    })?;
+    Ok(ZendeskServer::new(credentials, http))
 }
 
 /// Ctrl-C, or SIGTERM (what `docker stop` sends to PID 1).
