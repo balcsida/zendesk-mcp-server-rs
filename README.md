@@ -287,7 +287,7 @@ ZENDESK_OAUTH_TOKEN=$(zendesk token) zendesk-mcp-server
 ## Docker
 
 1. Copy `.env.example` to `.env` and fill in your Zendesk configuration. Keep this file outside version control.
-2. Pull the published image (`ghcr.io/balcsida/zendesk-mcp-server`; tags `latest`, `MAJOR.MINOR` and `MAJOR.MINOR.PATCH`, published from the next release on; linux/amd64 and linux/arm64):
+2. Pull the published image (`ghcr.io/balcsida/zendesk-mcp-server`; tags `latest`, `MAJOR.MINOR` and `MAJOR.MINOR.PATCH`, published from 0.2.0 on; linux/amd64 and linux/arm64):
 
    ```bash
    docker pull ghcr.io/balcsida/zendesk-mcp-server:latest
