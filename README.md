@@ -399,7 +399,7 @@ If sign-in times out after 5 minutes:
 
 ## Resources
 
-- `zendesk://knowledge-base`: all Help Center articles.
+- `zendesk://knowledge-base`: all Help Center articles in the sections you can view, keyed by section ID.
 
 ## Prompts
 

@@ -80,11 +80,12 @@ impl ZendeskClient {
                         out
                     })
                     .collect();
-                let name = section["name"].as_str().unwrap_or_default().to_string();
+                // Keyed by ID: names repeat across categories, and a name key let a later
+                // section overwrite an earlier one.
                 kb.insert(
-                    name,
+                    id.to_string(),
                     json!({
-                        "section_id": section["id"],
+                        "name": section["name"],
                         "description": section["description"],
                         "articles": articles,
                     }),
@@ -425,6 +426,39 @@ mod tests {
     use crate::zendesk::test_support::*;
     use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn knowledge_base_keeps_sections_that_share_a_name() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/help_center/sections.json"))
+            .respond_with(json_page(
+                "sections",
+                json!([
+                    {"id": 1, "name": "FAQ", "description": "a", "locale": "en-us"},
+                    {"id": 2, "name": "FAQ", "description": "b", "locale": "en-us"}
+                ]),
+                None,
+            ))
+            .mount(&server)
+            .await;
+        for id in [1, 2] {
+            Mock::given(method("GET"))
+                .and(path(format!("/api/v2/help_center/en-us/sections/{id}/articles.json")))
+                .respond_with(json_page(
+                    "articles",
+                    json!([{"id": id * 10, "title": "t", "body": "b", "updated_at": "u", "html_url": "h"}]),
+                    None,
+                ))
+                .mount(&server)
+                .await;
+        }
+        let kb = client(&server).get_all_articles().await.unwrap();
+        assert_eq!(kb["1"]["name"], "FAQ");
+        assert_eq!(kb["2"]["name"], "FAQ");
+        assert_eq!(kb["1"]["articles"][0]["id"], 10);
+        assert_eq!(kb["2"]["articles"][0]["id"], 20);
+    }
 
     #[tokio::test]
     async fn list_articles_pages_one_section_or_all_without_bodies() {
