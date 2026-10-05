@@ -84,7 +84,7 @@ struct UpdateTicketsBulkParams {
 #[tool_router(router = ticket_ops_router, vis = "pub(super)")]
 impl ZendeskServer {
     #[tool(
-        description = "List soft-deleted tickets from the last 30 days (id, subject, deleted_at, actor, previous_state). Limited to 10 requests per minute. restore_deleted_ticket undoes a deletion.",
+        description = "List soft-deleted tickets from the last 30 days (id, subject, deleted_at, actor, previous_state). Needs permission to view deleted tickets: admins have it, agents only if their role grants it, otherwise 403. Limited to 10 requests per minute. restore_deleted_ticket undoes a deletion.",
         annotations(read_only_hint = true)
     )]
     async fn list_deleted_tickets(

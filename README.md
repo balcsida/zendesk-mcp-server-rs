@@ -597,7 +597,7 @@ Add and/or remove specific tags on a ticket and return its current tags. Unlike 
 
 #### list_deleted_tickets
 
-List soft-deleted tickets from the last 30 days: `id`, `subject`, `deleted_at`, `actor` (`id`, `name`) and `previous_state`. Zendesk limits this to 10 requests per minute. `restore_deleted_ticket` undoes a deletion.
+List soft-deleted tickets from the last 30 days: `id`, `subject`, `deleted_at`, `actor` (`id`, `name`) and `previous_state`. Needs permission to view deleted tickets: admins have it, and agents only if their role grants it; otherwise 403. Zendesk limits this to 10 requests per minute. `restore_deleted_ticket` undoes a deletion.
 
 - `page` (integer, optional): Defaults to 1
 - `per_page` (integer, optional): Max 100 (defaults to 25)
@@ -1037,7 +1037,7 @@ Find tickets that breached SLA within a time period. Admin-only. It reads Zendes
 
 #### get_sla_policies
 
-Get all SLA policies with their metric targets per priority level. No inputs.
+Get all SLA policies with their metric targets per priority level. Admin-only: agents get 403. No inputs.
 
 #### list_satisfaction_ratings
 

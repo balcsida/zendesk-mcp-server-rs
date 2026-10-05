@@ -78,7 +78,7 @@ const INSTRUCTIONS: &str = "Zendesk server. Tool families: tickets and comments;
 
 Conventions: list tools page with page/per_page or page_size/after_cursor and report has_more. update_tickets_bulk and merge_tickets return a job result; follow it with get_job_status. update_ticket's tags replace the whole list; use update_ticket_tags to add or remove tags. Attachments: get_ticket_comments gives content_url for get_ticket_attachment; upload_attachment gives tokens to attach to comments.
 
-Admin-only: get_sla_breaches, list_satisfaction_ratings, list_suspended_tickets.
+Admin-only: get_sla_breaches, get_sla_policies, list_satisfaction_ratings, list_suspended_tickets. list_deleted_tickets needs a role that can view deleted tickets.
 
 Cautions: delete_ticket, merge_tickets, mark_ticket_as_spam, redact_comment_text, make_comment_private and update_tickets_bulk are destructive and flagged as such. apply_macro only previews; execute_macro saves. create_article makes drafts.";
 

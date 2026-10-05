@@ -261,7 +261,7 @@ impl ZendeskServer {
     }
 
     #[tool(
-        description = "Get all SLA policies with their metric targets per priority level",
+        description = "Get all SLA policies with their metric targets per priority level. Admin-only: agents get 403.",
         annotations(read_only_hint = true)
     )]
     async fn get_sla_policies(&self) -> CallToolResult {
