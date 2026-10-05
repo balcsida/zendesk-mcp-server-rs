@@ -30,6 +30,7 @@ ENV ZENDESK_TOKEN_FILE=/tokens/tokens.json \
     MCP_HTTP_ADDR=0.0.0.0:8080
 
 # reqwest uses rustls with the platform verifier; the base image ships the CA certificates.
+LABEL org.opencontainers.image.source=https://github.com/balcsida/zendesk-mcp-server-rs
 USER nonroot
 EXPOSE 8080
 
