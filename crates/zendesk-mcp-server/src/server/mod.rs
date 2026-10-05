@@ -26,9 +26,9 @@ use tokio::sync::{Mutex, OnceCell};
 use tokio_util::sync::CancellationToken;
 use tower_http::validate_request::ValidateRequestHeaderLayer;
 
-use crate::auth::Auth;
-use crate::config::Credentials;
-use crate::zendesk::{ArticleSearch, ZendeskClient};
+use zendesk::auth::Auth;
+use zendesk::config::{self, Credentials};
+use zendesk::{ArticleSearch, ZendeskClient};
 
 /// Options for the `http` subcommand.
 #[derive(Debug, Clone, clap::Args)]
@@ -628,7 +628,7 @@ pub async fn run(transport: Transport, http: reqwest::Client) -> Result<()> {
                 "MCP_PER_USER_AUTH cannot be combined with MCP_BEARER_TOKEN: in per-user mode the Authorization header carries each caller's own Zendesk token."
             );
         }
-        let server = ZendeskServer::per_user(crate::config::load_subdomain()?, http);
+        let server = ZendeskServer::per_user(config::load_subdomain()?, http);
         tracing::info!("Per-user mode: every caller acts with their own Zendesk token");
         (server, None)
     } else {
@@ -658,7 +658,7 @@ pub async fn run(transport: Transport, http: reqwest::Client) -> Result<()> {
 /// A server acting with its own Zendesk login from the environment, authenticated up
 /// front so a browser sign-in happens at startup, not mid-call.
 async fn signed_in_server(http: reqwest::Client) -> Result<ZendeskServer> {
-    let server = ZendeskServer::new(crate::config::load_credentials()?, http);
+    let server = ZendeskServer::new(config::load_credentials()?, http);
     if let Err(e) = server.client().await {
         tracing::error!("Zendesk authentication failed: {e:#}");
     }
@@ -891,7 +891,7 @@ mod tests {
 
     #[test]
     fn readme_and_instructions_name_only_real_tools() {
-        let readme = include_str!("../../README.md");
+        let readme = include_str!("../../../../README.md");
         for name in TOOLS {
             assert!(
                 readme.contains(&format!("#### {name}\n")),

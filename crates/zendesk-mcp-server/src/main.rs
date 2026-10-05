@@ -1,11 +1,4 @@
-mod auth;
-mod auth_cli;
-mod config;
-mod mobile_auth;
-mod oauth;
 mod server;
-mod tokens;
-mod zendesk;
 
 use std::time::Duration;
 
@@ -62,9 +55,9 @@ async fn main() -> Result<()> {
         Command::Stdio => server::run(server::Transport::Stdio, http).await,
         Command::Http(args) => server::run(server::Transport::Http(args), http).await,
         Command::Auth { manual } => {
-            let code = auth_cli::run(http, manual).await?;
+            let code = zendesk::authorize::run(http, manual).await?;
             std::process::exit(code);
         }
-        Command::MobileAuth => mobile_auth::run_auth_cli(http).await,
+        Command::MobileAuth => zendesk::mobile_auth::run_auth_cli(http).await,
     }
 }

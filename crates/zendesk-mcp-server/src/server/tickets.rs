@@ -304,7 +304,7 @@ impl ZendeskServer {
     )]
     async fn create_ticket(&self, Parameters(p): Parameters<CreateTicketParams>) -> CallToolResult {
         self.call_json(|c| async move {
-            let ticket = crate::zendesk::CreateTicket {
+            let ticket = zendesk::CreateTicket {
                 subject: p.subject,
                 description: p.description,
                 requester_id: p.requester_id,

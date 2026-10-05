@@ -2613,6 +2613,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "zendesk"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "base64 0.23.1",
+ "chrono",
+ "pulldown-cmark",
+ "rand",
+ "reqwest",
+ "rpassword",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "url",
+ "uuid",
+ "webbrowser",
+ "wiremock",
+]
+
+[[package]]
 name = "zendesk-mcp-server"
 version = "0.1.0"
 dependencies = [
@@ -2622,25 +2646,20 @@ dependencies = [
  "chrono",
  "clap",
  "dotenvy",
- "pulldown-cmark",
  "rand",
  "reqwest",
  "rmcp",
- "rpassword",
  "schemars",
  "serde",
  "serde_json",
- "sha2",
- "tempfile",
  "tokio",
  "tokio-util",
  "tower-http",
  "tracing",
  "tracing-subscriber",
  "url",
- "uuid",
- "webbrowser",
  "wiremock",
+ "zendesk",
 ]
 
 [[package]]
