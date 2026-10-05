@@ -1,30 +1,27 @@
 # syntax=docker/dockerfile:1
-FROM rust:1-slim-bookworm AS builder
-
-RUN apt-get update \
-    && apt-get install --no-install-recommends -y build-essential pkg-config \
-    && rm -rf /var/lib/apt/lists/*
-
+FROM lukemathwalker/cargo-chef:latest-rust-1-slim-bookworm AS planner
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
+RUN cargo chef prepare --recipe-path recipe.json
 
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/src/target \
-    cargo build --release --locked \
-    && cp target/release/zendesk-mcp-server /zendesk-mcp-server
+FROM lukemathwalker/cargo-chef:latest-rust-1-slim-bookworm AS builder
+WORKDIR /src
 
-FROM debian:bookworm-slim AS runtime
+# Dependencies compile in their own layer, cached until Cargo.toml/Cargo.lock change.
+COPY --from=planner /src/recipe.json recipe.json
+RUN cargo chef cook --release --locked --recipe-path recipe.json
 
-# reqwest uses rustls with the platform verifier, so only CA certificates are needed.
-RUN apt-get update \
-    && apt-get install --no-install-recommends -y ca-certificates \
-    && rm -rf /var/lib/apt/lists/* \
-    && useradd --system --uid 10001 --user-group --shell /usr/sbin/nologin appuser \
-    && mkdir -m 700 /tokens \
-    && chown appuser:appuser /tokens
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+RUN cargo build --release --locked \
+    && mkdir -m 700 /tokens
 
-COPY --from=builder /zendesk-mcp-server /usr/local/bin/zendesk-mcp-server
+FROM gcr.io/distroless/cc-debian12:nonroot AS runtime
+
+COPY --from=builder /src/target/release/zendesk-mcp-server /usr/local/bin/zendesk-mcp-server
+# Distroless has no shell, so the token directory is created in the builder stage.
+COPY --from=builder --chown=65532:65532 /tokens /tokens
 
 # Inside a container the network namespace is the boundary, so `http` listens on
 # every interface; publish the port with -p to expose it.
@@ -32,7 +29,8 @@ ENV ZENDESK_TOKEN_FILE=/tokens/tokens.json \
     ZENDESK_MOBILE_TOKEN_FILE=/tokens/mobile_token.json \
     MCP_HTTP_ADDR=0.0.0.0:8080
 
-USER appuser
+# reqwest uses rustls with the platform verifier; the base image ships the CA certificates.
+USER nonroot
 EXPOSE 8080
 
 # Serves over stdio by default. Pass `http` (with MCP_BEARER_TOKEN or MCP_PER_USER_AUTH
