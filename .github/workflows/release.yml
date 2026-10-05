@@ -8,7 +8,7 @@ permissions:
   contents: read
 
 env:
-  REGISTRY_IMAGE: ghcr.io/balcsida/zendesk-mcp-server-rs
+  REGISTRY_IMAGE: ghcr.io/balcsida/zendesk-mcp-server
 
 jobs:
   # The release stays a draft until `publish`, so a failed run is invisible.
@@ -49,6 +49,16 @@ jobs:
       - uses: taiki-e/upload-rust-binary-action@v1
         with:
           bin: zendesk-mcp-server
+          target: ${{ matrix.target }}
+          tar: unix
+          zip: windows
+          checksum: sha256
+          locked: true
+          include: LICENSE
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: zendesk
           target: ${{ matrix.target }}
           tar: unix
           zip: windows
