@@ -1,4 +1,4 @@
-//! `zendesk-mcp-server auth` — one-time OAuth authorization for this machine.
+//! `auth` (on `zendesk-mcp-server` and on `zendesk`) — one-time OAuth authorization for this machine.
 //!
 //! Run once per operator. It sends the operator to Zendesk in a browser, captures
 //! the authorization code, exchanges it for tokens using PKCE, and stores the result
@@ -58,8 +58,8 @@ type Captured = HashMap<String, String>;
 /// (no `ZENDESK_CLIENT_ID`), 130 on Ctrl-C.
 pub async fn run(http: reqwest::Client, manual: bool) -> Result<i32> {
     let settings = match load_credentials() {
-        Ok(Credentials::OAuth(settings)) => settings,
-        Ok(_) => {
+        Ok(Some(Credentials::OAuth { settings })) => settings,
+        Ok(Some(_)) | Ok(None) => {
             eprintln!(
                 "error: OAuth is not configured. Set ZENDESK_CLIENT_ID to the identifier of a \
                  public OAuth client from Admin Center (Apps and integrations > APIs > OAuth \

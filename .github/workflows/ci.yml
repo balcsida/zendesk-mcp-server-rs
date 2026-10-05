@@ -28,10 +28,10 @@ jobs:
         with:
           context: .
           load: true
-          tags: zendesk-mcp-server-rs:ci
+          tags: zendesk-mcp-server:ci
           cache-from: type=gha
           cache-to: type=gha,mode=max
       - run: |
-          docker run --rm zendesk-mcp-server-rs:ci --version |
+          docker run --rm zendesk-mcp-server:ci --version |
             grep '^zendesk-mcp-server '
-          docker image inspect -f '{{.Size}} bytes' zendesk-mcp-server-rs:ci
+          docker image inspect -f '{{.Size}} bytes' zendesk-mcp-server:ci

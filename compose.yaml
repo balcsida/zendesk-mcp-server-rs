@@ -1,6 +1,6 @@
 services:
   zendesk-mcp:
-    image: ghcr.io/balcsida/zendesk-mcp-server-rs
+    image: ghcr.io/balcsida/zendesk-mcp-server
     build: .
     command: ["http"]
     # .env must also contain MCP_BEARER_TOKEN, or MCP_PER_USER_AUTH=true.

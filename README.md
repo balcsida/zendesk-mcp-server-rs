@@ -1,22 +1,32 @@
-# Zendesk MCP Server (Rust)
+# zendesk-rs
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 
-A Model Context Protocol server for Zendesk.
+A Zendesk MCP server and a Zendesk CLI, sharing one Rust client library.
 
 This is a Rust rewrite of [reminia/zendesk-mcp-server](https://github.com/reminia/zendesk-mcp-server). It is licensed under Apache-2.0.
 
-It offers:
+## What is in the repository
 
-- Tools for tickets, comments and attachments; search and counts; users, organizations, groups and brands; views, macros and triggers; custom objects; Help Center reading and writing; SLA and satisfaction data
-- Specialized prompts for ticket analysis and response drafting
-- The Zendesk Help Center articles as a knowledge base resource
-- A single binary with no runtime dependencies, speaking stdio or streamable HTTP
+- `zendesk-mcp-server`: the MCP server. Tools for tickets, comments and attachments; search and counts; users, organizations, groups and brands; views, macros and triggers; custom objects; Help Center reading and writing; SLA and satisfaction data. Prompts for ticket analysis and response drafting. The Help Center articles as a knowledge base resource. Speaks stdio or streamable HTTP.
+- `zendesk`: the CLI for scripted use: `api`, `token`, `auth` and `mobile-auth`.
+- `crates/zendesk`: the shared client library.
 
-## Setup
+Both binaries are single files with no runtime dependencies.
 
-- Install: download the archive for your platform from the [releases](https://github.com/balcsida/zendesk-mcp-server-rs/releases) page: `zendesk-mcp-server-x86_64-unknown-linux-gnu.tar.gz`, `zendesk-mcp-server-aarch64-unknown-linux-gnu.tar.gz`, `zendesk-mcp-server-aarch64-apple-darwin.tar.gz`, `zendesk-mcp-server-x86_64-apple-darwin.tar.gz` or `zendesk-mcp-server-x86_64-pc-windows-msvc.zip` (each has a `.sha256` file). Unpack it and put `zendesk-mcp-server` on your `PATH`.
-- Build from source: `cargo install --path .` or `cargo build --release` (the binary is `target/release/zendesk-mcp-server`).
+## Install
+
+Download the archives for your platform from the [releases](https://github.com/balcsida/zendesk-rs/releases) page. Each has a `.sha256` file. Unpack them and put the binaries on your `PATH`.
+
+| Binary | Archives |
+| --- | --- |
+| `zendesk-mcp-server` | `zendesk-mcp-server-x86_64-unknown-linux-gnu.tar.gz`, `zendesk-mcp-server-aarch64-unknown-linux-gnu.tar.gz`, `zendesk-mcp-server-aarch64-apple-darwin.tar.gz`, `zendesk-mcp-server-x86_64-apple-darwin.tar.gz`, `zendesk-mcp-server-x86_64-pc-windows-msvc.zip` |
+| `zendesk` | `zendesk-x86_64-unknown-linux-gnu.tar.gz`, `zendesk-aarch64-unknown-linux-gnu.tar.gz`, `zendesk-aarch64-apple-darwin.tar.gz`, `zendesk-x86_64-apple-darwin.tar.gz`, `zendesk-x86_64-pc-windows-msvc.zip` |
+
+From source: `cargo install --path crates/zendesk-mcp-server` and `cargo install --path crates/zendesk-cli`, or `cargo build --release` (both binaries end up in `target/release/`).
+
+## MCP server
+
 - Configure authentication: see [Authentication](#authentication).
 - Configure Claude Desktop (or any MCP client that runs a command over stdio):
 
@@ -48,7 +58,7 @@ the same thing. `zendesk-mcp-server http` serves streamable HTTP instead, see
 
 ## Authentication
 
-This server authenticates with OAuth. Each operator authorizes with their own
+The server and the CLI authenticate the same way, with OAuth. Each operator authorizes with their own
 Zendesk login, so API calls carry their identity and Zendesk applies exactly the
 permissions it applies in the UI: their role, their group restrictions, their
 ticket access. Comments they post are authored by them.
@@ -73,7 +83,7 @@ from this client can ever request, even if the code changes.
 Note the client's **Identifier**. That is the `ZENDESK_CLIENT_ID` below.
 
 If Zendesk rejects `http://localhost:4567/callback`, register `https://localhost`
-instead and use `zendesk-mcp-server auth --manual` in step 3.
+instead and use `zendesk-mcp-server auth --manual` (or `zendesk auth --manual`) in step 3.
 
 ### 2. Configure the environment
 
@@ -100,8 +110,10 @@ Two optional settings must agree with the OAuth client:
 zendesk-mcp-server auth
 ```
 
+The CLI's `zendesk auth` does the same and writes the same token file.
+
 This opens a browser, asks the operator to approve access, and stores the
-resulting tokens locally. From then on the server renews access on its own. The
+resulting tokens locally. From then on the server and the CLI renew access on their own. The
 operator never repeats this unless the tokens are revoked or left unused past the
 refresh token's lifetime (90 days as requested by this server).
 
@@ -112,6 +124,8 @@ registered with `https://localhost`), use the paste-based flow instead:
 zendesk-mcp-server auth --manual
 ```
 
+(`zendesk auth --manual` works the same way.)
+
 Tokens are written to `$XDG_CONFIG_HOME/zendesk-mcp/tokens.json`
 (`~/.config/zendesk-mcp/tokens.json` by default), created `0600` inside a `0700`
 directory. Override the location with `ZENDESK_TOKEN_FILE`. The file holds live
@@ -120,7 +134,7 @@ credentials. Treat it like a password and never commit it.
 ### How token renewal works
 
 Zendesk access tokens are short-lived (30 minutes by default, 48 hours at most),
-so the server refreshes them for you:
+so they are refreshed for you:
 
 - **Before expiry**, when the stored token is within 60 seconds of expiring.
 - **On rejection**, when Zendesk answers `401` with `{"error": "invalid_token"}`.
@@ -136,7 +150,7 @@ atomic and guarded by a lock file, which matters if you run the server from more
 than one MCP client at the same time.
 
 When the refresh token itself is expired or revoked, tools fail with a message
-telling the operator to re-run `zendesk-mcp-server auth`.
+telling the operator to re-run `zendesk-mcp-server auth` (or `zendesk auth`).
 
 ### Choosing scopes
 
@@ -165,7 +179,7 @@ OAuth client's allowed scopes to match.
 Scopes are a ceiling, not a grant. A token can never do more than the
 authorizing operator is allowed to do. Zendesk accepts unrecognised scope names
 when issuing a token but then rejects every request with `403`, so
-`zendesk-mcp-server auth` prints the scope Zendesk actually granted for comparison.
+`auth` prints the scope Zendesk actually granted for comparison.
 
 ### Migrating from an API token
 
@@ -193,39 +207,6 @@ which for most installations is an admin. Per-operator OAuth fixes that.
 > goal is for operators to have exactly their own Zendesk permissions, the
 > authorization code flow is the only one that fits.
 
-### Mobile sign-in
-
-```bash
-zendesk-mcp-server mobile-auth
-```
-
-This signs in through the Zendesk mobile app's OAuth flow. No OAuth client is
-needed. Use it when you cannot register an OAuth client in Admin Center.
-
-- Accounts with email and password sign in directly, without a browser.
-- Accounts with SSO (SAML, Google, Office 365) open the system browser. The final
-  redirect goes to `zendesk-support://authenticate?...`, which is captured by a
-  temporary URL-scheme handler, or by pasting the URL.
-
-If `ZENDESK_SUBDOMAIN` is already set, `mobile-auth` uses it directly instead of
-prompting (the subdomain is printed, since it is not a secret).
-
-SSO sign-in (from `mobile-auth`, or when the server starts with no saved token) opens a
-private/incognito window in Chrome, Firefox or Edge where one of those browsers is
-installed, so the mobile OAuth cookies stay separate from the operator's normal
-Zendesk session. It falls back to the system default browser otherwise.
-
-The access token has no refresh token, so sign in again when it expires.
-
-The token is saved to `~/.config/zendesk-mcp/mobile_token.json` (under
-`$XDG_CONFIG_HOME` if set). Override the location with `ZENDESK_MOBILE_TOKEN_FILE`.
-The file has the same JSON format as the `.zendesk_token` file of the Python
-version, so an old file can be copied over.
-
-With none of the other credentials set, the server uses this saved token, or
-starts a browser sign-in at startup. `ZENDESK_SUBDOMAIN` is then optional, because
-the saved token records it.
-
 ### Session cookie
 
 Set `ZENDESK_SESSION_COOKIE` to the `_zendesk_session` cookie of a browser that is
@@ -242,27 +223,85 @@ The first match wins:
 | 2 | `ZENDESK_OAUTH_TOKEN` | Fixed bearer token (needs `ZENDESK_SUBDOMAIN`) |
 | 3 | `ZENDESK_EMAIL` + `ZENDESK_API_KEY` | API token, deprecated (needs `ZENDESK_SUBDOMAIN`) |
 | 4 | `ZENDESK_SESSION_COOKIE` | Session cookie (needs `ZENDESK_SUBDOMAIN`) |
-| 5 | nothing | Saved mobile token, or browser sign-in at startup |
+| 5 | nothing | Server: fails with an error. CLI: the saved mobile token, or a browser sign-in |
+
+## CLI
+
+`zendesk` calls the Zendesk API from scripts and the shell. `api` takes a path relative to `/api/v2/` (a leading `/` or `api/v2/` is tolerated), or an absolute URL on the account, so a `next_page` link can be passed straight back. It handles JSON endpoints only. It prints pretty-printed JSON on stdout, nothing for an empty body, and sends errors to stderr with exit code 1.
+
+`-X` sets the method (GET by default, POST when `-d` is given), `-d` the body (inline JSON, `@file` or `@-` for stdin) and `-q key=value` a query parameter, repeatable.
+
+```bash
+zendesk api users/me.json
+zendesk api tickets.json -q sort_by=updated_at -q sort_order=desc | jq '.tickets[].subject'
+zendesk api search.json -q 'query=type:ticket status:open'
+zendesk api -X POST tickets.json -d '{"ticket":{"subject":"Printer on fire","comment":{"body":"Help"}}}'
+zendesk api -X PUT tickets/123.json -d @update.json
+echo '{"ticket":{"status":"solved"}}' | zendesk api -X PUT tickets/123.json -d @-
+zendesk api -X DELETE tickets/123.json
+zendesk api "$(zendesk api tickets.json | jq -r .next_page)"     # follow pagination
+ZENDESK_OAUTH_TOKEN=$(zendesk token) zendesk-mcp-server          # hand the CLI's token to the server
+```
+
+`zendesk token` prints the bearer access token the CLI would use, refreshing OAuth first. It fails for API-token and cookie credentials. `zendesk token --mobile` prints the saved mobile token even when `ZENDESK_CLIENT_ID` or another credential is configured.
+
+`token` and `api` read the same environment variables as the server, in the same [precedence](#credential-precedence). When none is set, they use the saved mobile token (checked with a `users/me` call). A browser sign-in opens if it is missing or rejected.
+
+The CLI logs only warnings unless `RUST_LOG` is set.
+
+### Mobile sign-in
+
+```bash
+zendesk mobile-auth
+```
+
+This signs in through the Zendesk mobile app's OAuth flow. No OAuth client is
+needed. Use it when you cannot register an OAuth client in Admin Center.
+
+- Accounts with email and password sign in directly, without a browser.
+- Accounts with SSO (SAML, Google, Office 365) open the system browser. The final
+  redirect goes to `zendesk-support://authenticate?...`, which is captured by a
+  temporary URL-scheme handler, or by pasting the URL.
+
+If `ZENDESK_SUBDOMAIN` is already set, `mobile-auth` uses it directly instead of
+prompting (the subdomain is printed, since it is not a secret).
+
+SSO sign-in (from `mobile-auth`, or when a command finds no saved token) opens a
+private/incognito window in Chrome, Firefox or Edge where one of those browsers is
+installed, so the mobile OAuth cookies stay separate from the operator's normal
+Zendesk session. It falls back to the system default browser otherwise.
+
+The access token has no refresh token, so sign in again when it expires.
+
+The token is saved to `~/.config/zendesk-mcp/mobile_token.json` (under
+`$XDG_CONFIG_HOME` if set). Override the location with `ZENDESK_MOBILE_TOKEN_FILE`.
+The file has the same JSON format as the `.zendesk_token` file of the Python
+version, so an old file can be copied over.
+
+The MCP server does not read this file. Pass the token to it as a fixed bearer token:
+
+```bash
+ZENDESK_OAUTH_TOKEN=$(zendesk token) zendesk-mcp-server
+```
 
 ## Docker
 
 1. Copy `.env.example` to `.env` and fill in your Zendesk configuration. Keep this file outside version control.
-2. Pull the published image (`ghcr.io/balcsida/zendesk-mcp-server-rs`; tags `latest`, `0.1` and `0.1.0`; linux/amd64 and linux/arm64):
+2. Pull the published image (`ghcr.io/balcsida/zendesk-mcp-server`; tags `latest`, `MAJOR.MINOR` and `MAJOR.MINOR.PATCH`, published from the next release on; linux/amd64 and linux/arm64):
 
    ```bash
-   docker pull ghcr.io/balcsida/zendesk-mcp-server-rs:latest
+   docker pull ghcr.io/balcsida/zendesk-mcp-server:latest
    ```
 
    Or build it locally:
 
    ```bash
-   docker build -t ghcr.io/balcsida/zendesk-mcp-server-rs .
+   docker build -t ghcr.io/balcsida/zendesk-mcp-server .
    ```
 
 The image is built on distroless (`gcr.io/distroless/cc-debian12`), so it has no shell, and
 runs as the non-root user `nonroot` (uid 65532). It stores tokens in
-`/tokens` (`ZENDESK_TOKEN_FILE=/tokens/tokens.json` and
-`ZENDESK_MOBILE_TOKEN_FILE=/tokens/mobile_token.json`). Mount a named volume there
+`/tokens` (`ZENDESK_TOKEN_FILE=/tokens/tokens.json`). Mount a named volume there
 so tokens survive restarts. The server rewrites the file each time it rotates the
 refresh token, so the mount must be writable. A bind-mounted directory must be
 writable by uid 65532 (for example `chown 65532:65532 ./tokens`).
@@ -272,7 +311,7 @@ writable by uid 65532 (for example `chown 65532:65532 ./tokens`).
 Run the paste-based flow once, with the token volume mounted:
 
 ```bash
-docker run -it --rm --env-file .env -v zendesk-tokens:/tokens ghcr.io/balcsida/zendesk-mcp-server-rs auth --manual
+docker run -it --rm --env-file .env -v zendesk-tokens:/tokens ghcr.io/balcsida/zendesk-mcp-server auth --manual
 ```
 
 ### stdio
@@ -280,7 +319,7 @@ docker run -it --rm --env-file .env -v zendesk-tokens:/tokens ghcr.io/balcsida/z
 Add `-i` when wiring the container to an MCP client over stdin/stdout:
 
 ```bash
-docker run --rm -i --env-file .env -v zendesk-tokens:/tokens ghcr.io/balcsida/zendesk-mcp-server-rs
+docker run --rm -i --env-file .env -v zendesk-tokens:/tokens ghcr.io/balcsida/zendesk-mcp-server
 ```
 
 Claude Code or Claude Desktop configuration:
@@ -294,7 +333,7 @@ Claude Code or Claude Desktop configuration:
         "run", "--rm", "-i",
         "--env-file", "/path/to/.env",
         "-v", "zendesk-tokens:/tokens",
-        "ghcr.io/balcsida/zendesk-mcp-server-rs"
+        "ghcr.io/balcsida/zendesk-mcp-server"
       ]
     }
   }
@@ -309,7 +348,7 @@ docker run -d --name zendesk-mcp \
   -e MCP_BEARER_TOKEN=change-me \
   -v zendesk-tokens:/tokens \
   -p 8080:8080 \
-  ghcr.io/balcsida/zendesk-mcp-server-rs http
+  ghcr.io/balcsida/zendesk-mcp-server http
 ```
 
 Inside the image `http` listens on `0.0.0.0:8080` by default.
@@ -360,17 +399,19 @@ ZENDESK_SUBDOMAIN=acme zendesk-mcp-server http --per-user-auth --bind 0.0.0.0:80
 `--per-user-auth` (or `MCP_PER_USER_AUTH=true`) replaces `MCP_BEARER_TOKEN`, and
 setting both is an error. The server reads only `ZENDESK_SUBDOMAIN`.
 
-Each user signs in once on their own machine, then adds the server with the
-`access_token` from `~/.config/zendesk-mcp/mobile_token.json`:
+Each user signs in once on their own machine with the CLI, then adds the server
+with the token it prints:
 
 ```bash
-zendesk-mcp-server mobile-auth
+zendesk mobile-auth
 claude mcp add --transport http zendesk https://host/mcp \
-  --header "Authorization: Bearer $(jq -r .access_token ~/.config/zendesk-mcp/mobile_token.json)"
+  --header "Authorization: Bearer $(zendesk token --mobile)"
 ```
 
+`--mobile` makes sure the 30-minute OAuth token is not picked up when `ZENDESK_CLIENT_ID` is also set.
+
 - A `mobile-auth` token suits a fixed header because it has no refresh token to
-  rotate. When Zendesk stops accepting it, run `mobile-auth` again and add the
+  rotate. When Zendesk stops accepting it, run `zendesk mobile-auth` again and add the
   server again. Tokens from `auth` expire after 30 minutes and a header cannot
   renew them, so they do not fit this mode.
 - Only `Bearer` tokens are accepted, not API tokens.
@@ -400,29 +441,38 @@ claude mcp add --transport http zendesk https://host/mcp \
 | `ZENDESK_OAUTH_REDIRECT_URI` | `http://localhost:4567/callback` | Redirect URL registered on the OAuth client. |
 | `ZENDESK_TOKEN_FILE` | `~/.config/zendesk-mcp/tokens.json` | OAuth token store. |
 | `ZENDESK_OAUTH_TOKEN` | none | Fixed bearer token. |
-| `ZENDESK_MOBILE_TOKEN_FILE` | `~/.config/zendesk-mcp/mobile_token.json` | Token store for `mobile-auth`. |
+| `ZENDESK_MOBILE_TOKEN_FILE` | `~/.config/zendesk-mcp/mobile_token.json` | CLI only: token store for `zendesk mobile-auth` and the CLI's fallback when no other credentials are set. |
 | `ZENDESK_EMAIL` | none | Email for API token auth (deprecated). |
 | `ZENDESK_API_KEY` | none | API token (deprecated). |
 | `ZENDESK_SESSION_COOKIE` | none | `_zendesk_session` cookie of a signed-in browser. |
 | `MCP_HTTP_ADDR` | `127.0.0.1:8080` (`0.0.0.0:8080` in Docker) | Listen address for the `http` subcommand. Same as `--bind`. |
 | `MCP_BEARER_TOKEN` | none | Bearer token clients must present to the `http` transport, unless `MCP_PER_USER_AUTH` is set. Same as `--bearer-token`. |
 | `MCP_PER_USER_AUTH` | `false` | `true` has every `http` client act with its own Zendesk token, see [Per-user mode](#per-user-mode). Same as `--per-user-auth`. |
-| `RUST_LOG` | `info` | Log filter. Logs go to stderr. |
+| `RUST_LOG` | `info` (server), `warn` (CLI) | Log filter. Logs go to stderr. |
 
 ## Development
 
+The repository is a Cargo workspace with three crates:
+
+- `crates/zendesk`: the client library (API client, credentials, OAuth).
+- `crates/zendesk-mcp-server`: the `zendesk-mcp-server` binary.
+- `crates/zendesk-cli`: the `zendesk` binary.
+
 ```bash
-cargo test
-cargo clippy --all-targets -- -D warnings
-cargo fmt --check
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all --check
+cargo run -p zendesk-cli -- api users/me.json
+cargo run -p zendesk-mcp-server
 ```
 
 The tests use mocked HTTP and never contact Zendesk.
 
 ### Releasing
 
-Bump `version` in `Cargo.toml`, commit, tag `vX.Y.Z` and push the tag. The release
-workflow builds the five binaries and the two-arch image, then publishes the draft
+Bump `version` in `Cargo.toml`, commit it together with the updated `Cargo.lock` (the release builds with `--locked`), tag `vX.Y.Z` and push the tag. The release
+workflow builds both binaries (`zendesk-mcp-server` and `zendesk`) for five targets and the
+two-arch `ghcr.io/balcsida/zendesk-mcp-server` image, then publishes the draft
 release once everything has succeeded.
 
 ## Troubleshooting
@@ -434,7 +484,7 @@ If you're using Safari and seeing errors like "Safari cannot open the page becau
 **Solution:** The sign-in tries Chrome first. If you don't have Chrome installed:
 
 1. Install Chrome: `brew install --cask google-chrome`
-2. Run `zendesk-mcp-server mobile-auth` again, or restart the MCP server to repeat the sign-in.
+2. Re-run `zendesk mobile-auth`.
 
 **Why this happens:**
 
@@ -452,7 +502,7 @@ If you're using Safari and seeing errors like "Safari cannot open the page becau
 
 If sign-in times out after 5 minutes:
 
-1. Check that the URL scheme handler registered successfully (look for `Registered macOS URL scheme handler`, or the Linux or Windows equivalent, in the server log; set `RUST_LOG=debug` for more detail).
+1. Check that the URL scheme handler registered successfully (run `RUST_LOG=info zendesk mobile-auth` and look for `Registered macOS URL scheme handler`, or the Linux or Windows equivalent, in the output; set `RUST_LOG=debug` for more detail).
 2. Try the manual fallback by opening the sign-in URL the command prints in your browser.
 3. Complete the sign-in and copy/paste the `zendesk-support://` URL from the address bar.
 

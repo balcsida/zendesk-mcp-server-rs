@@ -452,7 +452,7 @@ impl ZendeskClient {
 
 #[cfg(test)]
 mod tests {
-    use crate::zendesk::test_support::*;
+    use crate::client::test_support::*;
     use serde_json::{Map, Value, json};
     use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};

@@ -558,7 +558,7 @@ impl ZendeskClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::zendesk::test_support::*;
+    use crate::client::test_support::*;
     use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 

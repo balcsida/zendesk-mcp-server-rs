@@ -480,6 +480,63 @@ impl ZendeskClient {
         Ok(())
     }
 
+    /// Whether `url` has the same scheme, host and port as `base_url`.
+    fn is_account_url(&self, url: &url::Url) -> Result<bool> {
+        let base = url::Url::parse(&self.base_url)?;
+        Ok(url.scheme() == base.scheme()
+            && url.host_str() == base.host_str()
+            && url.port_or_known_default() == base.port_or_known_default())
+    }
+
+    /// Send an arbitrary request and return the JSON body (`Null` when the body is empty).
+    ///
+    /// `path` is relative to `/api/v2/` (a leading `/` or `api/v2/` is tolerated), or an
+    /// absolute URL on this account, so a `next_page` link can be passed back in.
+    pub async fn api(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        query: &[(String, String)],
+        body: Option<&Value>,
+    ) -> Result<Value> {
+        let url = if path.starts_with("http://") || path.starts_with("https://") {
+            let mut url = url::Url::parse(path)?;
+            if !self.is_account_url(&url)? {
+                bail!(
+                    "Refusing to send credentials to {url}: not on this account ({})",
+                    self.base_url
+                );
+            }
+            if !query.is_empty() {
+                url.query_pairs_mut()
+                    .extend_pairs(query.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+            }
+            url
+        } else {
+            let path = path.trim_start_matches('/');
+            let path = match path.strip_prefix("api/v2") {
+                Some("") => "",
+                Some(rest) if rest.starts_with('/') => rest.trim_start_matches('/'),
+                _ => path,
+            };
+            let params: Vec<(&str, &(dyn Display + Sync))> = query
+                .iter()
+                .map(|(k, v)| (k.as_str(), v as &(dyn Display + Sync)))
+                .collect();
+            self.url(path, &params)?
+        };
+        let resp = self
+            .send(|| {
+                let req = self.http.request(method.clone(), url.clone());
+                match body {
+                    Some(body) => req.json(body),
+                    None => req,
+                }
+            })
+            .await?;
+        json_or_null(resp).await
+    }
+
     /// Validate a `next_page` link: same scheme, host and port as `base_url`, and not a
     /// page already fetched. `seen` holds the URLs fetched so far; the link is added to it.
     /// Returns `None` (after a warning) once `MAX_PAGES` pages have been fetched.
@@ -489,11 +546,7 @@ impl ZendeskClient {
         link: &str,
     ) -> Result<Option<url::Url>> {
         let next = url::Url::parse(link)?;
-        let base = url::Url::parse(&self.base_url)?;
-        if next.scheme() != base.scheme()
-            || next.host_str() != base.host_str()
-            || next.port_or_known_default() != base.port_or_known_default()
-        {
+        if !self.is_account_url(&next)? {
             bail!(
                 "Zendesk returned a next_page link on another host: {}",
                 next.host_str().unwrap_or("")
@@ -699,7 +752,7 @@ pub(super) mod test_support {
 mod tests {
     use super::test_support::*;
     use super::*;
-    use wiremock::matchers::{method, path, query_param};
+    use wiremock::matchers::{body_json, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[tokio::test]
@@ -799,6 +852,82 @@ mod tests {
         let err = c.api_put("tickets/1.json", &json!({})).await.unwrap_err();
         assert!(err.to_string().contains("503"), "{err}");
         assert_eq!(server.received_requests().await.unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn api_posts_body_and_query_to_a_path_with_the_api_prefix() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v2/x.json"))
+            .and(query_param("a", "b c"))
+            .and(body_json(json!({"k": 1})))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({"ok": true})))
+            .mount(&server)
+            .await;
+        let got = client(&server)
+            .api(
+                reqwest::Method::POST,
+                "/api/v2/x.json",
+                &[("a".into(), "b c".into())],
+                Some(&json!({"k": 1})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(got, json!({"ok": true}));
+    }
+
+    #[tokio::test]
+    async fn api_accepts_an_absolute_url_on_the_account_host() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/tickets.json"))
+            .and(query_param("page", "2"))
+            .and(query_param("x", "y"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"tickets": []})))
+            .mount(&server)
+            .await;
+        let url = format!("{}/api/v2/tickets.json?page=2", server.uri());
+        let got = client(&server)
+            .api(
+                reqwest::Method::GET,
+                &url,
+                &[("x".into(), "y".into())],
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(got, json!({"tickets": []}));
+    }
+
+    #[tokio::test]
+    async fn api_rejects_an_absolute_url_on_another_host_without_sending() {
+        let server = MockServer::start().await;
+        let err = client(&server)
+            .api(
+                reqwest::Method::GET,
+                "https://evil.example/api/v2/x",
+                &[],
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("evil.example"), "{err}");
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn api_returns_null_for_an_empty_body() {
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/api/v2/tickets/1.json"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let got = client(&server)
+            .api(reqwest::Method::DELETE, "tickets/1.json", &[], None)
+            .await
+            .unwrap();
+        assert_eq!(got, Value::Null);
     }
 
     #[tokio::test]

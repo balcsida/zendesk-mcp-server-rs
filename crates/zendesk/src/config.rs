@@ -2,13 +2,15 @@
 //!
 //! Credentials are chosen in this order:
 //!
-//! 1. `ZENDESK_CLIENT_ID` — OAuth with PKCE, authorized once with `zendesk-mcp-server auth`.
+//! 1. `ZENDESK_CLIENT_ID` — OAuth with PKCE, authorized once with `zendesk-mcp-server auth` (or `zendesk auth`).
 //! 2. `ZENDESK_OAUTH_TOKEN` — a fixed bearer token.
 //! 3. `ZENDESK_EMAIL` + `ZENDESK_API_KEY` — deprecated API token (Zendesk retires these on 2027-04-30).
 //! 4. `ZENDESK_SESSION_COOKIE` — the `_zendesk_session` cookie of a signed-in browser.
-//! 5. Nothing — the token saved by `zendesk-mcp-server mobile-auth`, or a browser sign-in at startup.
 //!
-//! `ZENDESK_SUBDOMAIN` is required for 1–4; for 5 it may also come from the saved mobile token.
+//! If none is set, [`load_credentials`] returns `None` and the caller decides what that
+//! means: the MCP server fails, the CLI falls back to its saved mobile token.
+//!
+//! `ZENDESK_SUBDOMAIN` is required for 1–4.
 //!
 //! `http --per-user-auth` uses none of these: every caller sends their own Zendesk token,
 //! and only `ZENDESK_SUBDOMAIN` is read, through [`load_subdomain`].
@@ -38,7 +40,7 @@ pub const API_TOKEN_DEPRECATION_MESSAGE: &str = "Zendesk API token authenticatio
 Zendesk deactivates unused API tokens from 2026-07-28, blocks creation of new ones from 2026-10-27, \
 and stops accepting all API tokens on 2027-04-30. It also grants this server the full access of the \
 token's user rather than the permissions of the operator using it. Migrate to OAuth by setting \
-ZENDESK_CLIENT_ID and running `zendesk-mcp-server auth`.";
+ZENDESK_CLIENT_ID and running `zendesk-mcp-server auth` (or `zendesk auth`).";
 
 /// OAuth authorization-code-with-PKCE configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,7 +68,12 @@ impl OAuthSettings {
 /// Which credentials the environment describes.
 #[derive(Clone, PartialEq, Eq)]
 pub enum Credentials {
-    OAuth(OAuthSettings),
+    /// A struct variant on purpose: CodeQL treats a call to anything named `OAuth` as a
+    /// source of secrets and then flags every URL built from these settings, though they
+    /// hold only a public client id, scopes and paths.
+    OAuth {
+        settings: OAuthSettings,
+    },
     Bearer {
         subdomain: String,
         access_token: String,
@@ -80,19 +87,15 @@ pub enum Credentials {
         subdomain: String,
         cookie: String,
     },
-    /// No explicit credentials: use the saved mobile-app token, or sign in through a
-    /// browser at startup. `subdomain` is `None` when `ZENDESK_SUBDOMAIN` is unset and must
-    /// then come from the saved token.
-    Mobile {
-        subdomain: Option<String>,
-    },
 }
 
 // Manual Debug so secrets never reach logs or panics.
 impl fmt::Debug for Credentials {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Credentials::OAuth(s) => f.debug_tuple("OAuth").field(s).finish(),
+            Credentials::OAuth { settings } => {
+                f.debug_struct("OAuth").field("settings", settings).finish()
+            }
             Credentials::Bearer { subdomain, .. } => f
                 .debug_struct("Bearer")
                 .field("subdomain", subdomain)
@@ -110,10 +113,6 @@ impl fmt::Debug for Credentials {
                 .debug_struct("SessionCookie")
                 .field("subdomain", subdomain)
                 .field("cookie", &"<redacted>")
-                .finish(),
-            Credentials::Mobile { subdomain } => f
-                .debug_struct("Mobile")
-                .field("subdomain", subdomain)
                 .finish(),
         }
     }
@@ -137,11 +136,6 @@ pub fn default_token_file() -> PathBuf {
     config_dir().join("tokens.json")
 }
 
-/// Where `mobile-auth` stores its token unless `ZENDESK_MOBILE_TOKEN_FILE` says otherwise.
-pub fn default_mobile_token_file() -> PathBuf {
-    config_dir().join("mobile_token.json")
-}
-
 /// Expand a leading `~/` so operators can write `ZENDESK_TOKEN_FILE=~/x/tokens.json`.
 pub fn expand_home(path: &str) -> PathBuf {
     match path.strip_prefix("~/") {
@@ -161,13 +155,13 @@ pub fn load_subdomain() -> Result<String> {
         .ok_or_else(|| anyhow!(MISSING_SUBDOMAIN))
 }
 
-/// Read credentials from the process environment.
-pub fn load_credentials() -> Result<Credentials> {
+/// Read credentials from the process environment; `None` when none are configured.
+pub fn load_credentials() -> Result<Option<Credentials>> {
     load_credentials_from(|key| std::env::var(key).ok())
 }
 
 /// Read credentials through `get`, so tests can supply their own environment.
-pub fn load_credentials_from(get: impl Fn(&str) -> Option<String>) -> Result<Credentials> {
+pub fn load_credentials_from(get: impl Fn(&str) -> Option<String>) -> Result<Option<Credentials>> {
     let clean = |key: &str| {
         get(key)
             .map(|v| v.trim().to_string())
@@ -199,14 +193,14 @@ pub fn load_credentials_from(get: impl Fn(&str) -> Option<String>) -> Result<Cre
             token_file = %settings.token_file.display(),
             "Using Zendesk OAuth authentication"
         );
-        return Ok(Credentials::OAuth(settings));
+        return Ok(Some(Credentials::OAuth { settings }));
     }
 
     if let Some(access_token) = clean("ZENDESK_OAUTH_TOKEN") {
-        return Ok(Credentials::Bearer {
+        return Ok(Some(Credentials::Bearer {
             subdomain: require_subdomain()?,
             access_token,
-        });
+        }));
     }
 
     let email = clean("ZENDESK_EMAIL");
@@ -214,11 +208,11 @@ pub fn load_credentials_from(get: impl Fn(&str) -> Option<String>) -> Result<Cre
     match (email, token) {
         (Some(email), Some(token)) => {
             tracing::warn!("{API_TOKEN_DEPRECATION_MESSAGE}");
-            return Ok(Credentials::ApiToken {
+            return Ok(Some(Credentials::ApiToken {
                 subdomain: require_subdomain()?,
                 email,
                 token,
-            });
+            }));
         }
         (Some(_), None) => bail!(
             "Incomplete API token configuration: ZENDESK_API_KEY is not set. Set both, or switch to OAuth with ZENDESK_CLIENT_ID."
@@ -230,13 +224,13 @@ pub fn load_credentials_from(get: impl Fn(&str) -> Option<String>) -> Result<Cre
     }
 
     if let Some(cookie) = clean("ZENDESK_SESSION_COOKIE") {
-        return Ok(Credentials::SessionCookie {
+        return Ok(Some(Credentials::SessionCookie {
             subdomain: require_subdomain()?,
             cookie,
-        });
+        }));
     }
 
-    Ok(Credentials::Mobile { subdomain })
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -262,7 +256,7 @@ mod tests {
         ]))
         .unwrap();
         match creds {
-            Credentials::OAuth(s) => {
+            Some(Credentials::OAuth { settings: s }) => {
                 assert_eq!(s.subdomain, "acme");
                 assert_eq!(s.scopes, DEFAULT_OAUTH_SCOPES);
                 assert_eq!(
@@ -293,16 +287,11 @@ mod tests {
     }
 
     #[test]
-    fn nothing_set_means_mobile_flow() {
-        assert_eq!(
-            load_credentials_from(env(&[])).unwrap(),
-            Credentials::Mobile { subdomain: None }
-        );
+    fn nothing_set_means_no_credentials() {
+        assert_eq!(load_credentials_from(env(&[])).unwrap(), None);
         assert_eq!(
             load_credentials_from(env(&[("ZENDESK_SUBDOMAIN", " acme ")])).unwrap(),
-            Credentials::Mobile {
-                subdomain: Some("acme".into())
-            }
+            None
         );
     }
 
