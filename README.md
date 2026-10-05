@@ -16,6 +16,10 @@ Both binaries are single files with no runtime dependencies.
 
 ## Install
 
+Install the binary you need, or both. The MCP server is also published as a [Docker image](#docker).
+
+### Prebuilt binaries
+
 Download the archives for your platform from the [releases](https://github.com/balcsida/zendesk-rs/releases) page. Each has a `.sha256` file. Unpack them and put the binaries on your `PATH`.
 
 | Binary | Archives |
@@ -23,7 +27,20 @@ Download the archives for your platform from the [releases](https://github.com/b
 | `zendesk-mcp-server` | `zendesk-mcp-server-x86_64-unknown-linux-gnu.tar.gz`, `zendesk-mcp-server-aarch64-unknown-linux-gnu.tar.gz`, `zendesk-mcp-server-aarch64-apple-darwin.tar.gz`, `zendesk-mcp-server-x86_64-apple-darwin.tar.gz`, `zendesk-mcp-server-x86_64-pc-windows-msvc.zip` |
 | `zendesk` | `zendesk-x86_64-unknown-linux-gnu.tar.gz`, `zendesk-aarch64-unknown-linux-gnu.tar.gz`, `zendesk-aarch64-apple-darwin.tar.gz`, `zendesk-x86_64-apple-darwin.tar.gz`, `zendesk-x86_64-pc-windows-msvc.zip` |
 
-From source: `cargo install --path crates/zendesk-mcp-server` and `cargo install --path crates/zendesk-cli`, or `cargo build --release` (both binaries end up in `target/release/`).
+### With Cargo
+
+The crates are not on crates.io, so Cargo builds them from this repository. This needs Rust 1.89 or later.
+
+```bash
+cargo install --locked --git https://github.com/balcsida/zendesk-rs zendesk-mcp-server  # the MCP server
+cargo install --locked --git https://github.com/balcsida/zendesk-rs zendesk-cli         # the zendesk CLI
+```
+
+Cargo installs them to `~/.cargo/bin`. This builds the latest `main`. To build a release instead, add its tag, for example `--tag v0.2.0`.
+
+From a clone, run `cargo install --locked --path crates/zendesk-mcp-server` (or `crates/zendesk-cli`), or `cargo build --release`, which puts both binaries in `target/release/`.
+
+On x86-64 Windows, the TLS library (aws-lc) needs [NASM](https://www.nasm.us/) to build. Without NASM, set `AWS_LC_SYS_PREBUILT_NASM=1` to use prebuilt objects.
 
 ## MCP server
 
@@ -73,7 +90,7 @@ create a client:
 
 | Field | Value |
 | --- | --- |
-| Client kind | **Public**. This server runs on each operator's machine, so there is no secret it could keep. PKCE is used instead. |
+| Client kind | **Public**. The server and the CLI run on each operator's machine, so there is no secret they could keep. PKCE is used instead. |
 | Redirect URLs | `http://localhost:4567/callback` |
 | Allowed scopes | `read tickets:write ticket_attachments:write users:write organizations:write hc:write` |
 
@@ -115,7 +132,7 @@ The CLI's `zendesk auth` does the same and writes the same token file.
 This opens a browser, asks the operator to approve access, and stores the
 resulting tokens locally. From then on the server and the CLI renew access on their own. The
 operator never repeats this unless the tokens are revoked or left unused past the
-refresh token's lifetime (90 days as requested by this server).
+refresh token's lifetime (both binaries request 90 days).
 
 If the browser cannot reach this machine (a remote shell, or an OAuth client
 registered with `https://localhost`), use the paste-based flow instead:
@@ -191,8 +208,8 @@ Zendesk is retiring API tokens on this schedule:
 | 2026-10-27 | No account can create new API tokens. |
 | 2027-04-30 | All API tokens stop working permanently. |
 
-Until then `ZENDESK_EMAIL` + `ZENDESK_API_KEY` continue to work, and the server
-logs a deprecation warning the first time it authenticates. Set
+Until then `ZENDESK_EMAIL` + `ZENDESK_API_KEY` continue to work, with a deprecation
+warning from the server and the CLI. Set
 `ZENDESK_CLIENT_ID` and OAuth takes precedence, so you can migrate without
 removing the old variables.
 
@@ -245,7 +262,7 @@ ZENDESK_OAUTH_TOKEN=$(zendesk token) zendesk-mcp-server          # hand the CLI'
 
 `zendesk token` prints the bearer access token the CLI would use, refreshing OAuth first. It fails for API-token and cookie credentials. `zendesk token --mobile` prints the saved mobile token even when `ZENDESK_CLIENT_ID` or another credential is configured.
 
-`token` and `api` read the same environment variables as the server, in the same [precedence](#credential-precedence). When none is set, they use the saved mobile token (checked with a `users/me` call). A browser sign-in opens if it is missing or rejected.
+`token` and `api` read the same environment variables as the server, in the same [precedence](#credential-precedence), also from a `.env` file in the working directory or any parent. When none is set, they use the saved mobile token (checked with a `users/me` call). A browser sign-in opens if it is missing or rejected.
 
 The CLI logs only warnings unless `RUST_LOG` is set.
 
@@ -285,6 +302,8 @@ ZENDESK_OAUTH_TOKEN=$(zendesk token) zendesk-mcp-server
 ```
 
 ## Docker
+
+The image contains the MCP server only, not the `zendesk` CLI.
 
 1. Copy `.env.example` to `.env` and fill in your Zendesk configuration. Keep this file outside version control.
 2. Pull the published image (`ghcr.io/balcsida/zendesk-mcp-server`; tags `latest`, `MAJOR.MINOR` and `MAJOR.MINOR.PATCH`, published from 0.2.0 on; linux/amd64 and linux/arm64):
@@ -433,6 +452,8 @@ claude mcp add --transport http zendesk https://host/mcp \
 
 ## Environment variables
 
+Both binaries read these from the environment or from a `.env` file in the working directory or any parent. The `MCP_*` variables apply to the server only.
+
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `ZENDESK_SUBDOMAIN` | none | Zendesk subdomain (`acme` for `acme.zendesk.com`). Required for credentials 1 to 4 and for per-user mode. |
@@ -506,11 +527,11 @@ If sign-in times out after 5 minutes:
 2. Try the manual fallback by opening the sign-in URL the command prints in your browser.
 3. Complete the sign-in and copy/paste the `zendesk-support://` URL from the address bar.
 
-## Resources
+## MCP resources
 
 - `zendesk://knowledge-base`: all Help Center articles in the sections you can view, keyed by section ID.
 
-## Prompts
+## MCP prompts
 
 ### analyze-ticket
 
@@ -524,7 +545,7 @@ Draft a response to a Zendesk ticket.
 
 - `ticket_id` (required)
 
-## Tools
+## MCP tools
 
 Tools carry MCP annotations (read-only, destructive) so clients can ask for confirmation before changes. The categories below cover tickets, ticket operations, search, users and organizations, views, macros and triggers, account, custom objects, the Help Center, and metrics and SLAs.
 
