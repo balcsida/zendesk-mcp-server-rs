@@ -87,7 +87,7 @@ impl Auth {
     /// Build the credential described by the environment, with the subdomain to talk to.
     pub fn from_credentials(creds: &Credentials, http: &reqwest::Client) -> (String, Auth) {
         match creds {
-            Credentials::OAuth(settings) => (
+            Credentials::OAuth { settings } => (
                 settings.subdomain.clone(),
                 Auth::OAuth(Arc::new(OAuthProvider::new(settings.clone(), http.clone()))),
             ),

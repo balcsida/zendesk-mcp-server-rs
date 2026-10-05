@@ -58,7 +58,7 @@ type Captured = HashMap<String, String>;
 /// (no `ZENDESK_CLIENT_ID`), 130 on Ctrl-C.
 pub async fn run(http: reqwest::Client, manual: bool) -> Result<i32> {
     let settings = match load_credentials() {
-        Ok(Some(Credentials::OAuth(settings))) => settings,
+        Ok(Some(Credentials::OAuth { settings })) => settings,
         Ok(Some(_)) | Ok(None) => {
             eprintln!(
                 "error: OAuth is not configured. Set ZENDESK_CLIENT_ID to the identifier of a \
