@@ -325,7 +325,7 @@ zendesk-mcp-server http --bind 0.0.0.0:8080 --bearer-token "$(openssl rand -hex 
 
 - The MCP endpoint is `http://host:8080/mcp`.
 - `--bind` (or `MCP_HTTP_ADDR`) defaults to `127.0.0.1:8080`; the Docker image sets it to `0.0.0.0:8080`.
-- The `http` transport requires a bearer token (`--bearer-token` or `MCP_BEARER_TOKEN`). Clients send it as `Authorization: Bearer <token>`.
+- The `http` transport requires a bearer token (`--bearer-token` or `MCP_BEARER_TOKEN`), unless it runs in [per-user mode](#per-user-mode). Clients send it as `Authorization: Bearer <token>`.
 - `GET /healthz` is unauthenticated, for health checks.
 - The server speaks plain HTTP. Put TLS in front with a reverse proxy such as Caddy or nginx.
 
@@ -338,11 +338,54 @@ claude mcp add --transport http zendesk https://host/mcp --header "Authorization
 All MCP clients share the one Zendesk identity the server was authorized with.
 Everyone who holds the bearer token acts as that Zendesk user.
 
+### Per-user mode
+
+In per-user mode the server holds no Zendesk login of its own. Each client sends
+its own Zendesk token as the bearer token, the server passes it on, and Zendesk
+applies that user's permissions and records them as the author.
+
+```bash
+ZENDESK_SUBDOMAIN=acme zendesk-mcp-server http --per-user-auth --bind 0.0.0.0:8080
+```
+
+`--per-user-auth` (or `MCP_PER_USER_AUTH=true`) replaces `MCP_BEARER_TOKEN`, and
+setting both is an error. The server reads only `ZENDESK_SUBDOMAIN`.
+
+Each user signs in once on their own machine, then adds the server with the
+`access_token` from `~/.config/zendesk-mcp/mobile_token.json`:
+
+```bash
+zendesk-mcp-server mobile-auth
+claude mcp add --transport http zendesk https://host/mcp \
+  --header "Authorization: Bearer $(jq -r .access_token ~/.config/zendesk-mcp/mobile_token.json)"
+```
+
+- A `mobile-auth` token suits a fixed header because it has no refresh token to
+  rotate. When Zendesk stops accepting it, run `mobile-auth` again and add the
+  server again. Tokens from `auth` expire after 30 minutes and a header cannot
+  renew them, so they do not fit this mode.
+- Only `Bearer` tokens are accepted, not API tokens.
+- The server lets any bearer token through and leaves it to Zendesk to reject
+  invalid ones, so anyone who can reach the port can make it send requests to
+  Zendesk. Keep the port on a private network or behind a proxy that limits
+  request rates. The subdomain is fixed on the server, so the server cannot be
+  used to reach anything else.
+- Requests don't share sessions: each one stands alone with its own token. No
+  caller can join another's session, and a load balancer needs no sticky
+  sessions.
+- The knowledge-base resource is fetched on every read rather than cached,
+  because Help Center articles can be restricted to some users.
+- The tokens are personal credentials. Serve them over TLS only, and keep
+  request headers out of the proxy's logs.
+- The MCP specification calls this token passthrough. It works in clients that
+  let you set headers, such as Claude Code, Cursor and VS Code. Clients that only
+  support OAuth sign-in cannot connect this way.
+
 ## Environment variables
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `ZENDESK_SUBDOMAIN` | none | Zendesk subdomain (`acme` for `acme.zendesk.com`). Required for credentials 1 to 4. |
+| `ZENDESK_SUBDOMAIN` | none | Zendesk subdomain (`acme` for `acme.zendesk.com`). Required for credentials 1 to 4 and for per-user mode. |
 | `ZENDESK_CLIENT_ID` | none | Identifier of a public OAuth client. Enables OAuth. |
 | `ZENDESK_OAUTH_SCOPES` | `read tickets:write ticket_attachments:write users:write organizations:write hc:write` | Scopes requested at sign-in. |
 | `ZENDESK_OAUTH_REDIRECT_URI` | `http://localhost:4567/callback` | Redirect URL registered on the OAuth client. |
@@ -353,7 +396,8 @@ Everyone who holds the bearer token acts as that Zendesk user.
 | `ZENDESK_API_KEY` | none | API token (deprecated). |
 | `ZENDESK_SESSION_COOKIE` | none | `_zendesk_session` cookie of a signed-in browser. |
 | `MCP_HTTP_ADDR` | `127.0.0.1:8080` (`0.0.0.0:8080` in Docker) | Listen address for the `http` subcommand. Same as `--bind`. |
-| `MCP_BEARER_TOKEN` | none | Bearer token clients must present to the `http` transport. Same as `--bearer-token`. |
+| `MCP_BEARER_TOKEN` | none | Bearer token clients must present to the `http` transport, unless `MCP_PER_USER_AUTH` is set. Same as `--bearer-token`. |
+| `MCP_PER_USER_AUTH` | `false` | `true` has every `http` client act with its own Zendesk token, see [Per-user mode](#per-user-mode). Same as `--per-user-auth`. |
 | `RUST_LOG` | `info` | Log filter. Logs go to stderr. |
 
 ## Development
