@@ -129,11 +129,6 @@ pub fn default_token_file() -> PathBuf {
     config_dir().join("tokens.json")
 }
 
-/// Where `mobile-auth` stores its token unless `ZENDESK_MOBILE_TOKEN_FILE` says otherwise.
-pub fn default_mobile_token_file() -> PathBuf {
-    config_dir().join("mobile_token.json")
-}
-
 /// Expand a leading `~/` so operators can write `ZENDESK_TOKEN_FILE=~/x/tokens.json`.
 pub fn expand_home(path: &str) -> PathBuf {
     match path.strip_prefix("~/") {

@@ -7,7 +7,7 @@
 //!   temporary OS URL-scheme handler or by the operator pasting the URL.
 //!
 //! The access token (no refresh token) is saved to the mobile token file for the
-//! MCP server to use.
+//! CLI to use.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -62,7 +62,7 @@ window.addEventListener('DOMContentLoaded', function() {
 </head>
 <body style="font-family:system-ui,sans-serif;text-align:center;padding:60px">
 <h2>&#9989; Authentication successful!</h2>
-<p>You can close this tab. The MCP server is starting.</p>
+<p>You can close this tab.</p>
 </body></html>"##;
 
 /// `__AUTH_URL__` is replaced by the login URL as a JSON string literal, `__NONCE__` by the
@@ -201,9 +201,13 @@ impl fmt::Debug for MobileToken {
     }
 }
 
-/// `ZENDESK_MOBILE_TOKEN_FILE`, else `config::default_mobile_token_file()`.
+/// `ZENDESK_MOBILE_TOKEN_FILE`, else `<config dir>/mobile_token.json`.
 pub fn token_path() -> PathBuf {
     token_path_from(|key| std::env::var(key).ok())
+}
+
+fn default_token_path() -> PathBuf {
+    zendesk::config::config_dir().join("mobile_token.json")
 }
 
 fn token_path_from(get: impl Fn(&str) -> Option<String>) -> PathBuf {
@@ -211,8 +215,8 @@ fn token_path_from(get: impl Fn(&str) -> Option<String>) -> PathBuf {
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
     {
-        Some(path) => crate::config::expand_home(&path),
-        None => crate::config::default_mobile_token_file(),
+        Some(path) => zendesk::config::expand_home(&path),
+        None => default_token_path(),
     }
 }
 
@@ -335,7 +339,7 @@ fn device_name() -> String {
         .flatten()
         .map(|name| name.trim().to_string())
         .find(|name| !name.is_empty())
-        .unwrap_or_else(|| "zendesk-mcp".to_string())
+        .unwrap_or_else(|| "zendesk-cli".to_string())
 }
 
 /// POST `/access/oauth_mobile` with email and password.
@@ -729,7 +733,7 @@ impl UrlSchemeHandler {
         // Must be in ~/Applications for Launch Services to find it.
         let apps_dir = home_dir()?.join("Applications");
         std::fs::create_dir_all(&apps_dir)?;
-        let app_dir = apps_dir.join("ZendeskMCPAuth.app");
+        let app_dir = apps_dir.join("ZendeskCLIAuth.app");
         let _ = std::fs::remove_dir_all(&app_dir);
 
         // `on open location` is how macOS delivers custom-scheme URLs to apps. The script
@@ -777,7 +781,7 @@ end open location
         let plist = app_dir.join("Contents").join("Info.plist");
         let mut buddy = Command::new("/usr/libexec/PlistBuddy");
         for edit in [
-            "Set :CFBundleIdentifier com.zendesk-mcp-server.auth".to_string(),
+            "Set :CFBundleIdentifier com.zendesk-cli.auth".to_string(),
             "Add :CFBundleURLTypes array".to_string(),
             "Add :CFBundleURLTypes:0 dict".to_string(),
             "Add :CFBundleURLTypes:0:CFBundleURLName string Zendesk Support OAuth".to_string(),
@@ -798,7 +802,7 @@ end open location
         std::fs::create_dir_all(&apps_dir)?;
 
         let script_path = std::env::temp_dir().join(format!(
-            "zendesk-mcp-auth-handler-{}.sh",
+            "zendesk-cli-auth-handler-{}.sh",
             std::process::id()
         ));
         write_private(
@@ -816,11 +820,11 @@ end open location
             let _ = std::fs::remove_file(&cleanup_script);
         }));
 
-        let desktop_path = apps_dir.join("zendesk-mcp-auth.desktop");
+        let desktop_path = apps_dir.join("zendesk-cli-auth.desktop");
         std::fs::write(
             &desktop_path,
             format!(
-                "[Desktop Entry]\nType=Application\nName=Zendesk MCP Auth\nExec={} %u\n\
+                "[Desktop Entry]\nType=Application\nName=Zendesk CLI Auth\nExec={} %u\n\
                  NoDisplay=true\nMimeType=x-scheme-handler/{URL_SCHEME};\n",
                 script_path.display()
             ),
@@ -832,7 +836,7 @@ end open location
 
         run(Command::new("xdg-mime").args([
             "default",
-            "zendesk-mcp-auth.desktop",
+            "zendesk-cli-auth.desktop",
             &format!("x-scheme-handler/{URL_SCHEME}"),
         ]))?;
         tracing::info!("Registered Linux URL scheme handler via xdg-mime");
@@ -841,7 +845,7 @@ end open location
 
     fn register_windows(&mut self) -> Result<()> {
         let script_path =
-            std::env::temp_dir().join(format!("zendesk-mcp-auth-{}.ps1", std::process::id()));
+            std::env::temp_dir().join(format!("zendesk-cli-auth-{}.ps1", std::process::id()));
         let (script, command) = windows_handler(&script_path, &self.callback_url);
         write_private(&script_path, &script)?;
         let key = format!("HKCU\\Software\\Classes\\{URL_SCHEME}");
@@ -922,7 +926,7 @@ fn require_https_login_url(auth_url: &str) -> Result<String> {
 const REJECTED_TOKEN: &str =
     "The sign-in returned a token Zendesk does not accept; nothing was saved.";
 
-/// Non-interactive browser sign-in used by the server at startup.
+/// Non-interactive browser sign-in used when a command runs with no usable saved token.
 ///
 /// Discovers auth methods, picks the best (SSO > Google > Office 365 > email/password),
 /// serves a local callback/paste page, tries to register a temporary OS handler for
@@ -1001,9 +1005,7 @@ pub async fn auth_via_browser(
             tracing::info!("Browser authentication completed");
             Ok(token)
         }
-        _ => bail!(
-            "Authentication timed out. Run 'zendesk-mcp-server mobile-auth' manually to authenticate."
-        ),
+        _ => bail!("Authentication timed out. Run 'zendesk mobile-auth' manually to authenticate."),
     }
 }
 
@@ -1028,9 +1030,7 @@ pub async fn ensure_auth(http: &reqwest::Client, subdomain: Option<&str>) -> Res
         .map(str::to_string)
         .or_else(|| saved.map(|t| t.subdomain))
         .ok_or_else(|| {
-            anyhow!(
-                "ZENDESK_SUBDOMAIN is required. Set it in .env or run 'zendesk-mcp-server mobile-auth'."
-            )
+            anyhow!("ZENDESK_SUBDOMAIN is required. Set it in .env or run 'zendesk mobile-auth'.")
         })?;
     let token = auth_via_browser(http, &subdomain, BROWSER_TIMEOUT).await?;
     if !verify_token(http, &token.subdomain, &token.access_token).await {
@@ -1136,9 +1136,9 @@ async fn auth_sso_browser_interactive(subdomain: &str, auth_url: &str) -> Result
     }
 }
 
-/// Interactive `zendesk-mcp-server mobile-auth` command.
+/// Interactive `zendesk mobile-auth` command.
 pub async fn run_auth_cli(http: reqwest::Client) -> Result<()> {
-    println!("=== Zendesk MCP Server - Authentication ===\n");
+    println!("=== Zendesk mobile sign-in ===\n");
 
     if let Some(existing) = load_token()
         && verify_token(&http, &existing.subdomain, &existing.access_token).await
@@ -1225,7 +1225,9 @@ pub async fn run_auth_cli(http: reqwest::Client) -> Result<()> {
     println!("  User: {}", token.username.as_deref().unwrap_or("N/A"));
     println!("  Role: {}", token.user_role.as_deref().unwrap_or("N/A"));
     println!("  Token saved to: {}", path.display());
-    println!("\nThe MCP server will use this token automatically on next start.");
+    println!(
+        "\nzendesk commands use this token when no other credentials are configured. For the MCP server, pass it as ZENDESK_OAUTH_TOKEN, e.g. ZENDESK_OAUTH_TOKEN=$(zendesk token)."
+    );
     Ok(())
 }
 
@@ -1351,14 +1353,8 @@ mod tests {
             (k == "ZENDESK_MOBILE_TOKEN_FILE").then(|| "/tmp/t.json".to_string())
         });
         assert_eq!(custom, PathBuf::from("/tmp/t.json"));
-        assert_eq!(
-            token_path_from(|_| None),
-            crate::config::default_mobile_token_file()
-        );
-        assert_eq!(
-            token_path_from(|_| Some("  ".into())),
-            crate::config::default_mobile_token_file()
-        );
+        assert_eq!(token_path_from(|_| None), default_token_path());
+        assert_eq!(token_path_from(|_| Some("  ".into())), default_token_path());
     }
 
     #[test]
@@ -1697,14 +1693,14 @@ mod tests {
     fn windows_handler_uses_powershell_without_cmd() {
         let callback = callback_url_for(4242, "NONCE");
         let (script, command) =
-            windows_handler(Path::new(r"C:\Temp\zendesk-mcp-auth-1.ps1"), &callback);
+            windows_handler(Path::new(r"C:\Temp\zendesk-cli-auth-1.ps1"), &callback);
         assert_eq!(
             script,
             "param([string]$u)\r\nInvoke-RestMethod -Uri (\"http://127.0.0.1:4242/callback/NONCE?url=\" + [uri]::EscapeDataString($u)) | Out-Null\r\n"
         );
         assert_eq!(
             command,
-            "\"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\" -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File \"C:\\Temp\\zendesk-mcp-auth-1.ps1\" \"%1\""
+            "\"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\" -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File \"C:\\Temp\\zendesk-cli-auth-1.ps1\" \"%1\""
         );
         assert!(!command.contains("cmd") && !command.contains(".bat"));
     }

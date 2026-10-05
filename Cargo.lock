@@ -2623,7 +2623,6 @@ dependencies = [
  "pulldown-cmark",
  "rand",
  "reqwest",
- "rpassword",
  "serde",
  "serde_json",
  "sha2",
@@ -2634,6 +2633,31 @@ dependencies = [
  "uuid",
  "webbrowser",
  "wiremock",
+]
+
+[[package]]
+name = "zendesk-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "base64 0.23.1",
+ "clap",
+ "dotenvy",
+ "rand",
+ "reqwest",
+ "rpassword",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "uuid",
+ "webbrowser",
+ "wiremock",
+ "zendesk",
 ]
 
 [[package]]

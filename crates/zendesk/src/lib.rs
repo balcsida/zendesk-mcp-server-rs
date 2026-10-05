@@ -4,7 +4,6 @@ pub mod auth;
 pub mod authorize;
 pub mod client;
 pub mod config;
-pub mod mobile_auth;
 pub mod oauth;
 pub mod tokens;
 

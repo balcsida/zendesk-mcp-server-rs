@@ -1,6 +1,6 @@
 [package]
-name = "zendesk"
-description = "Zendesk API client and credentials shared by the MCP server and the CLI"
+name = "zendesk-cli"
+description = "Command-line client for Zendesk"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,19 +8,25 @@ license.workspace = true
 repository.workspace = true
 publish = false
 
+[[bin]]
+name = "zendesk"
+path = "src/main.rs"
+
 [dependencies]
+zendesk.workspace = true
 anyhow.workspace = true
 axum.workspace = true
 base64.workspace = true
-chrono.workspace = true
-pulldown-cmark.workspace = true
+clap.workspace = true
+dotenvy.workspace = true
 rand.workspace = true
 reqwest.workspace = true
+rpassword.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-sha2.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread"] }
 tracing.workspace = true
+tracing-subscriber.workspace = true
 url.workspace = true
 uuid.workspace = true
 webbrowser.workspace = true
