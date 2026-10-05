@@ -561,9 +561,9 @@ Get tickets for a user by role. Returns `count`, `tickets` (id, subject, status,
 
 #### count_tickets
 
-Count all tickets, or those matching a ZQL query: a cheap way to size a result set before searching. Returns `count`, `refreshed_at` (only for the unfiltered count) and `query`. Counts above 100,000 are approximate and refreshed daily.
+Count all tickets, or those matching a ZQL query: a cheap way to size a result set before searching. Returns `count` and `query`.
 
-- `query` (string, optional): ZQL query; include `type:ticket`, since a search also counts users and organizations
+- `query` (string, optional): ZQL query; include `type:ticket`, since a search also counts users and organizations. Defaults to `type:ticket`, which counts every ticket, archived ones included
 
 #### get_ticket_collaborators
 

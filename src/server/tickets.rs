@@ -246,7 +246,7 @@ struct UserTicketsParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct CountTicketsParams {
-    /// ZQL query, e.g. 'type:ticket status:open'; leave out to count all tickets
+    /// ZQL query, e.g. 'type:ticket status:open'; defaults to 'type:ticket' (all tickets)
     query: Option<String>,
 }
 
@@ -589,7 +589,7 @@ impl ZendeskServer {
     }
 
     #[tool(
-        description = "Count tickets: all tickets, or those matching a ZQL query (include type:ticket, since a search counts users and organizations too). A cheap way to size a result set before searching. Counts above 100,000 are approximate and refreshed daily.",
+        description = "Count tickets: all tickets, or those matching a ZQL query (include type:ticket, since a search counts users and organizations too). A cheap way to size a result set before searching.",
         annotations(read_only_hint = true)
     )]
     async fn count_tickets(&self, Parameters(p): Parameters<CountTicketsParams>) -> CallToolResult {

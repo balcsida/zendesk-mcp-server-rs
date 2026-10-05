@@ -728,29 +728,16 @@ impl ZendeskClient {
         )))
     }
 
-    /// Size a result set: `search/count` for a ZQL `query`, `tickets/count` otherwise.
+    /// Size a result set with `search/count`. Without a query this counts `type:ticket`:
+    /// `tickets/count` leaves out archived tickets and reports exactly 100,000 while it
+    /// refreshes a larger count.
     pub async fn count_tickets(&self, query: Option<&str>) -> Result<Value> {
         async {
-            match query.filter(|q| !q.is_empty()) {
-                Some(query) => {
-                    let data = self
-                        .api_get("search/count.json", &[("query", &query)])
-                        .await?;
-                    Ok(json!({
-                        "count": data["count"],
-                        "refreshed_at": null,
-                        "query": query,
-                    }))
-                }
-                None => {
-                    let data = self.api_get("tickets/count.json", &[]).await?;
-                    Ok(json!({
-                        "count": data["count"]["value"],
-                        "refreshed_at": data["count"]["refreshed_at"],
-                        "query": null,
-                    }))
-                }
-            }
+            let query = query.filter(|q| !q.is_empty()).unwrap_or("type:ticket");
+            let data = self
+                .api_get("search/count.json", &[("query", &query)])
+                .await?;
+            Ok(json!({ "count": data["count"], "query": query }))
         }
         .await
         .map_err(ctx("Failed to count tickets"))
@@ -887,7 +874,7 @@ mod tests {
     use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
     #[tokio::test]
-    async fn count_tickets_uses_search_count_with_a_query_and_tickets_count_without() {
+    async fn count_tickets_uses_search_count_and_defaults_to_all_tickets() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/v2/search/count.json"))
@@ -896,10 +883,9 @@ mod tests {
             .mount(&server)
             .await;
         Mock::given(method("GET"))
-            .and(path("/api/v2/tickets/count.json"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(
-                json!({"count": {"value": 102, "refreshed_at": "2020-04-06T02:18:17Z"}}),
-            ))
+            .and(path("/api/v2/search/count.json"))
+            .and(query_param("query", "type:ticket"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"count": 102})))
             .mount(&server)
             .await;
         let c = client(&server);
@@ -907,11 +893,11 @@ mod tests {
             c.count_tickets(Some("type:ticket status:open"))
                 .await
                 .unwrap(),
-            json!({"count": 6, "refreshed_at": null, "query": "type:ticket status:open"})
+            json!({"count": 6, "query": "type:ticket status:open"})
         );
         assert_eq!(
             c.count_tickets(None).await.unwrap(),
-            json!({"count": 102, "refreshed_at": "2020-04-06T02:18:17Z", "query": null})
+            json!({"count": 102, "query": "type:ticket"})
         );
     }
 
