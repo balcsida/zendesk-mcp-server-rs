@@ -1009,7 +1009,7 @@ pub async fn auth_via_browser(
     }
 }
 
-/// Token to use at server startup: the saved one if it is for `subdomain` and still
+/// Token to use for a command: the saved one if it is for `subdomain` and still
 /// verifies, else a fresh browser sign-in (saved before returning). `subdomain` may be
 /// `None` only when the saved token supplies it.
 pub async fn ensure_auth(http: &reqwest::Client, subdomain: Option<&str>) -> Result<MobileToken> {
