@@ -5,10 +5,11 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 use axum::response::IntoResponse;
 use rmcp::handler::server::router::prompt::PromptRouter;
 use rmcp::handler::server::router::tool::ToolRouter;
+use rmcp::handler::server::tool::ToolCallContext;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::*;
 use rmcp::service::RequestContext;
@@ -25,6 +26,7 @@ use tokio::sync::{Mutex, OnceCell};
 use tokio_util::sync::CancellationToken;
 use tower_http::validate_request::ValidateRequestHeaderLayer;
 
+use crate::auth::Auth;
 use crate::config::Credentials;
 use crate::zendesk::{ArticleSearch, ZendeskClient};
 
@@ -40,8 +42,8 @@ pub struct HttpArgs {
     )]
     pub bind: SocketAddr,
 
-    /// Bearer token MCP clients must present. Required, so the Zendesk credentials are
-    /// not exposed to anyone who can reach the port.
+    /// Bearer token MCP clients must present. Required unless --per-user-auth, so the
+    /// server's Zendesk login is not exposed to anyone who can reach the port.
     #[arg(
         long,
         env = "MCP_BEARER_TOKEN",
@@ -49,6 +51,11 @@ pub struct HttpArgs {
         value_name = "TOKEN"
     )]
     pub bearer_token: Option<String>,
+
+    /// Act as each caller: clients send their own Zendesk token as the bearer token, and
+    /// Zendesk applies that user's permissions. Only ZENDESK_SUBDOMAIN is needed.
+    #[arg(long, env = "MCP_PER_USER_AUTH")]
+    pub per_user_auth: bool,
 }
 
 /// How the server talks to its MCP client.
@@ -60,15 +67,35 @@ pub enum Transport {
 
 #[derive(Clone)]
 pub struct ZendeskServer {
-    credentials: Arc<Credentials>,
+    login: Arc<Login>,
     http: reqwest::Client,
-    /// Built on first use so a configuration or sign-in problem surfaces as a tool
-    /// error the MCP client can display, and is retried on the next call.
-    client: Arc<OnceCell<Arc<ZendeskClient>>>,
     /// The knowledge base with the time it was fetched; reused for [`KB_TTL`].
     kb_cache: Arc<Mutex<Option<(Instant, Value)>>>,
     tool_router: ToolRouter<ZendeskServer>,
     prompt_router: PromptRouter<ZendeskServer>,
+}
+
+/// Whose Zendesk login the tools act with.
+enum Login {
+    /// The server's own, described by the environment.
+    Shared {
+        credentials: Credentials,
+        /// Built on first use so a configuration or sign-in problem surfaces as a tool
+        /// error the MCP client can display, and is retried on the next call.
+        client: OnceCell<Arc<ZendeskClient>>,
+    },
+    /// Each caller's own: the Zendesk token their HTTP request carries as its bearer
+    /// token, held in [`CALLER`] while the request is served.
+    PerUser {
+        subdomain: String,
+        /// `https://{subdomain}.zendesk.com/api/v2` in production; tests point it at a mock.
+        base_url: String,
+    },
+}
+
+tokio::task_local! {
+    /// In per-user mode, the Zendesk credential of the request being served.
+    static CALLER: Auth;
 }
 
 const KB_TTL: Duration = Duration::from_secs(3600);
@@ -114,11 +141,33 @@ mod tickets;
 mod workflows;
 
 impl ZendeskServer {
+    /// A server acting with its own Zendesk login, described by `credentials`.
     pub fn new(credentials: Credentials, http: reqwest::Client) -> Self {
-        ZendeskServer {
-            credentials: Arc::new(credentials),
+        Self::with_login(
+            Login::Shared {
+                credentials,
+                client: OnceCell::new(),
+            },
             http,
-            client: Arc::new(OnceCell::new()),
+        )
+    }
+
+    /// A server acting as each caller, with the Zendesk token their request carries.
+    pub fn per_user(subdomain: String, http: reqwest::Client) -> Self {
+        let base_url = format!("https://{subdomain}.zendesk.com/api/v2");
+        Self::with_login(
+            Login::PerUser {
+                subdomain,
+                base_url,
+            },
+            http,
+        )
+    }
+
+    fn with_login(login: Login, http: reqwest::Client) -> Self {
+        ZendeskServer {
+            login: Arc::new(login),
+            http,
             kb_cache: Arc::new(Mutex::new(None)),
             tool_router: Self::ticket_router()
                 + Self::people_router()
@@ -130,20 +179,61 @@ impl ZendeskServer {
         }
     }
 
-    /// The shared client, authenticating on first use.
+    fn is_per_user(&self) -> bool {
+        matches!(*self.login, Login::PerUser { .. })
+    }
+
+    /// The client to act through: in per-user mode the caller's own, otherwise the
+    /// shared one, authenticating on first use.
     pub async fn client(&self) -> Result<Arc<ZendeskClient>> {
-        self.client
-            .get_or_try_init(|| async {
-                let (subdomain, auth) =
-                    crate::auth::Auth::from_credentials(&self.credentials, &self.http).await?;
-                Ok(Arc::new(ZendeskClient::new(
-                    &subdomain,
+        match &*self.login {
+            Login::PerUser {
+                subdomain,
+                base_url,
+            } => {
+                // Never a fallback to another login: no caller token, no call.
+                let auth = CALLER.try_with(Auth::clone).map_err(|_| {
+                    anyhow!("No Zendesk token: send your own as `Authorization: Bearer <token>`.")
+                })?;
+                Ok(Arc::new(ZendeskClient::with_base_url(
+                    subdomain,
                     auth,
                     self.http.clone(),
+                    base_url.clone(),
                 )))
-            })
-            .await
-            .cloned()
+            }
+            Login::Shared {
+                credentials,
+                client,
+            } => client
+                .get_or_try_init(|| async {
+                    let (subdomain, auth) = Auth::from_credentials(credentials, &self.http).await?;
+                    Ok(Arc::new(ZendeskClient::new(
+                        &subdomain,
+                        auth,
+                        self.http.clone(),
+                    )))
+                })
+                .await
+                .cloned(),
+        }
+    }
+
+    /// In per-user mode, the Zendesk token of the HTTP request behind `context`.
+    fn caller(&self, context: &RequestContext<RoleServer>) -> Option<Auth> {
+        if !self.is_per_user() {
+            return None;
+        }
+        let parts = context.extensions.get::<axum::http::request::Parts>()?;
+        bearer_token(&parts.headers).map(Auth::bearer)
+    }
+}
+
+/// Run `fut` with `caller` as the credential [`ZendeskServer::client`] acts with.
+async fn as_caller<T>(caller: Option<Auth>, fut: impl Future<Output = T>) -> T {
+    match caller {
+        Some(auth) => CALLER.scope(auth, fut).await,
+        None => fut.await,
     }
 }
 
@@ -324,6 +414,12 @@ impl ZendeskServer {
 
     /// The knowledge base, fetched at most once per [`KB_TTL`].
     async fn knowledge_base(&self) -> Result<Value> {
+        // Articles can be restricted to some users, so one caller's knowledge base must
+        // never be served to another.
+        // ponytail: per-user mode fetches on every read; cache per caller if that is slow.
+        if self.is_per_user() {
+            return self.client().await?.get_all_articles().await;
+        }
         let mut cache = self.kb_cache.lock().await;
         if let Some((fetched, kb)) = cache.as_ref()
             && fetched.elapsed() < KB_TTL
@@ -368,6 +464,19 @@ impl ZendeskServer {
 #[tool_handler(router = self.tool_router)]
 #[prompt_handler(router = self.prompt_router)]
 impl ServerHandler for ZendeskServer {
+    // Written out so every tool runs as the caller; #[tool_handler] then skips its own.
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, McpError> {
+        let caller = self.caller(&context);
+        let call = self
+            .tool_router
+            .call(ToolCallContext::new(self, request, context));
+        as_caller(caller, call).await
+    }
+
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(
             ServerCapabilities::builder()
@@ -401,7 +510,7 @@ impl ServerHandler for ZendeskServer {
     async fn read_resource(
         &self,
         request: ReadResourceRequestParams,
-        _: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResponse, McpError> {
         if request.uri != KB_URI {
             return Err(McpError::resource_not_found(
@@ -409,10 +518,12 @@ impl ServerHandler for ZendeskServer {
                 Some(json!({ "uri": request.uri })),
             ));
         }
-        let kb = self.knowledge_base().await.map_err(|e| {
-            tracing::error!("Error fetching knowledge base: {e:#}");
-            McpError::internal_error(format!("{e:#}"), None)
-        })?;
+        let kb = as_caller(self.caller(&context), self.knowledge_base())
+            .await
+            .map_err(|e| {
+                tracing::error!("Error fetching knowledge base: {e:#}");
+                McpError::internal_error(format!("{e:#}"), None)
+            })?;
         let sections = kb.as_object().map_or(0, |s| s.len());
         let total_articles: usize = kb.as_object().map_or(0, |s| {
             s.values()
@@ -433,8 +544,30 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-/// `/mcp` requires the bearer token; `/healthz` is open for load balancers.
-fn http_router(server: ZendeskServer, bearer_token: &str, ct: CancellationToken) -> axum::Router {
+/// The token of an `Authorization: Bearer <token>` header. The scheme is
+/// case-insensitive (RFC 7235).
+fn bearer_token(headers: &axum::http::HeaderMap) -> Option<&str> {
+    let value = headers
+        .get(axum::http::header::AUTHORIZATION)?
+        .to_str()
+        .ok()?;
+    let (scheme, token) = value.split_once(' ')?;
+    let token = token.trim();
+    (scheme.eq_ignore_ascii_case("bearer") && !token.is_empty()).then_some(token)
+}
+
+/// `/mcp` requires a bearer token: `shared_token`, or in per-user mode any token, since
+/// it is the caller's own Zendesk token and Zendesk checks it on every call. `/healthz`
+/// is open for load balancers.
+fn http_router(
+    server: ZendeskServer,
+    shared_token: Option<&str>,
+    ct: CancellationToken,
+) -> axum::Router {
+    // Taken from the server, not from `shared_token`, so a server acting with its own
+    // Zendesk login can never be opened to any token.
+    let per_user = server.is_per_user();
+    let expected = shared_token.map(str::to_string);
     let service = StreamableHttpService::new(
         move || Ok(server.clone()),
         LocalSessionManager::default().into(),
@@ -443,45 +576,41 @@ fn http_router(server: ZendeskServer, bearer_token: &str, ct: CancellationToken)
         // reached by name, so accept any `Host`.
         StreamableHttpServerConfig::default()
             .with_cancellation_token(ct.child_token())
-            .disable_allowed_hosts(),
+            .disable_allowed_hosts()
+            // rmcp keys a session by its id alone, so anyone holding a leaked id could read
+            // that session's responses, whatever their token. In per-user mode every
+            // request stands alone instead.
+            .with_legacy_session_mode(!per_user),
     );
-    let expected = bearer_token.to_string();
     axum::Router::new()
         .nest_service("/mcp", service)
         .layer(ValidateRequestHeaderLayer::custom(
             #[allow(clippy::result_large_err)]
             move |req: &mut axum::http::Request<axum::body::Body>| {
-                let presented = req
-                    .headers()
-                    .get(axum::http::header::AUTHORIZATION)
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|v| v.split_once(' '))
-                    .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
-                    .map(|(_, token)| token.trim());
-                match presented {
-                    Some(t) if constant_time_eq(t.as_bytes(), expected.as_bytes()) => Ok(()),
-                    _ => Err((
+                let allowed = match (bearer_token(req.headers()), &expected) {
+                    (Some(_), _) if per_user => true,
+                    (Some(t), Some(e)) => constant_time_eq(t.as_bytes(), e.as_bytes()),
+                    _ => false,
+                };
+                if allowed {
+                    Ok(())
+                } else {
+                    Err((
                         axum::http::StatusCode::UNAUTHORIZED,
                         [(axum::http::header::WWW_AUTHENTICATE, "Bearer")],
                     )
-                        .into_response()),
+                        .into_response())
                 }
             },
         ))
         .merge(axum::Router::new().route("/healthz", axum::routing::get(|| async { "ok" })))
 }
 
-/// Authenticate up front (so a browser sign-in happens at startup, not mid-call), then
-/// serve over the chosen transport.
+/// Serve over the chosen transport.
 pub async fn run(transport: Transport, http: reqwest::Client) -> Result<()> {
-    let credentials = crate::config::load_credentials()?;
-    let server = ZendeskServer::new(credentials, http);
-    if let Err(e) = server.client().await {
-        tracing::error!("Zendesk authentication failed: {e:#}");
-    }
-
     let args = match transport {
         Transport::Stdio => {
+            let server = signed_in_server(http).await?;
             tracing::info!("Serving MCP over stdio");
             server
                 .serve(rmcp::transport::stdio())
@@ -493,13 +622,25 @@ pub async fn run(transport: Transport, http: reqwest::Client) -> Result<()> {
         Transport::Http(args) => args,
     };
 
-    let Some(token) = args.bearer_token else {
-        bail!(
-            "MCP_BEARER_TOKEN (or --bearer-token) is required for the http transport so the Zendesk credentials are not exposed to anyone who can reach the port."
-        );
+    let (server, shared_token) = if args.per_user_auth {
+        if args.bearer_token.is_some() {
+            bail!(
+                "MCP_PER_USER_AUTH cannot be combined with MCP_BEARER_TOKEN: in per-user mode the Authorization header carries each caller's own Zendesk token."
+            );
+        }
+        let server = ZendeskServer::per_user(crate::config::load_subdomain()?, http);
+        tracing::info!("Per-user mode: every caller acts with their own Zendesk token");
+        (server, None)
+    } else {
+        let Some(token) = args.bearer_token else {
+            bail!(
+                "MCP_BEARER_TOKEN (or --bearer-token) is required for the http transport so the Zendesk credentials are not exposed to anyone who can reach the port. To have each caller use their own Zendesk token instead, set MCP_PER_USER_AUTH=true."
+            );
+        };
+        (signed_in_server(http).await?, Some(token))
     };
     let ct = CancellationToken::new();
-    let router = http_router(server, &token, ct.clone());
+    let router = http_router(server, shared_token.as_deref(), ct.clone());
     let listener = tokio::net::TcpListener::bind(args.bind).await?;
     tracing::info!(
         "Serving MCP over HTTP at http://{}/mcp",
@@ -512,6 +653,16 @@ pub async fn run(transport: Transport, http: reqwest::Client) -> Result<()> {
         })
         .await?;
     Ok(())
+}
+
+/// A server acting with its own Zendesk login from the environment, authenticated up
+/// front so a browser sign-in happens at startup, not mid-call.
+async fn signed_in_server(http: reqwest::Client) -> Result<ZendeskServer> {
+    let server = ZendeskServer::new(crate::config::load_credentials()?, http);
+    if let Err(e) = server.client().await {
+        tracing::error!("Zendesk authentication failed: {e:#}");
+    }
+    Ok(server)
 }
 
 /// Ctrl-C, or SIGTERM (what `docker stop` sends to PID 1).
@@ -875,7 +1026,7 @@ mod tests {
 
     #[tokio::test]
     async fn http_router_requires_bearer_on_mcp_only() {
-        let router = http_router(server(), "right-token", CancellationToken::new());
+        let router = http_router(server(), Some("right-token"), CancellationToken::new());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, router).await });
@@ -943,5 +1094,104 @@ mod tests {
             .await
             .unwrap();
         assert_ne!(authorized.status(), 401);
+    }
+
+    /// POST one JSON-RPC message to `/mcp` as the holder of `token`. Returns the session
+    /// id the server answered with, and the JSON-RPC response in the SSE body, if any.
+    async fn post_mcp(
+        http: &reqwest::Client,
+        url: &str,
+        token: &str,
+        message: Value,
+    ) -> (Option<String>, Option<Value>) {
+        let response = http
+            .post(url)
+            .bearer_auth(token)
+            .header("accept", "application/json, text/event-stream")
+            .json(&message)
+            .send()
+            .await
+            .unwrap();
+        assert!(response.status().is_success(), "{}", response.status());
+        let session = response
+            .headers()
+            .get("mcp-session-id")
+            .and_then(|v| v.to_str().ok())
+            .map(String::from);
+        let body = response.text().await.unwrap();
+        let reply = body
+            .lines()
+            .filter_map(|line| line.strip_prefix("data:"))
+            .filter_map(|data| serde_json::from_str::<Value>(data.trim()).ok())
+            .find(|message| message.get("id").is_some());
+        (session, reply)
+    }
+
+    #[tokio::test]
+    async fn per_user_mode_calls_zendesk_with_each_callers_own_token() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // Zendesk answers only when the request carries that caller's token.
+        let zendesk = MockServer::start().await;
+        for token in ["alice-token", "bob-token"] {
+            Mock::given(method("GET"))
+                .and(path("/api/v2/tickets/1.json"))
+                .and(header("authorization", format!("Bearer {token}").as_str()))
+                .respond_with(ResponseTemplate::new(200).set_body_json(
+                    json!({ "ticket": { "id": 1, "subject": format!("seen with {token}") } }),
+                ))
+                .mount(&zendesk)
+                .await;
+        }
+        let server = ZendeskServer::with_login(
+            Login::PerUser {
+                subdomain: "acme".into(),
+                base_url: format!("{}/api/v2", zendesk.uri()),
+            },
+            reqwest::Client::new(),
+        );
+        let router = http_router(server, None, CancellationToken::new());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, router).await });
+        let http = reqwest::Client::new();
+
+        // A token is still required; Zendesk decides whether it is any good.
+        let anonymous = http.post(&url).body("{}").send().await.unwrap();
+        assert_eq!(anonymous.status(), 401);
+
+        // Nor is there a standing stream to replay a caller's responses from.
+        let stream = http
+            .get(&url)
+            .bearer_auth("alice-token")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(stream.status(), 405);
+
+        for token in ["alice-token", "bob-token"] {
+            let initialize = json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "clientInfo": { "name": "test", "version": "0" },
+                },
+            });
+            let (session, _) = post_mcp(&http, &url, token, initialize).await;
+            // No session another caller could join: every request stands alone.
+            assert_eq!(session, None);
+            let call = json!({
+                "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                "params": { "name": "get_ticket", "arguments": { "ticket_id": 1 } },
+            });
+            let (_, reply) = post_mcp(&http, &url, token, call).await;
+            let reply = reply.expect("a tools/call response");
+            let text = reply["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap_or_default();
+            assert!(text.contains(&format!("seen with {token}")), "{reply}");
+        }
     }
 }

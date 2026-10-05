@@ -9,11 +9,14 @@
 //! 5. Nothing — the token saved by `zendesk-mcp-server mobile-auth`, or a browser sign-in at startup.
 //!
 //! `ZENDESK_SUBDOMAIN` is required for 1–4; for 5 it may also come from the saved mobile token.
+//!
+//! `http --per-user-auth` uses none of these: every caller sends their own Zendesk token,
+//! and only `ZENDESK_SUBDOMAIN` is read, through [`load_subdomain`].
 
 use std::fmt;
 use std::path::PathBuf;
 
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 
 /// The broad `read` (every GET endpoint, including ticket audits and search, which have
 /// no narrow scope) plus the narrow write scopes of the documented tool families. A few
@@ -27,6 +30,9 @@ pub const DEFAULT_OAUTH_SCOPES: &str =
 
 /// Must match a redirect URL registered on the OAuth client in Admin Center.
 pub const DEFAULT_REDIRECT_URI: &str = "http://localhost:4567/callback";
+
+const MISSING_SUBDOMAIN: &str =
+    "ZENDESK_SUBDOMAIN is not set. For https://acme.zendesk.com the subdomain is 'acme'.";
 
 pub const API_TOKEN_DEPRECATION_MESSAGE: &str = "Zendesk API token authentication is deprecated. \
 Zendesk deactivates unused API tokens from 2026-07-28, blocks creation of new ones from 2026-10-27, \
@@ -146,6 +152,15 @@ pub fn expand_home(path: &str) -> PathBuf {
     }
 }
 
+/// `ZENDESK_SUBDOMAIN` alone, for per-user mode.
+pub fn load_subdomain() -> Result<String> {
+    std::env::var("ZENDESK_SUBDOMAIN")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| anyhow!(MISSING_SUBDOMAIN))
+}
+
 /// Read credentials from the process environment.
 pub fn load_credentials() -> Result<Credentials> {
     load_credentials_from(|key| std::env::var(key).ok())
@@ -163,9 +178,7 @@ pub fn load_credentials_from(get: impl Fn(&str) -> Option<String>) -> Result<Cre
     let require_subdomain = || -> Result<String> {
         match &subdomain {
             Some(s) => Ok(s.clone()),
-            None => bail!(
-                "ZENDESK_SUBDOMAIN is not set. For https://acme.zendesk.com the subdomain is 'acme'."
-            ),
+            None => bail!(MISSING_SUBDOMAIN),
         }
     };
 

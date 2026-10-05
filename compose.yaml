@@ -2,7 +2,7 @@ services:
   zendesk-mcp:
     build: .
     command: ["http"]
-    # .env must also contain MCP_BEARER_TOKEN.
+    # .env must also contain MCP_BEARER_TOKEN, or MCP_PER_USER_AUTH=true.
     env_file: .env
     ports:
       - "8080:8080"

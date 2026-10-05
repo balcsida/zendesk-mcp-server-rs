@@ -35,6 +35,6 @@ ENV ZENDESK_TOKEN_FILE=/tokens/tokens.json \
 USER appuser
 EXPOSE 8080
 
-# Serves over stdio by default. Pass `http` (with MCP_BEARER_TOKEN set) for streamable
-# HTTP, or `auth --manual` to authorize.
+# Serves over stdio by default. Pass `http` (with MCP_BEARER_TOKEN or MCP_PER_USER_AUTH
+# set) for streamable HTTP, or `auth --manual` to authorize.
 ENTRYPOINT ["zendesk-mcp-server"]
