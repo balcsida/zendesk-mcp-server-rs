@@ -35,14 +35,18 @@ enum Command {
     /// Sign in through the Zendesk mobile app's OAuth flow (no OAuth client needed).
     MobileAuth,
     /// Print the bearer access token the other commands would use.
-    Token,
+    Token {
+        /// Use the token saved by mobile-auth even when other credentials are configured.
+        #[arg(long)]
+        mobile: bool,
+    },
     /// Call the Zendesk API and print the JSON response.
     Api {
         /// Path under /api/v2/ (e.g. tickets/1.json), or an absolute URL on this account.
         path: String,
-        /// HTTP method.
-        #[arg(short = 'X', long, default_value = "GET", value_parser = parse_method)]
-        method: reqwest::Method,
+        /// HTTP method. Defaults to GET, or POST when --data is given.
+        #[arg(short = 'X', long, value_parser = parse_method)]
+        method: Option<reqwest::Method>,
         /// JSON request body: inline, `@file`, or `@-` for stdin.
         #[arg(short, long)]
         data: Option<String>,
@@ -82,8 +86,8 @@ async fn run(cli: Cli) -> Result<i32> {
     match cli.command {
         Command::Auth { manual } => return zendesk::authorize::run(http, manual).await,
         Command::MobileAuth => mobile_auth::run_auth_cli(http).await?,
-        Command::Token => {
-            let (_, auth) = resolve_auth(&http).await?;
+        Command::Token { mobile } => {
+            let (_, auth) = resolve_auth(&http, mobile).await?;
             let value = auth.value().await?;
             let token = value.bearer_token().ok_or_else(|| {
                 anyhow!(
@@ -101,7 +105,12 @@ async fn run(cli: Cli) -> Result<i32> {
             let body = data
                 .map(|d| read_data(&d, &mut std::io::stdin()))
                 .transpose()?;
-            let (subdomain, auth) = resolve_auth(&http).await?;
+            let method = method.unwrap_or(if body.is_some() {
+                reqwest::Method::POST
+            } else {
+                reqwest::Method::GET
+            });
+            let (subdomain, auth) = resolve_auth(&http, false).await?;
             let client = ZendeskClient::new(&subdomain, auth, http);
             let value = client.api(method, &path, &query, body.as_ref()).await?;
             if !value.is_null() {
@@ -113,14 +122,11 @@ async fn run(cli: Cli) -> Result<i32> {
 }
 
 /// The configured credentials, else the saved (or freshly signed-in) mobile token.
-async fn resolve_auth(http: &reqwest::Client) -> Result<(String, Auth)> {
-    if let Some(creds) = config::load_credentials()? {
+async fn resolve_auth(http: &reqwest::Client, mobile: bool) -> Result<(String, Auth)> {
+    if !mobile && let Some(creds) = config::load_credentials()? {
         return Ok(Auth::from_credentials(&creds, http));
     }
-    let subdomain = std::env::var("ZENDESK_SUBDOMAIN")
-        .ok()
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty());
+    let subdomain = config::load_subdomain().ok();
     let token = mobile_auth::ensure_auth(http, subdomain.as_deref()).await?;
     Ok((token.subdomain, Auth::bearer(&token.access_token)))
 }

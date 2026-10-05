@@ -503,8 +503,8 @@ impl ZendeskClient {
             let mut url = url::Url::parse(path)?;
             if !self.is_account_url(&url)? {
                 bail!(
-                    "Refusing to send credentials to another host: {}",
-                    url.host_str().unwrap_or("")
+                    "Refusing to send credentials to {url}: not on this account ({})",
+                    self.base_url
                 );
             }
             if !query.is_empty() {

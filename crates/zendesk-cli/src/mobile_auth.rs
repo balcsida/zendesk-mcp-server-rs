@@ -1032,6 +1032,9 @@ pub async fn ensure_auth(http: &reqwest::Client, subdomain: Option<&str>) -> Res
         .ok_or_else(|| {
             anyhow!("ZENDESK_SUBDOMAIN is required. Set it in .env or run 'zendesk mobile-auth'.")
         })?;
+    eprintln!(
+        "No usable saved token. Signing in to {subdomain}.zendesk.com in your browser (waits up to 5 minutes). For the interactive flow run `zendesk mobile-auth`."
+    );
     let token = auth_via_browser(http, &subdomain, BROWSER_TIMEOUT).await?;
     if !verify_token(http, &token.subdomain, &token.access_token).await {
         bail!(REJECTED_TOKEN);

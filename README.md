@@ -206,6 +206,7 @@ which for most installations is an admin. Per-operator OAuth fixes that.
 > admin, and audit logs and comment authorship would all point at them. Since the
 > goal is for operators to have exactly their own Zendesk permissions, the
 > authorization code flow is the only one that fits.
+
 ### Session cookie
 
 Set `ZENDESK_SESSION_COOKIE` to the `_zendesk_session` cookie of a browser that is
@@ -228,7 +229,7 @@ The first match wins:
 
 `zendesk` calls the Zendesk API from scripts and the shell. `api` takes a path relative to `/api/v2/` (a leading `/` or `api/v2/` is tolerated), or an absolute URL on the account, so a `next_page` link can be passed straight back. It handles JSON endpoints only. It prints pretty-printed JSON on stdout, nothing for an empty body, and sends errors to stderr with exit code 1.
 
-`-X` sets the method, `-d` the body (inline JSON, `@file` or `@-` for stdin) and `-q key=value` a query parameter, repeatable.
+`-X` sets the method (GET by default, POST when `-d` is given), `-d` the body (inline JSON, `@file` or `@-` for stdin) and `-q key=value` a query parameter, repeatable.
 
 ```bash
 zendesk api users/me.json
@@ -242,7 +243,7 @@ zendesk api "$(zendesk api tickets.json | jq -r .next_page)"     # follow pagina
 ZENDESK_OAUTH_TOKEN=$(zendesk token) zendesk-mcp-server          # hand the CLI's token to the server
 ```
 
-`zendesk token` prints the bearer access token the CLI would use, refreshing OAuth first. It fails for API-token and cookie credentials.
+`zendesk token` prints the bearer access token the CLI would use, refreshing OAuth first. It fails for API-token and cookie credentials. `zendesk token --mobile` prints the saved mobile token even when `ZENDESK_CLIENT_ID` or another credential is configured.
 
 `token` and `api` read the same environment variables as the server, in the same [precedence](#credential-precedence). When none is set, they use the saved mobile token (checked with a `users/me` call). A browser sign-in opens if it is missing or rejected.
 
@@ -253,7 +254,6 @@ The CLI logs only warnings unless `RUST_LOG` is set.
 ```bash
 zendesk mobile-auth
 ```
-
 
 This signs in through the Zendesk mobile app's OAuth flow. No OAuth client is
 needed. Use it when you cannot register an OAuth client in Admin Center.
@@ -287,7 +287,7 @@ ZENDESK_OAUTH_TOKEN=$(zendesk token) zendesk-mcp-server
 ## Docker
 
 1. Copy `.env.example` to `.env` and fill in your Zendesk configuration. Keep this file outside version control.
-2. Pull the published image (`ghcr.io/balcsida/zendesk-mcp-server`; tags `latest`, `0.1` and `0.1.0`; linux/amd64 and linux/arm64):
+2. Pull the published image (`ghcr.io/balcsida/zendesk-mcp-server`; tags `latest`, `MAJOR.MINOR` and `MAJOR.MINOR.PATCH`, published from the next release on; linux/amd64 and linux/arm64):
 
    ```bash
    docker pull ghcr.io/balcsida/zendesk-mcp-server:latest
@@ -405,8 +405,10 @@ with the token it prints:
 ```bash
 zendesk mobile-auth
 claude mcp add --transport http zendesk https://host/mcp \
-  --header "Authorization: Bearer $(zendesk token)"
+  --header "Authorization: Bearer $(zendesk token --mobile)"
 ```
+
+`--mobile` makes sure the 30-minute OAuth token is not picked up when `ZENDESK_CLIENT_ID` is also set.
 
 - A `mobile-auth` token suits a fixed header because it has no refresh token to
   rotate. When Zendesk stops accepting it, run `zendesk mobile-auth` again and add the
@@ -446,7 +448,7 @@ claude mcp add --transport http zendesk https://host/mcp \
 | `MCP_HTTP_ADDR` | `127.0.0.1:8080` (`0.0.0.0:8080` in Docker) | Listen address for the `http` subcommand. Same as `--bind`. |
 | `MCP_BEARER_TOKEN` | none | Bearer token clients must present to the `http` transport, unless `MCP_PER_USER_AUTH` is set. Same as `--bearer-token`. |
 | `MCP_PER_USER_AUTH` | `false` | `true` has every `http` client act with its own Zendesk token, see [Per-user mode](#per-user-mode). Same as `--per-user-auth`. |
-| `RUST_LOG` | `info` | Log filter. Logs go to stderr. |
+| `RUST_LOG` | `info` (server), `warn` (CLI) | Log filter. Logs go to stderr. |
 
 ## Development
 
@@ -468,7 +470,7 @@ The tests use mocked HTTP and never contact Zendesk.
 
 ### Releasing
 
-Bump `version` in `Cargo.toml`, commit, tag `vX.Y.Z` and push the tag. The release
+Bump `version` in `Cargo.toml`, commit it together with the updated `Cargo.lock` (the release builds with `--locked`), tag `vX.Y.Z` and push the tag. The release
 workflow builds both binaries (`zendesk-mcp-server` and `zendesk`) for five targets and the
 two-arch `ghcr.io/balcsida/zendesk-mcp-server` image, then publishes the draft
 release once everything has succeeded.
@@ -500,7 +502,7 @@ If you're using Safari and seeing errors like "Safari cannot open the page becau
 
 If sign-in times out after 5 minutes:
 
-1. Check that the URL scheme handler registered successfully (look for `Registered macOS URL scheme handler`, or the Linux or Windows equivalent, in the command output; set `RUST_LOG=debug` for more detail).
+1. Check that the URL scheme handler registered successfully (run `RUST_LOG=info zendesk mobile-auth` and look for `Registered macOS URL scheme handler`, or the Linux or Windows equivalent, in the output; set `RUST_LOG=debug` for more detail).
 2. Try the manual fallback by opening the sign-in URL the command prints in your browser.
 3. Complete the sign-in and copy/paste the `zendesk-support://` URL from the address bar.
 
