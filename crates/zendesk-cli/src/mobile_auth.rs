@@ -480,13 +480,9 @@ impl Drop for CallbackServer {
     }
 }
 
-fn callback_url_for(port: u16, nonce: &str) -> String {
-    format!("http://127.0.0.1:{port}/callback/{nonce}")
-}
-
 impl CallbackServer {
     fn callback_url(&self) -> String {
-        callback_url_for(self.port, &self.nonce)
+        format!("http://127.0.0.1:{}/callback/{}", self.port, self.nonce)
     }
 
     fn auth_url(&self) -> String {
@@ -687,17 +683,12 @@ fn home_dir() -> Result<PathBuf> {
 }
 
 impl UrlSchemeHandler {
-    pub fn new(port: u16) -> Self {
+    /// `callback_url` is the callback server's nonced URL.
+    pub fn new(callback_url: String) -> Self {
         Self {
-            callback_url: callback_url_for(port, ""),
+            callback_url,
             cleanup: Vec::new(),
         }
-    }
-
-    /// Target the server's nonced callback URL; the default one (no nonce) answers 404.
-    fn with_callback_url(mut self, callback_url: String) -> Self {
-        self.callback_url = callback_url;
-        self
     }
 
     /// Create and register the handler. Returns false (after cleaning up) on failure.
@@ -971,8 +962,7 @@ pub async fn auth_via_browser(
     let full_auth_url = build_auth_url(&require_https_login_url(&auth_url)?);
 
     let mut server = start_callback_server(subdomain, full_auth_url.clone(), false).await?;
-    let mut scheme_handler =
-        UrlSchemeHandler::new(server.port).with_callback_url(server.callback_url());
+    let mut scheme_handler = UrlSchemeHandler::new(server.callback_url());
     let registered = scheme_handler.register();
 
     if registered {
@@ -1694,9 +1684,9 @@ mod tests {
 
     #[test]
     fn windows_handler_uses_powershell_without_cmd() {
-        let callback = callback_url_for(4242, "NONCE");
+        let callback = "http://127.0.0.1:4242/callback/NONCE";
         let (script, command) =
-            windows_handler(Path::new(r"C:\Temp\zendesk-cli-auth-1.ps1"), &callback);
+            windows_handler(Path::new(r"C:\Temp\zendesk-cli-auth-1.ps1"), callback);
         assert_eq!(
             script,
             "param([string]$u)\r\nInvoke-RestMethod -Uri (\"http://127.0.0.1:4242/callback/NONCE?url=\" + [uri]::EscapeDataString($u)) | Out-Null\r\n"
