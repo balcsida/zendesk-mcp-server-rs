@@ -313,6 +313,9 @@ zendesk mobile-auth
 This signs in through the Zendesk mobile app's OAuth flow. Like `auth`, it needs
 no OAuth client of your own. Use it for [per-user mode](#per-user-mode), or when
 zcli's client is blocked on your account.
+Other `zendesk` commands use the mobile token only while `ZENDESK_SUBDOMAIN` is
+unset; with it set they sign in through zcli's client, and `zendesk token --mobile`
+still prints the mobile token.
 
 - Accounts with email and password sign in directly, without a browser.
 - Accounts with SSO (SAML, Google, Office 365) open the system browser. The final
