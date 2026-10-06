@@ -480,6 +480,13 @@ impl ZendeskClient {
         Ok(())
     }
 
+    /// `https://{subdomain}.zendesk.com`: `base_url` without `/api/v2`.
+    pub(crate) fn origin(&self) -> &str {
+        self.base_url
+            .strip_suffix("/api/v2")
+            .unwrap_or(&self.base_url)
+    }
+
     /// Whether `url` has the same scheme, host and port as `base_url`.
     fn is_account_url(&self, url: &url::Url) -> Result<bool> {
         let base = url::Url::parse(&self.base_url)?;

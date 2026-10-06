@@ -8,8 +8,8 @@ This is a Rust rewrite of [reminia/zendesk-mcp-server](https://github.com/remini
 
 ## What is in the repository
 
-- `zendesk-mcp-server`: the MCP server. Tools for tickets, comments and attachments; search and counts; users, organizations, groups and brands; views, macros and triggers; custom objects; Help Center reading and writing; SLA and satisfaction data. Prompts for ticket analysis and response drafting. The Help Center articles as a knowledge base resource. Speaks stdio or streamable HTTP.
-- `zendesk`: the CLI for scripted use: `api`, `token`, `auth` and `mobile-auth`.
+- `zendesk-mcp-server`: the MCP server. Tools for tickets, comments and attachments; search and counts; users, organizations, groups and brands; views, macros and triggers; custom objects; Help Center reading and writing; SLA and satisfaction data. Four catalog tools that search, describe and call any other Zendesk API operation, so the server reaches the full API. Prompts for ticket analysis and response drafting. The Help Center articles as a knowledge base resource. Speaks stdio or streamable HTTP.
+- `zendesk`: the CLI for scripted use: a command for every Zendesk API operation (`zendesk <group> <operation>`), plus `api`, `token`, `auth` and `mobile-auth`.
 - `crates/zendesk`: the shared client library.
 
 Both binaries are single files with no runtime dependencies.
@@ -187,6 +187,11 @@ A few operations have no documented narrow scope: `recover_suspended_ticket`,
 `search_custom_object_records` with a `filter`. If one of them answers 403, add the
 broad `write` scope to `ZENDESK_OAUTH_SCOPES` (reads stay covered by `read`).
 
+The API catalog (the CLI's generated commands, and `call_api_read` and
+`call_api_write` on the server) also reaches families this table does not list,
+such as macros, triggers, webhooks and Talk. Writing to them needs the broad
+`write` scope, or the family's own scope where Zendesk documents one.
+
 `read` alone is the read-only configuration. Zendesk gives search, job statuses
 and ticket audits no narrow read scope (`tickets:read` is not enough for audits),
 so the broad `read` is requested and covers all of these. Narrow the write
@@ -265,6 +270,23 @@ ZENDESK_OAUTH_TOKEN=$(zendesk token) zendesk-mcp-server          # hand the CLI'
 `token` and `api` read the same environment variables as the server, in the same [precedence](#credential-precedence), also from a `.env` file in the working directory or any parent. When none is set, they use the saved mobile token (checked with a `users/me` call). A browser sign-in opens if it is missing or rejected.
 
 The CLI logs only warnings unless `RUST_LOG` is set.
+
+### API commands
+
+Every operation in the API catalog is a command, `zendesk <group> <operation>`. Both names are the catalog's kebab-cased: the group `Ticket Comments` is `ticket-comments`, the operation `ShowTicket` is `show-ticket`, `ListSLAPolicies` is `list-sla-policies`. `zendesk --help` lists the groups and `zendesk <group> --help` the operations in one. `zendesk <group> <operation> --help` shows the method, path, description and an example body.
+
+Path parameters are positional arguments. Query parameters are long options named after the parameter, with `[`, `]`, `_` and `.` turned into `-`: `page[size]` is `--page-size`. Every query option is repeatable; repeats become a list, sent comma-separated or as repeated parameters as the API expects. For an object parameter such as `page`, pass `KEY=VALUE`, which is sent as `page[KEY]=VALUE`. Where the API lists values for a parameter, help shows them as a hint; any value is accepted. `-p KEY=VALUE` (`--param`) adds a query parameter the catalog does not list, and is the way to set one whose option name would clash with `--data`, `--param` or another option. `-d` (`--data`) gives the JSON body of operations that write, inline, as `@file`, or as `@-` for stdin; it is required where the API requires a body.
+
+```bash
+zendesk tickets show-ticket 123
+zendesk tickets list-tickets --sort-by updated_at --sort-order desc
+zendesk search list-search-results --query 'type:ticket status:open'
+zendesk tickets create-ticket -d @ticket.json
+zendesk ticket-comments list-ticket-comments 123 --page size=10
+zendesk tickets list-tickets -p external_id=abc-1
+```
+
+Output and errors work as for `api`. The commands are built from the catalog on every run.
 
 ### Mobile sign-in
 
@@ -489,6 +511,8 @@ cargo run -p zendesk-mcp-server
 
 The tests use mocked HTTP and never contact Zendesk.
 
+`crates/zendesk/src/catalog.json`, the list of API operations the CLI and the MCP server are built on, is generated. Regenerate it with `uv run scripts/gen_catalog.py`: it reads Zendesk's OpenAPI specs and the collections of its public Postman workspace. Add `--specs DIR` to read local copies instead of downloading.
+
 ### Releasing
 
 Bump `version` in `Cargo.toml`, commit it together with the updated `Cargo.lock` (the release builds with `--locked`), tag `vX.Y.Z` and push the tag. The release
@@ -547,7 +571,7 @@ Draft a response to a Zendesk ticket.
 
 ## MCP tools
 
-Tools carry MCP annotations (read-only, destructive) so clients can ask for confirmation before changes. The categories below cover tickets, ticket operations, search, users and organizations, views, macros and triggers, account, custom objects, the Help Center, and metrics and SLAs.
+Tools carry MCP annotations (read-only, destructive) so clients can ask for confirmation before changes. The categories below cover tickets, ticket operations, search, users and organizations, views, macros and triggers, account, custom objects, the Help Center, metrics and SLAs, and the API catalog.
 
 ### Tickets
 
@@ -1177,3 +1201,46 @@ List CSAT satisfaction ratings with `score`, `comment`, `reason`, `reason_id`, t
 - `days_back` (integer, optional): Only ratings from the last N days (defaults to 30)
 - `page` (integer, optional): Defaults to 1
 - `per_page` (integer, optional): Max 100 (defaults to 25)
+
+### API catalog
+
+These four tools reach the full Zendesk API (Support, Help Center, Talk, webhooks, chat and more) without one tool per endpoint. Search for an operation, read its description, then call it.
+
+Operations that return or change credentials (API and OAuth tokens, OAuth client and webhook signing secrets, Help Center JWTs, passwords, ZIS connections and inbound webhooks) are left out, so a secret never lands in the model's context through a read a client may approve automatically. The CLI runs them.
+
+#### search_api_operations
+
+Search the full Zendesk API by keywords. Use it when no dedicated tool fits.
+
+- `query` (string): Keywords, e.g. `list ticket comments`; an operation must match every word
+- `limit` (integer, optional): Operations to return, max 100 (defaults to 20)
+
+Returns `total` and the first `limit` operations, each with `id`, `method`, `path` and `summary`.
+
+#### get_api_operation
+
+Describe one API operation.
+
+- `operation_id` (string): An id from `search_api_operations`, e.g. `ShowTicket` (case-insensitive)
+
+Returns the operation with its group, path and query parameters, an example request body and a description, plus `tool`: `call_api_read` or `call_api_write`, whichever runs it.
+
+#### call_api_read
+
+Run a read-only (`GET`) operation. Refuses other operations and points to `call_api_write`.
+
+- `operation_id` (string)
+- `params` (object, optional): Path and query parameters by name, e.g. `{"ticket_id": 1, "include": "users"}`. An array is sent comma-separated, or as repeated pairs when the name ends in `[]` or the API wants the parameter repeated. An object is sent as `name[key]=value`, so `{"page": {"size": 10}}` becomes `page[size]=10`
+- `fields` (array of strings, optional): Keep only these keys of each object in the response, to save tokens. It applies to the elements of top-level arrays and to top-level objects other than `meta` and `links`; other values such as `next_page` and `count` stay. An empty list keeps everything
+
+Returns the response as compact JSON. Page through large listings with the operation's paging parameters, such as `per_page` or `page[size]`.
+
+#### call_api_write
+
+Run an operation that writes (`POST`, `PUT`, `PATCH` or `DELETE`). It may create, change or delete Zendesk data and may notify customers, so call `get_api_operation` first to see the parameters and an example body. Refuses reads and points to `call_api_read`.
+
+- `operation_id` (string)
+- `params` (object, optional): Path and query parameters, as for `call_api_read`
+- `body` (object, optional): The JSON request body
+
+Returns the response as compact JSON, or `{"message": "<METHOD> <path> succeeded"}` when Zendesk answers with an empty body.
