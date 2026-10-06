@@ -96,13 +96,23 @@ fn http_client() -> Result<reqwest::Client> {
         .build()?)
 }
 
+/// Like [`http_client`], but never follows a redirect: `zendesk login` sends a sign-in
+/// code and receives a token, neither of which may go to wherever a proxy points.
+fn login_client() -> Result<reqwest::Client> {
+    Ok(reqwest::Client::builder()
+        .user_agent(concat!("zendesk-cli/", env!("CARGO_PKG_VERSION")))
+        .timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?)
+}
+
 async fn run(cli: Cli) -> Result<i32> {
     let http = http_client()?;
 
     match cli.command {
         Command::Auth { manual } => return zendesk::authorize::run(http, manual).await,
         Command::MobileAuth => mobile_auth::run_auth_cli(http).await?,
-        Command::Login { url } => login(&http, &url).await?,
+        Command::Login { url } => login(&login_client()?, &url).await?,
         Command::Token { mobile } => {
             let (_, auth) = resolve_auth(&http, mobile).await?;
             let value = auth.value().await?;
@@ -154,10 +164,14 @@ async fn login(http: &reqwest::Client, url: &str) -> Result<()> {
             .ok_or_else(|| anyhow!("{origin} sent an unexpected answer: {name} is missing"))
     };
     let state = field(&started, "state")?;
+    let authorize_url = field(&started, "authorize_url")?;
+    if !url::Url::parse(&authorize_url).is_ok_and(|u| u.scheme() == "https") {
+        bail!("The server sent a sign-in URL that is not https, so it was not opened.");
+    }
     let captured = zendesk::authorize::receive_code_via_loopback(
         &field(&started, "redirect_uri")?,
         &state,
-        &field(&started, "authorize_url")?,
+        &authorize_url,
     )
     .await?;
     let code = zendesk::authorize::validate_callback(&captured, &state)?;
@@ -309,5 +323,45 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("https"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn login_opens_only_https_sign_in_urls() {
+        let mock = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/cli/login"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "authorize_url": "file:///etc/passwd",
+                    "state": "s",
+                    "redirect_uri": "http://localhost:19186/",
+                })),
+            )
+            .mount(&mock)
+            .await;
+        let err = login(&reqwest::Client::new(), &mock.uri())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "The server sent a sign-in URL that is not https, so it was not opened."
+        );
+    }
+
+    #[tokio::test]
+    async fn login_does_not_follow_redirects() {
+        let mock = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/cli/login"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(307)
+                    .insert_header("location", "http://example.com/"),
+            )
+            .mount(&mock)
+            .await;
+        let err = login(&login_client().unwrap(), &mock.uri())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("307"), "{err}");
     }
 }
