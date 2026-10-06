@@ -50,7 +50,7 @@ pub fn generate_pkce_pair() -> PkcePair {
     }
 }
 
-fn challenge_for(verifier: &str) -> String {
+pub fn challenge_for(verifier: &str) -> String {
     URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()))
 }
 
@@ -103,6 +103,18 @@ async fn post_token_request(
     })
 }
 
+/// The stored login cannot be renewed; only signing in again helps.
+#[derive(Debug)]
+pub struct ReauthRequired(pub String);
+
+impl std::fmt::Display for ReauthRequired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ReauthRequired {}
+
 /// Translate an error body into an error, without echoing credentials.
 fn token_error(status: u16, body: &[u8]) -> anyhow::Error {
     let parsed: Option<serde_json::Value> = serde_json::from_slice(body).ok();
@@ -121,10 +133,10 @@ fn token_error(status: u16, body: &[u8]) -> anyhow::Error {
     };
     let message = format!("Zendesk rejected the token request (HTTP {status}). {detail}");
     match error {
-        Some("invalid_grant") => anyhow!(
+        Some("invalid_grant") => anyhow::Error::new(ReauthRequired(format!(
             "{message}\nThe authorization code or refresh token is expired, revoked or already \
              used. Run zendesk-mcp-server auth (or zendesk auth) to authorize again."
-        ),
+        ))),
         Some("invalid_scope") => anyhow!(
             "{message}\nThe requested scopes exceed the OAuth client's allowed scopes. Widen \
              them in Admin Center or narrow ZENDESK_OAUTH_SCOPES."
@@ -147,7 +159,7 @@ pub async fn exchange_authorization_code(
     exchange_code_at(http, &settings.token_endpoint(), settings, code, pkce).await
 }
 
-async fn exchange_code_at(
+pub async fn exchange_code_at(
     http: &reqwest::Client,
     endpoint: &str,
     settings: &OAuthSettings,
@@ -276,9 +288,8 @@ impl OAuthProvider {
         }
     }
 
-    /// Point token requests at a test server instead of Zendesk.
-    #[cfg(test)]
-    pub(crate) fn with_token_endpoint(mut self, endpoint: &str) -> Self {
+    /// Point token requests somewhere other than Zendesk, such as a test server.
+    pub fn with_token_endpoint(mut self, endpoint: &str) -> Self {
         self.token_endpoint = endpoint.to_string();
         self
     }
@@ -355,10 +366,10 @@ impl OAuthProvider {
             return Ok(stored);
         }
         if !stored.can_refresh() {
-            bail!(
+            return Err(anyhow::Error::new(ReauthRequired(format!(
                 "The Zendesk refresh token is missing or expired, so access cannot be renewed \
                  ({reason}). Run zendesk-mcp-server auth (or zendesk auth) to authorize this machine again."
-            );
+            ))));
         }
 
         tracing::info!("Renewing the Zendesk access token because {reason}.");
@@ -528,10 +539,38 @@ mod tests {
             &pkce(),
         )
         .await
-        .unwrap_err()
-        .to_string();
+        .unwrap_err();
+        assert!(err.is::<ReauthRequired>());
+        let err = err.to_string();
         assert!(err.contains("HTTP 400") && err.contains("invalid_grant: code used"));
         assert!(err.contains("zendesk-mcp-server auth"));
+    }
+
+    #[tokio::test]
+    async fn other_token_errors_are_not_reauth_required() {
+        let dir = tempfile::tempdir().unwrap();
+        for response in [
+            ResponseTemplate::new(400)
+                .set_body_json(serde_json::json!({ "error": "invalid_scope" })),
+            ResponseTemplate::new(500),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(response)
+                .mount(&server)
+                .await;
+            let endpoint = format!("{}/oauth/tokens", server.uri());
+            let err = exchange_code_at(
+                &reqwest::Client::new(),
+                &endpoint,
+                &settings(dir.path()),
+                "c",
+                &pkce(),
+            )
+            .await
+            .unwrap_err();
+            assert!(!err.is::<ReauthRequired>());
+        }
     }
 
     #[tokio::test]
@@ -650,7 +689,9 @@ mod tests {
         let mut tokens = stored("stale", -10);
         tokens.refresh_token = None;
         let provider = provider(dir.path(), &server, &tokens);
-        let err = provider.access_token().await.unwrap_err().to_string();
+        let err = provider.access_token().await.unwrap_err();
+        assert!(err.is::<ReauthRequired>());
+        let err = err.to_string();
         assert!(err.contains("refresh token is missing or expired"));
         assert!(err.contains("the stored access token has expired"));
         assert!(err.contains("zendesk-mcp-server auth"));
