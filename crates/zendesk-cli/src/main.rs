@@ -1,3 +1,4 @@
+mod commands;
 mod mobile_auth;
 
 use std::io::Read;
@@ -5,7 +6,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use serde_json::Value;
 use tracing_subscriber::EnvFilter;
 use zendesk::ZendeskClient;
@@ -68,7 +69,12 @@ async fn main() {
         .with_ansi(false)
         .init();
 
-    match run(Cli::parse()).await {
+    let matches = commands::command(Cli::command()).get_matches();
+    let result = match commands::selected(&matches) {
+        Some((op, op_matches)) => commands::run(op, op_matches).await.map(|()| 0),
+        None => run(Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit())).await,
+    };
+    match result {
         Ok(code) => std::process::exit(code),
         Err(e) => {
             eprintln!("error: {e:#}");
@@ -77,11 +83,15 @@ async fn main() {
     }
 }
 
-async fn run(cli: Cli) -> Result<i32> {
-    let http = reqwest::Client::builder()
+fn http_client() -> Result<reqwest::Client> {
+    Ok(reqwest::Client::builder()
         .user_agent(concat!("zendesk-cli/", env!("CARGO_PKG_VERSION")))
         .timeout(Duration::from_secs(30))
-        .build()?;
+        .build()?)
+}
+
+async fn run(cli: Cli) -> Result<i32> {
+    let http = http_client()?;
 
     match cli.command {
         Command::Auth { manual } => return zendesk::authorize::run(http, manual).await,
@@ -113,12 +123,18 @@ async fn run(cli: Cli) -> Result<i32> {
             let (subdomain, auth) = resolve_auth(&http, false).await?;
             let client = ZendeskClient::new(&subdomain, auth, http);
             let value = client.api(method, &path, &query, body.as_ref()).await?;
-            if !value.is_null() {
-                println!("{}", serde_json::to_string_pretty(&value)?);
-            }
+            print_json(&value)?;
         }
     }
     Ok(0)
+}
+
+/// Print `value` as pretty JSON, nothing for null.
+fn print_json(value: &Value) -> Result<()> {
+    if !value.is_null() {
+        println!("{}", serde_json::to_string_pretty(value)?);
+    }
+    Ok(())
 }
 
 /// The configured credentials, else the saved (or freshly signed-in) mobile token.

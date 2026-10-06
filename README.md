@@ -9,7 +9,7 @@ This is a Rust rewrite of [reminia/zendesk-mcp-server](https://github.com/remini
 ## What is in the repository
 
 - `zendesk-mcp-server`: the MCP server. Tools for tickets, comments and attachments; search and counts; users, organizations, groups and brands; views, macros and triggers; custom objects; Help Center reading and writing; SLA and satisfaction data. Prompts for ticket analysis and response drafting. The Help Center articles as a knowledge base resource. Speaks stdio or streamable HTTP.
-- `zendesk`: the CLI for scripted use: `api`, `token`, `auth` and `mobile-auth`.
+- `zendesk`: the CLI for scripted use: a command for every Zendesk API operation (`zendesk <group> <operation>`), plus `api`, `token`, `auth` and `mobile-auth`.
 - `crates/zendesk`: the shared client library.
 
 Both binaries are single files with no runtime dependencies.
@@ -265,6 +265,23 @@ ZENDESK_OAUTH_TOKEN=$(zendesk token) zendesk-mcp-server          # hand the CLI'
 `token` and `api` read the same environment variables as the server, in the same [precedence](#credential-precedence), also from a `.env` file in the working directory or any parent. When none is set, they use the saved mobile token (checked with a `users/me` call). A browser sign-in opens if it is missing or rejected.
 
 The CLI logs only warnings unless `RUST_LOG` is set.
+
+### API commands
+
+Every operation in the API catalog is a command, `zendesk <group> <operation>`. Both names are the catalog's kebab-cased: the group `Ticket Comments` is `ticket-comments`, the operation `ShowTicket` is `show-ticket`, `ListSLAPolicies` is `list-sla-policies`. `zendesk --help` lists the groups and `zendesk <group> --help` the operations in one. `zendesk <group> <operation> --help` shows the method, path, description and an example body.
+
+Path parameters are positional arguments. Query parameters are long options named after the parameter, with `[`, `]`, `_` and `.` turned into `-`: `page[size]` is `--page-size`. Every query option is repeatable; repeats become a list, sent comma-separated or as repeated parameters as the API expects. For an object parameter such as `page`, pass `KEY=VALUE`, which is sent as `page[KEY]=VALUE`. Where the API lists values for a parameter, help shows them as a hint; any value is accepted. `-p KEY=VALUE` (`--param`) adds a query parameter the catalog does not list, and is the way to set one whose option name would clash with `--data`, `--param` or another option. `-d` (`--data`) gives the JSON body of operations that write, inline, as `@file`, or as `@-` for stdin; it is required where the API requires a body.
+
+```bash
+zendesk tickets show-ticket 123
+zendesk tickets list-tickets --sort-by updated_at --sort-order desc
+zendesk search list-search-results --query 'type:ticket status:open'
+zendesk tickets create-ticket -d @ticket.json
+zendesk ticket-comments list-ticket-comments 123 --page size=10
+zendesk tickets list-tickets -p external_id=abc-1
+```
+
+Output and errors work as for `api`. The commands are built from the catalog on every run.
 
 ### Mobile sign-in
 
