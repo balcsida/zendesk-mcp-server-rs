@@ -56,6 +56,12 @@ pub struct HttpArgs {
     /// Zendesk applies that user's permissions. Only ZENDESK_SUBDOMAIN is needed.
     #[arg(long, env = "MCP_PER_USER_AUTH")]
     pub per_user_auth: bool,
+
+    /// Public origin of this server, like https://zendesk-mcp.example.com. With
+    /// --per-user-auth, MCP clients sign in here, and the server keeps each user's
+    /// Zendesk login.
+    #[arg(long, env = "MCP_PUBLIC_URL", value_name = "URL", value_parser = sign_in::parse_public_url)]
+    pub public_url: Option<String>,
 }
 
 /// How the server talks to its MCP client.
@@ -134,6 +140,7 @@ mod catalog;
 mod custom_objects;
 mod help_center;
 mod people;
+mod sign_in;
 mod ticket_ops;
 mod tickets;
 mod workflows;
@@ -207,6 +214,10 @@ impl ZendeskServer {
             return None;
         }
         let parts = context.extensions.get::<axum::http::request::Parts>()?;
+        // `sign_in::require_caller` put the `Auth` of a stored login here.
+        if let Some(auth) = parts.extensions.get::<Auth>() {
+            return Some(auth.clone());
+        }
         bearer_token(&parts.headers).map(Auth::bearer)
     }
 }
@@ -544,6 +555,7 @@ fn bearer_token(headers: &axum::http::HeaderMap) -> Option<&str> {
 fn http_router(
     server: ZendeskServer,
     shared_token: Option<&str>,
+    sign_in: Option<Arc<sign_in::SignIn>>,
     ct: CancellationToken,
 ) -> axum::Router {
     // Taken from the server, not from `shared_token`, so a server acting with its own
@@ -564,9 +576,13 @@ fn http_router(
             // request stands alone instead.
             .with_legacy_session_mode(!per_user),
     );
-    axum::Router::new()
-        .nest_service("/mcp", service)
-        .layer(ValidateRequestHeaderLayer::custom(
+    let mcp = axum::Router::new().nest_service("/mcp", service);
+    let mcp = match &sign_in {
+        Some(sign_in) => mcp.layer(axum::middleware::from_fn_with_state(
+            sign_in.clone(),
+            sign_in::require_caller,
+        )),
+        None => mcp.layer(ValidateRequestHeaderLayer::custom(
             #[allow(clippy::result_large_err)]
             move |req: &mut axum::http::Request<axum::body::Body>| {
                 let allowed = match (bearer_token(req.headers()), &expected) {
@@ -584,8 +600,13 @@ fn http_router(
                         .into_response())
                 }
             },
-        ))
-        .merge(axum::Router::new().route("/healthz", axum::routing::get(|| async { "ok" })))
+        )),
+    };
+    let router = match &sign_in {
+        Some(sign_in) => mcp.merge(sign_in.routes()),
+        None => mcp,
+    };
+    router.merge(axum::Router::new().route("/healthz", axum::routing::get(|| async { "ok" })))
 }
 
 /// Serve over the chosen transport.
@@ -604,13 +625,16 @@ pub async fn run(transport: Transport, http: reqwest::Client) -> Result<()> {
         Transport::Http(args) => args,
     };
 
+    if args.public_url.is_some() && !args.per_user_auth {
+        bail!("--public-url (MCP_PUBLIC_URL) needs --per-user-auth (MCP_PER_USER_AUTH=true).");
+    }
     let (server, shared_token) = if args.per_user_auth {
         if args.bearer_token.is_some() {
             bail!(
                 "MCP_PER_USER_AUTH cannot be combined with MCP_BEARER_TOKEN: in per-user mode the Authorization header carries each caller's own Zendesk token."
             );
         }
-        let server = ZendeskServer::per_user(config::load_subdomain()?, http);
+        let server = ZendeskServer::per_user(config::load_subdomain()?, http.clone());
         tracing::info!("Per-user mode: every caller acts with their own Zendesk token");
         (server, None)
     } else {
@@ -619,10 +643,17 @@ pub async fn run(transport: Transport, http: reqwest::Client) -> Result<()> {
                 "MCP_BEARER_TOKEN (or --bearer-token) is required for the http transport so the Zendesk credentials are not exposed to anyone who can reach the port. To have each caller use their own Zendesk token instead, set MCP_PER_USER_AUTH=true."
             );
         };
-        (signed_in_server(http)?, Some(token))
+        (signed_in_server(http.clone())?, Some(token))
     };
     let ct = CancellationToken::new();
-    let router = http_router(server, shared_token.as_deref(), ct.clone());
+    let sign_in = match args.public_url {
+        Some(public) => {
+            tracing::info!("Sign-in through this server is on: {public}/mcp");
+            Some(sign_in::SignIn::from_env(public, http)?)
+        }
+        None => None,
+    };
+    let router = http_router(server, shared_token.as_deref(), sign_in, ct.clone());
     let listener = tokio::net::TcpListener::bind(args.bind).await?;
     tracing::info!(
         "Serving MCP over HTTP at http://{}/mcp",
@@ -1017,7 +1048,12 @@ mod tests {
 
     #[tokio::test]
     async fn http_router_requires_bearer_on_mcp_only() {
-        let router = http_router(server(), Some("right-token"), CancellationToken::new());
+        let router = http_router(
+            server(),
+            Some("right-token"),
+            None,
+            CancellationToken::new(),
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, router).await });
@@ -1089,7 +1125,7 @@ mod tests {
 
     /// POST one JSON-RPC message to `/mcp` as the holder of `token`. Returns the session
     /// id the server answered with, and the JSON-RPC response in the SSE body, if any.
-    async fn post_mcp(
+    pub(super) async fn post_mcp(
         http: &reqwest::Client,
         url: &str,
         token: &str,
@@ -1142,7 +1178,7 @@ mod tests {
             },
             reqwest::Client::new(),
         );
-        let router = http_router(server, None, CancellationToken::new());
+        let router = http_router(server, None, None, CancellationToken::new());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/mcp", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, router).await });
