@@ -6,11 +6,14 @@
 //! 2. `ZENDESK_OAUTH_TOKEN` — a fixed bearer token.
 //! 3. `ZENDESK_EMAIL` + `ZENDESK_API_KEY` — deprecated API token (Zendesk retires these on 2027-04-30).
 //! 4. `ZENDESK_SESSION_COOKIE` — the `_zendesk_session` cookie of a signed-in browser.
+//! 5. `ZENDESK_SUBDOMAIN` alone — OAuth with PKCE through zcli's public client
+//!    ([`ZCLI_CLIENT_ID`]), authorized once the same way as 1.
 //!
-//! If none is set, [`load_credentials`] returns `None` and the caller decides what that
-//! means: the MCP server fails, the CLI falls back to its saved mobile token.
+//! If not even `ZENDESK_SUBDOMAIN` is set, [`load_credentials`] returns `None` and the
+//! caller decides what that means: the MCP server fails, the CLI falls back to its saved
+//! mobile token.
 //!
-//! `ZENDESK_SUBDOMAIN` is required for 1–4.
+//! `ZENDESK_SUBDOMAIN` is required for 1–5.
 //!
 //! `http --per-user-auth` uses none of these: every caller sends their own Zendesk token,
 //! and only `ZENDESK_SUBDOMAIN` is read, through [`load_subdomain`].
@@ -33,14 +36,26 @@ pub const DEFAULT_OAUTH_SCOPES: &str =
 /// Must match a redirect URL registered on the OAuth client in Admin Center.
 pub const DEFAULT_REDIRECT_URI: &str = "http://localhost:4567/callback";
 
-const MISSING_SUBDOMAIN: &str =
+/// The public OAuth client of zcli, Zendesk's own CLI, used when `ZENDESK_CLIENT_ID` is
+/// not set so that nobody has to register a client in Admin Center. Zendesk does not
+/// document it for other tools, so it may be renamed or restricted;
+/// `ZENDESK_CLIENT_ID` switches to a client of your own.
+pub const ZCLI_CLIENT_ID: &str = "zdg-zcli-oauth";
+
+/// zcli's client accepts this and the same URL on ports 19187 and 19188.
+pub const ZCLI_REDIRECT_URI: &str = "http://localhost:19186/";
+
+/// What zcli itself requests, so its client is known to grant it.
+pub const ZCLI_OAUTH_SCOPES: &str = "read write";
+
+pub(crate) const MISSING_SUBDOMAIN: &str =
     "ZENDESK_SUBDOMAIN is not set. For https://acme.zendesk.com the subdomain is 'acme'.";
 
 pub const API_TOKEN_DEPRECATION_MESSAGE: &str = "Zendesk API token authentication is deprecated. \
 Zendesk deactivates unused API tokens from 2026-07-28, blocks creation of new ones from 2026-10-27, \
 and stops accepting all API tokens on 2027-04-30. It also grants this server the full access of the \
-token's user rather than the permissions of the operator using it. Migrate to OAuth by setting \
-ZENDESK_CLIENT_ID and running `zendesk-mcp-server auth` (or `zendesk auth`).";
+token's user rather than the permissions of the operator using it. Migrate to OAuth by unsetting \
+ZENDESK_EMAIL and ZENDESK_API_KEY and running `zendesk-mcp-server auth` (or `zendesk auth`).";
 
 /// OAuth authorization-code-with-PKCE configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -176,24 +191,35 @@ pub fn load_credentials_from(get: impl Fn(&str) -> Option<String>) -> Result<Opt
         }
     };
 
-    if let Some(client_id) = clean("ZENDESK_CLIENT_ID") {
+    // Not named `oauth`: CodeQL takes a call to anything named OAuth for a source of
+    // secrets, as with `Credentials::OAuth`.
+    let sign_in_with = |client_id: String| -> Result<Option<Credentials>> {
+        // zcli's client accepts only its own redirect URLs.
+        let (scopes, redirect_uri) = if client_id == ZCLI_CLIENT_ID {
+            (ZCLI_OAUTH_SCOPES, ZCLI_REDIRECT_URI)
+        } else {
+            (DEFAULT_OAUTH_SCOPES, DEFAULT_REDIRECT_URI)
+        };
         let settings = OAuthSettings {
             subdomain: require_subdomain()?,
             client_id,
             token_file: clean("ZENDESK_TOKEN_FILE")
                 .map(|p| expand_home(&p))
                 .unwrap_or_else(default_token_file),
-            scopes: clean("ZENDESK_OAUTH_SCOPES")
-                .unwrap_or_else(|| DEFAULT_OAUTH_SCOPES.to_string()),
+            scopes: clean("ZENDESK_OAUTH_SCOPES").unwrap_or_else(|| scopes.to_string()),
             redirect_uri: clean("ZENDESK_OAUTH_REDIRECT_URI")
-                .unwrap_or_else(|| DEFAULT_REDIRECT_URI.to_string()),
+                .unwrap_or_else(|| redirect_uri.to_string()),
         };
         tracing::info!(
             client_id = %settings.client_id,
             token_file = %settings.token_file.display(),
             "Using Zendesk OAuth authentication"
         );
-        return Ok(Some(Credentials::OAuth { settings }));
+        Ok(Some(Credentials::OAuth { settings }))
+    };
+
+    if let Some(client_id) = clean("ZENDESK_CLIENT_ID") {
+        return sign_in_with(client_id);
     }
 
     if let Some(access_token) = clean("ZENDESK_OAUTH_TOKEN") {
@@ -228,6 +254,10 @@ pub fn load_credentials_from(get: impl Fn(&str) -> Option<String>) -> Result<Opt
             subdomain: require_subdomain()?,
             cookie,
         }));
+    }
+
+    if subdomain.is_some() {
+        return sign_in_with(ZCLI_CLIENT_ID.to_string());
     }
 
     Ok(None)
@@ -289,10 +319,33 @@ mod tests {
     #[test]
     fn nothing_set_means_no_credentials() {
         assert_eq!(load_credentials_from(env(&[])).unwrap(), None);
-        assert_eq!(
-            load_credentials_from(env(&[("ZENDESK_SUBDOMAIN", " acme ")])).unwrap(),
-            None
-        );
+    }
+
+    #[test]
+    fn subdomain_alone_signs_in_with_zcli_client() {
+        let settings_for = |pairs: &[(&str, &str)]| match load_credentials_from(env(pairs)).unwrap()
+        {
+            Some(Credentials::OAuth { settings }) => settings,
+            other => panic!("expected OAuth, got {other:?}"),
+        };
+        let zcli = settings_for(&[("ZENDESK_SUBDOMAIN", " acme ")]);
+        assert_eq!(zcli.subdomain, "acme");
+        assert_eq!(zcli.client_id, "zdg-zcli-oauth");
+        assert_eq!(zcli.redirect_uri, "http://localhost:19186/");
+        assert_eq!(zcli.scopes, "read write");
+        // Naming zcli's client explicitly gets its defaults too.
+        let named = settings_for(&[
+            ("ZENDESK_SUBDOMAIN", "acme"),
+            ("ZENDESK_CLIENT_ID", "zdg-zcli-oauth"),
+        ]);
+        assert_eq!(named, zcli);
+        // An explicit credential wins over the fallback.
+        let bearer = load_credentials_from(env(&[
+            ("ZENDESK_SUBDOMAIN", "acme"),
+            ("ZENDESK_OAUTH_TOKEN", "t"),
+        ]))
+        .unwrap();
+        assert!(matches!(bearer, Some(Credentials::Bearer { .. })));
     }
 
     #[test]

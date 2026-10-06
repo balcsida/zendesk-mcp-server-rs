@@ -1219,7 +1219,7 @@ pub async fn run_auth_cli(http: reqwest::Client) -> Result<()> {
     println!("  Role: {}", token.user_role.as_deref().unwrap_or("N/A"));
     println!("  Token saved to: {}", path.display());
     println!(
-        "\nzendesk commands use this token when no other credentials are configured. For the MCP server, pass it as ZENDESK_OAUTH_TOKEN, e.g. ZENDESK_OAUTH_TOKEN=$(zendesk token)."
+        "\n`zendesk token --mobile` prints this token, e.g. ZENDESK_OAUTH_TOKEN=$(zendesk token --mobile) for the MCP server. Other zendesk commands use it only when nothing is configured, not even ZENDESK_SUBDOMAIN."
     );
     Ok(())
 }

@@ -5,7 +5,7 @@ use std::io::Read;
 use std::path::Path;
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use serde_json::Value;
 use tracing_subscriber::EnvFilter;
@@ -16,8 +16,8 @@ use zendesk::config;
 /// Command-line client for Zendesk.
 ///
 /// Configuration comes from the environment and a .env file in the working directory or
-/// any parent. With no credentials configured, commands use the token saved by
-/// `mobile-auth`.
+/// any parent. With nothing configured, not even ZENDESK_SUBDOMAIN, commands use the token
+/// saved by `mobile-auth`.
 #[derive(Parser)]
 #[command(name = "zendesk", version, about)]
 struct Cli {
@@ -40,6 +40,12 @@ enum Command {
         /// Use the token saved by mobile-auth even when other credentials are configured.
         #[arg(long)]
         mobile: bool,
+    },
+    /// Sign in through a remote zendesk-mcp-server and print the token for its
+    /// Authorization header.
+    Login {
+        /// The server's address, like https://zendesk-mcp.example.com/mcp.
+        url: String,
     },
     /// Call the Zendesk API and print the JSON response.
     Api {
@@ -90,12 +96,23 @@ fn http_client() -> Result<reqwest::Client> {
         .build()?)
 }
 
+/// Like [`http_client`], but never follows a redirect: `zendesk login` sends a sign-in
+/// code and receives a token, neither of which may go to wherever a proxy points.
+fn login_client() -> Result<reqwest::Client> {
+    Ok(reqwest::Client::builder()
+        .user_agent(concat!("zendesk-cli/", env!("CARGO_PKG_VERSION")))
+        .timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?)
+}
+
 async fn run(cli: Cli) -> Result<i32> {
     let http = http_client()?;
 
     match cli.command {
         Command::Auth { manual } => return zendesk::authorize::run(http, manual).await,
         Command::MobileAuth => mobile_auth::run_auth_cli(http).await?,
+        Command::Login { url } => login(&login_client()?, &url).await?,
         Command::Token { mobile } => {
             let (_, auth) = resolve_auth(&http, mobile).await?;
             let value = auth.value().await?;
@@ -127,6 +144,81 @@ async fn run(cli: Cli) -> Result<i32> {
         }
     }
     Ok(0)
+}
+
+/// Sign in through the zendesk-mcp-server at `url`, catching the Zendesk redirect on this
+/// machine. Prints the server token on stdout and how to use it on stderr.
+async fn login(http: &reqwest::Client, url: &str) -> Result<()> {
+    let parsed = url::Url::parse(url).with_context(|| format!("{url} is not a valid URL"))?;
+    let local = matches!(parsed.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
+    if !(parsed.scheme() == "https" || (parsed.scheme() == "http" && local)) {
+        bail!("{url} must use https: the token it returns is a credential.");
+    }
+    let origin = parsed.origin().ascii_serialization();
+
+    let started = post_json(http, &format!("{origin}/cli/login"), None).await?;
+    let field = |value: &Value, name: &str| -> Result<String> {
+        value[name]
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| anyhow!("{origin} sent an unexpected answer: {name} is missing"))
+    };
+    let state = field(&started, "state")?;
+    let authorize_url = field(&started, "authorize_url")?;
+    if !url::Url::parse(&authorize_url).is_ok_and(|u| u.scheme() == "https") {
+        bail!("The server sent a sign-in URL that is not https, so it was not opened.");
+    }
+    let captured = zendesk::authorize::receive_code_via_loopback(
+        &field(&started, "redirect_uri")?,
+        &state,
+        &authorize_url,
+    )
+    .await?;
+    let code = zendesk::authorize::validate_callback(&captured, &state)?;
+
+    let finished = post_json(
+        http,
+        &format!("{origin}/cli/login/finish"),
+        Some(serde_json::json!({ "state": state, "code": code })),
+    )
+    .await?;
+    let token = field(&finished, "access_token")?;
+    let user = &finished["user"];
+    let user_field = |name| user[name].as_str().unwrap_or_default();
+    eprintln!(
+        "Signed in to {origin} as {} <{}>.\n\
+         Send the token below as \"Authorization: Bearer <token>\". With it in ZENDESK_MCP_TOKEN:\n  \
+         Claude Code: claude mcp add --transport http zendesk {origin}/mcp --header \"Authorization: Bearer $ZENDESK_MCP_TOKEN\"\n  \
+         Pi:          \"headers\": {{\"Authorization\": \"Bearer ${{ZENDESK_MCP_TOKEN}}\"}}\n  \
+         OpenCode:    \"headers\": {{\"Authorization\": \"Bearer {{env:ZENDESK_MCP_TOKEN}}\"}}, \"oauth\": false",
+        user_field("name"),
+        user_field("email"),
+    );
+    println!("{token}");
+    Ok(())
+}
+
+/// POST `body` (if any) to `url` and return the JSON answer. A failure status becomes an
+/// error carrying the server's `error_description`.
+async fn post_json(http: &reqwest::Client, url: &str, body: Option<Value>) -> Result<Value> {
+    let request = http.post(url);
+    let request = match body {
+        Some(body) => request.json(&body),
+        None => request,
+    };
+    let response = request
+        .send()
+        .await
+        .with_context(|| format!("POST {url}"))?;
+    let status = response.status();
+    let answer: Value = response.json().await.unwrap_or(Value::Null);
+    if !status.is_success() {
+        match answer["error_description"].as_str() {
+            Some(description) => bail!("{description}"),
+            None => bail!("{url} answered {status}"),
+        }
+    }
+    Ok(answer)
 }
 
 /// Print `value` as pretty JSON, nothing for null.
@@ -223,5 +315,53 @@ mod tests {
         let err = read_data("{nope", &mut std::io::empty()).unwrap_err();
         assert!(err.to_string().contains("not valid JSON"), "{err}");
         assert!(read_data("@/nonexistent/body.json", &mut std::io::empty()).is_err());
+    }
+
+    #[tokio::test]
+    async fn login_requires_https() {
+        let err = login(&reqwest::Client::new(), "http://mcp.example.com/mcp")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("https"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn login_opens_only_https_sign_in_urls() {
+        let mock = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/cli/login"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "authorize_url": "file:///etc/passwd",
+                    "state": "s",
+                    "redirect_uri": "http://localhost:19186/",
+                })),
+            )
+            .mount(&mock)
+            .await;
+        let err = login(&reqwest::Client::new(), &mock.uri())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "The server sent a sign-in URL that is not https, so it was not opened."
+        );
+    }
+
+    #[tokio::test]
+    async fn login_does_not_follow_redirects() {
+        let mock = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/cli/login"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(307)
+                    .insert_header("location", "http://example.com/"),
+            )
+            .mount(&mock)
+            .await;
+        let err = login(&login_client().unwrap(), &mock.uri())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("307"), "{err}");
     }
 }

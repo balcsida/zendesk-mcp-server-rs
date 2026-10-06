@@ -27,7 +27,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
-use crate::config::{Credentials, OAuthSettings, load_credentials};
+use crate::config::{Credentials, MISSING_SUBDOMAIN, OAuthSettings, load_credentials};
 use crate::oauth::{
     PkcePair, build_authorization_url, exchange_authorization_code, generate_pkce_pair,
     generate_state,
@@ -51,20 +51,24 @@ const FAILURE_PAGE: &str = "<!doctype html>
 ";
 
 /// Query parameters of the redirect (first value of each key).
-type Captured = HashMap<String, String>;
+pub type Captured = HashMap<String, String>;
 
 /// Run the authorization flow. Returns the process exit code: 0 on success, 1 when
 /// authorization or the token exchange failed, 2 when OAuth is not configured
-/// (no `ZENDESK_CLIENT_ID`), 130 on Ctrl-C.
+/// (no `ZENDESK_SUBDOMAIN`, or another credential takes precedence), 130 on Ctrl-C.
 pub async fn run(http: reqwest::Client, manual: bool) -> Result<i32> {
     let settings = match load_credentials() {
         Ok(Some(Credentials::OAuth { settings })) => settings,
-        Ok(Some(_)) | Ok(None) => {
+        Ok(Some(_)) => {
             eprintln!(
-                "error: OAuth is not configured. Set ZENDESK_CLIENT_ID to the identifier of a \
-                 public OAuth client from Admin Center (Apps and integrations > APIs > OAuth \
-                 clients)."
+                "error: ZENDESK_OAUTH_TOKEN, ZENDESK_EMAIL + ZENDESK_API_KEY or \
+                 ZENDESK_SESSION_COOKIE is set and takes precedence over OAuth. Unset it, or \
+                 set ZENDESK_CLIENT_ID to put OAuth first."
             );
+            return Ok(2);
+        }
+        Ok(None) => {
+            eprintln!("error: {MISSING_SUBDOMAIN}");
             return Ok(2);
         }
         Err(err) => {
@@ -118,7 +122,7 @@ async fn authorize(
     let captured = if manual {
         receive_code_manually(authorization_url).await?
     } else {
-        receive_code_via_loopback(settings, state, authorization_url).await?
+        receive_code_via_loopback(&settings.redirect_uri, state, authorization_url).await?
     };
     let code = validate_callback(&captured, state)?;
     let tokens = exchange_authorization_code(http, settings, &code, pkce).await?;
@@ -205,23 +209,25 @@ async fn bind_loopback(redirect_uri: &str) -> Result<TcpListener> {
     })
 }
 
-async fn receive_code_via_loopback(
-    settings: &OAuthSettings,
+/// Listen on the loopback `redirect_uri`, open the browser at `authorization_url` and
+/// return the query of the redirect that carries `state`. Progress goes to stderr.
+pub async fn receive_code_via_loopback(
+    redirect_uri: &str,
     state: &str,
     authorization_url: &str,
 ) -> Result<Captured> {
-    let listener = bind_loopback(&settings.redirect_uri).await?;
+    let listener = bind_loopback(redirect_uri).await?;
     let (sender, receiver) = oneshot::channel();
     let router = callback_router(sender, state);
     let server = tokio::spawn(async move {
         let _ = axum::serve(listener, router).await;
     });
 
-    println!("Opening your browser to authorize with Zendesk:\n  {authorization_url}\n");
+    eprintln!("Opening your browser to authorize with Zendesk:\n  {authorization_url}\n");
     if webbrowser::open(authorization_url).is_err() {
-        println!("Could not open a browser automatically. Open the URL above manually.\n");
+        eprintln!("Could not open a browser automatically. Open the URL above manually.\n");
     }
-    println!("Waiting up to {CALLBACK_TIMEOUT_SECONDS}s for the redirect...");
+    eprintln!("Waiting up to {CALLBACK_TIMEOUT_SECONDS}s for the redirect...");
 
     let result =
         tokio::time::timeout(Duration::from_secs(CALLBACK_TIMEOUT_SECONDS), receiver).await;
@@ -253,7 +259,7 @@ async fn receive_code_manually(authorization_url: &str) -> Result<Captured> {
 }
 
 /// A pasted redirect URL yields its query pairs; anything else is a bare code.
-fn parse_pasted(pasted: &str) -> Result<Captured> {
+pub fn parse_pasted(pasted: &str) -> Result<Captured> {
     let pasted = pasted.trim();
     if pasted.is_empty() {
         bail!("Nothing was pasted, so authorization cannot continue.");
@@ -267,7 +273,9 @@ fn parse_pasted(pasted: &str) -> Result<Captured> {
     Ok(Captured::from([("code".to_owned(), pasted.to_owned())]))
 }
 
-fn validate_callback(captured: &Captured, expected_state: &str) -> Result<String> {
+/// The code of a captured redirect, once its `state` matches `expected_state` and
+/// Zendesk reported no error.
+pub fn validate_callback(captured: &Captured, expected_state: &str) -> Result<String> {
     if let Some(error) = captured.get("error") {
         let detail = captured
             .get("error_description")
