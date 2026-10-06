@@ -48,6 +48,9 @@ pub struct Param {
     /// The allowed values, when the spec lists them.
     #[serde(default, rename = "enum", skip_serializing_if = "Vec::is_empty")]
     pub values: Vec<String>,
+    /// Send an array as repeated `name=value` pairs rather than comma-separated.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub explode: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -88,9 +91,12 @@ pub fn find(id: &str) -> Option<&'static Operation> {
 }
 
 /// Operations matching every word of `query` (case-insensitive substrings of the id,
-/// summary, group, path or description), best match first.
+/// summary, group, path or description), best match first. None for an empty query.
 pub fn search(query: &str) -> Vec<&'static Operation> {
     let words: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
+    if words.is_empty() {
+        return Vec::new();
+    }
     let mut hits: Vec<(u32, &Operation)> = operations()
         .iter()
         .filter_map(|op| {
@@ -128,8 +134,9 @@ impl Operation {
 
     /// The path with `args` filled in (each value percent-encoded as one segment) and the
     /// query string from the remaining `args`. Null values are skipped; an array is sent
-    /// comma-separated, or as repeated pairs when the name ends in `[]`; an object is sent
-    /// as `name[key]=value` pairs, so `{"page": {"size": 10}}` becomes `page[size]=10`.
+    /// comma-separated, or as repeated pairs when the name ends in `[]` or the parameter is
+    /// `explode`; an object is sent as `name[key]=value` pairs, so `{"page": {"size": 10}}`
+    /// becomes `page[size]=10`.
     pub fn request(&self, args: &Map<String, Value>) -> Result<(String, Vec<(String, String)>)> {
         let mut path = String::new();
         let mut used = Vec::new();
@@ -154,7 +161,8 @@ impl Operation {
         let mut query = Vec::new();
         for (name, value) in args {
             if !used.contains(&name.as_str()) {
-                push_query(&mut query, name, value)?;
+                let explode = self.params.iter().any(|p| p.name == *name && p.explode);
+                push_query(&mut query, name, value, explode)?;
             }
         }
         if let Some(missing) = self.params.iter().find(|p| {
@@ -177,10 +185,15 @@ fn scalar(name: &str, value: &Value) -> Result<String> {
     }
 }
 
-fn push_query(query: &mut Vec<(String, String)>, name: &str, value: &Value) -> Result<()> {
+fn push_query(
+    query: &mut Vec<(String, String)>,
+    name: &str,
+    value: &Value,
+    explode: bool,
+) -> Result<()> {
     match value {
         Value::Null => {}
-        Value::Array(items) if name.ends_with("[]") => {
+        Value::Array(items) if explode || name.ends_with("[]") => {
             for item in items {
                 query.push((name.to_string(), scalar(name, item)?));
             }
@@ -191,7 +204,7 @@ fn push_query(query: &mut Vec<(String, String)>, name: &str, value: &Value) -> R
         }
         Value::Object(fields) => {
             for (key, value) in fields {
-                push_query(query, &format!("{name}[{key}]"), value)?;
+                push_query(query, &format!("{name}[{key}]"), value, false)?;
             }
         }
         _ => query.push((name.to_string(), scalar(name, value)?)),
@@ -318,6 +331,7 @@ mod tests {
             text.contains("show") && text.contains("ticket")
         }));
         assert!(search("zzzz-nothing").is_empty());
+        assert!(search("  ").is_empty());
     }
 
     #[test]
@@ -328,18 +342,22 @@ mod tests {
             "params": [
                 {"name": "thing_id", "in": "path", "required": true},
                 {"name": "part", "in": "path", "required": true},
+                {"name": "at", "in": "query", "explode": true},
             ],
         }));
         let (p, q) = o
             .request(&args(json!({
                 "thing_id": 7, "part": "a/b", "ids": [1, 2], "ids[]": [3, 4],
                 "page": {"size": 10, "after": "c"}, "flag": true, "skip": null,
+                "at": ["x", "y"],
             })))
             .unwrap();
         assert_eq!(p, "/api/v2/things/7/parts/a%2Fb");
         let mut q = q;
         q.sort();
         let expected: Vec<(String, String)> = [
+            ("at", "x"),
+            ("at", "y"),
             ("flag", "true"),
             ("ids", "1,2"),
             ("ids[]", "3"),
@@ -442,5 +460,11 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("multipart/form-data"), "{err}");
         assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[test]
+    fn paths_outside_api_v2_go_to_the_account_host() {
+        let c = ZendeskClient::new("acme", Auth::bearer("t"), reqwest::Client::new());
+        assert_eq!(c.origin(), "https://acme.zendesk.com");
     }
 }

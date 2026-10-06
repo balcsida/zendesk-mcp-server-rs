@@ -489,6 +489,8 @@ cargo run -p zendesk-mcp-server
 
 The tests use mocked HTTP and never contact Zendesk.
 
+`crates/zendesk/src/catalog.json`, the list of API operations the CLI and the MCP server are built on, is generated. Regenerate it with `uv run scripts/gen_catalog.py`: it reads Zendesk's OpenAPI specs and the collections of its public Postman workspace. Add `--specs DIR` to read local copies instead of downloading.
+
 ### Releasing
 
 Bump `version` in `Cargo.toml`, commit it together with the updated `Cargo.lock` (the release builds with `--locked`), tag `vX.Y.Z` and push the tag. The release
