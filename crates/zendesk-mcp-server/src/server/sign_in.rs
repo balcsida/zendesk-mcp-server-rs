@@ -2,23 +2,79 @@
 //! `/mcp` middleware that finds them, and the OAuth metadata that tells clients where to
 //! sign in.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
 use axum::Json;
-use axum::extract::{Request, State};
+use axum::body::Bytes;
+use axum::extract::{Query, Request, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use serde_json::json;
+use axum::{Form, routing};
+use serde_json::{Value, json};
 
+use zendesk::ZendeskClient;
 use zendesk::auth::Auth;
+use zendesk::authorize::{parse_pasted, validate_callback};
 use zendesk::config::{self, Credentials, OAuthSettings};
-use zendesk::oauth::{OAuthProvider, ReauthRequired, challenge_for};
+use zendesk::oauth::{
+    OAuthProvider, PkcePair, ReauthRequired, build_authorization_url, challenge_for,
+    exchange_code_at, generate_pkce_pair, generate_state,
+};
+use zendesk::tokens::{TokenSet, TokenStore};
 
 /// Prefix of the tokens this server hands to its MCP clients.
 const SERVER_TOKEN_PREFIX: &str = "zmcp_";
+
+/// How long a started sign-in waits for its Zendesk code.
+const PENDING_TTL: Duration = Duration::from_secs(600);
+
+/// The most sign-ins that may be in progress at once.
+const MAX_PENDING: usize = 1000;
+
+/// How long a one-time code for `/token` stays valid.
+const CODE_TTL: Duration = Duration::from_secs(60);
+
+/// Sign-ins in progress and the one-time codes issued for finished ones.
+#[derive(Default)]
+struct Flows {
+    /// By the `state` sent to Zendesk.
+    pending: HashMap<String, Pending>,
+    /// By the code handed to the MCP client.
+    codes: HashMap<String, Issued>,
+}
+
+struct Pending {
+    started: Instant,
+    pkce: PkcePair,
+    /// `None` for a sign-in started by the CLI rather than by an MCP client.
+    client: Option<Client>,
+}
+
+/// The MCP client's side of a sign-in, as sent to `/authorize`.
+#[derive(Clone)]
+struct Client {
+    client_id: String,
+    redirect_uri: String,
+    code_challenge: String,
+    state: Option<String>,
+}
+
+struct Issued {
+    issued: Instant,
+    client: Client,
+    signed_in: SignedIn,
+}
+
+/// A completed Zendesk sign-in: its tokens and the user they belong to.
+pub(super) struct SignedIn {
+    pub tokens: TokenSet,
+    pub user: Value,
+}
 
 /// What the server needs to sign MCP clients in to Zendesk and to find their logins.
 pub struct SignIn {
@@ -28,6 +84,7 @@ pub struct SignIn {
     /// `https://{subdomain}.zendesk.com` in production; tests point it at a mock.
     zendesk: String,
     http: reqwest::Client,
+    flows: Mutex<Flows>,
 }
 
 impl SignIn {
@@ -42,6 +99,7 @@ impl SignIn {
             settings,
             zendesk,
             http,
+            flows: Mutex::new(Flows::default()),
         })
     }
 
@@ -58,7 +116,8 @@ impl SignIn {
         Ok(sign_in)
     }
 
-    /// The routes that need no token: the OAuth metadata documents.
+    /// The routes that need no token: the OAuth metadata documents and the sign-in
+    /// endpoints.
     pub fn routes(self: &Arc<Self>) -> axum::Router {
         let resource = {
             let sign_in = self.clone();
@@ -68,7 +127,16 @@ impl SignIn {
             let sign_in = self.clone();
             move || async move { Json(sign_in.authorization_server()) }
         };
+        let sign_in_routes = axum::Router::new()
+            .route("/register", routing::post(register))
+            .route(
+                "/authorize",
+                routing::get(authorize_page).post(authorize_paste),
+            )
+            .route("/token", routing::post(token))
+            .with_state(self.clone());
         axum::Router::new()
+            .merge(sign_in_routes)
             .route(
                 "/.well-known/oauth-protected-resource",
                 axum::routing::get(resource.clone()),
@@ -103,6 +171,79 @@ impl SignIn {
             "code_challenge_methods_supported": ["S256"],
             "token_endpoint_auth_methods_supported": ["none"],
         })
+    }
+
+    fn flows(&self) -> MutexGuard<'_, Flows> {
+        self.flows.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Begin a sign-in. Returns the Zendesk authorize URL and its state, or `None` when
+    /// too many sign-ins are in progress.
+    fn start(&self, client: Option<Client>) -> Option<(String, String)> {
+        let mut flows = self.flows();
+        flows
+            .pending
+            .retain(|_, p| p.started.elapsed() < PENDING_TTL);
+        if flows.pending.len() >= MAX_PENDING {
+            return None;
+        }
+        let pkce = generate_pkce_pair();
+        let state = generate_state();
+        let url = build_authorization_url(&self.settings, &state, &pkce);
+        flows.pending.insert(
+            state.clone(),
+            Pending {
+                started: Instant::now(),
+                pkce,
+                client,
+            },
+        );
+        Some((url, state))
+    }
+
+    /// Take the sign-in started with `state`; `None` if it is unknown or too old.
+    fn take_pending(&self, state: &str) -> Option<Pending> {
+        let pending = self.flows().pending.remove(state)?;
+        (pending.started.elapsed() < PENDING_TTL).then_some(pending)
+    }
+
+    /// Exchange Zendesk's authorization `code` for tokens, and look up who they belong to.
+    async fn redeem(&self, pkce: &PkcePair, code: &str) -> Result<SignedIn> {
+        let tokens = exchange_code_at(
+            &self.http,
+            &format!("{}/oauth/tokens", self.zendesk),
+            &self.settings,
+            code,
+            pkce,
+        )
+        .await?;
+        let client = ZendeskClient::with_base_url(
+            &self.settings.subdomain,
+            Auth::bearer(&tokens.access_token),
+            self.http.clone(),
+            format!("{}/api/v2", self.zendesk),
+        );
+        let user = client.get_current_user().await?;
+        Ok(SignedIn { tokens, user })
+    }
+
+    /// Keep a sign-in on disk under a new server token, and return that token.
+    fn store(&self, signed_in: &SignedIn) -> Result<String> {
+        let token = format!("{SERVER_TOKEN_PREFIX}{}", generate_state());
+        let dir = self.grant_dir(&token);
+        TokenStore::new(dir.join("tokens.json")).save(&signed_in.tokens)?;
+        let user = &signed_in.user;
+        let record = json!({
+            "id": user["id"],
+            "name": user["name"],
+            "email": user["email"],
+            "signed_in_at": chrono::Utc::now().to_rfc3339(),
+        });
+        std::fs::write(
+            dir.join("user.json"),
+            serde_json::to_string_pretty(&record)?,
+        )?;
+        Ok(token)
     }
 
     /// Where all stored logins live, next to the operator's own token file.
@@ -184,6 +325,301 @@ pub async fn require_caller(
         }
     }
     next.run(req).await
+}
+
+/// Whether `uri` is an `http` URL on this machine, the only kind of redirect an MCP
+/// client may register.
+fn is_loopback_redirect(uri: &str) -> bool {
+    reqwest::Url::parse(uri).is_ok_and(|url| {
+        url.scheme() == "http"
+            && matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "[::1]"))
+            && url.fragment().is_none()
+    })
+}
+
+fn escape_html(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&#39;"),
+            c => escaped.push(c),
+        }
+    }
+    escaped
+}
+
+/// An HTML answer that browsers will not cache, leak the address of or frame.
+fn html(status: StatusCode, body: String) -> Response {
+    (
+        status,
+        [
+            (header::CACHE_CONTROL, "no-store"),
+            (header::REFERRER_POLICY, "no-referrer"),
+            (header::X_FRAME_OPTIONS, "DENY"),
+            (header::CONTENT_SECURITY_POLICY, "frame-ancestors 'none'"),
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+fn error_page(status: StatusCode, message: &str) -> Response {
+    html(
+        status,
+        format!(
+            "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\"><title>Sign in to Zendesk</title></head>\n<body>\n<h1>Sign in to Zendesk</h1>\n<p>{}</p>\n</body></html>\n",
+            escape_html(message)
+        ),
+    )
+}
+
+/// An OAuth error answer: status 400 with `error` and `error_description`, uncached.
+fn oauth_error(status: StatusCode, error: &str, description: &str) -> Response {
+    (
+        status,
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(json!({ "error": error, "error_description": description })),
+    )
+        .into_response()
+}
+
+fn bad_request(error: &str, description: &str) -> Response {
+    oauth_error(StatusCode::BAD_REQUEST, error, description)
+}
+
+/// `POST /register`: dynamic client registration. Nothing is stored, because every
+/// client is public and may only redirect to this machine.
+async fn register(body: Bytes) -> Response {
+    let Ok(Value::Object(mut metadata)) = serde_json::from_slice(&body) else {
+        return bad_request(
+            "invalid_client_metadata",
+            "The request body must be a JSON object.",
+        );
+    };
+    let uris = metadata.get("redirect_uris").and_then(Value::as_array);
+    let valid = uris.is_some_and(|uris| {
+        !uris.is_empty()
+            && uris
+                .iter()
+                .all(|uri| uri.as_str().is_some_and(is_loopback_redirect))
+    });
+    if !valid {
+        return bad_request(
+            "invalid_redirect_uri",
+            "redirect_uris must be a non-empty list of http URLs on 127.0.0.1, localhost or [::1].",
+        );
+    }
+    metadata.insert("client_id".into(), generate_state().into());
+    metadata.insert(
+        "client_id_issued_at".into(),
+        chrono::Utc::now().timestamp().into(),
+    );
+    metadata.insert("token_endpoint_auth_method".into(), "none".into());
+    (StatusCode::CREATED, Json(Value::Object(metadata))).into_response()
+}
+
+/// `GET /authorize`: the page that sends the user to Zendesk and takes the pasted result.
+async fn authorize_page(
+    State(sign_in): State<Arc<SignIn>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    let param = |name: &str| {
+        params
+            .get(name)
+            .map(String::as_str)
+            .filter(|v| !v.is_empty())
+    };
+    let invalid = if params.get("response_type").map(String::as_str) != Some("code") {
+        Some("response_type must be code")
+    } else if param("client_id").is_none() {
+        Some("client_id is missing")
+    } else if !param("redirect_uri").is_some_and(is_loopback_redirect) {
+        Some("redirect_uri must be a loopback http URL")
+    } else if param("code_challenge").is_none() {
+        Some("code_challenge is missing")
+    } else if param("code_challenge_method") != Some("S256") {
+        Some("code_challenge_method must be S256")
+    } else {
+        None
+    };
+    if let Some(reason) = invalid {
+        return error_page(
+            StatusCode::BAD_REQUEST,
+            &format!(
+                "This sign-in request is not valid ({reason}). Start the sign-in again from your MCP client."
+            ),
+        );
+    }
+    let client = Client {
+        client_id: params["client_id"].clone(),
+        redirect_uri: params["redirect_uri"].clone(),
+        code_challenge: params["code_challenge"].clone(),
+        state: params.get("state").cloned(),
+    };
+    let Some((zendesk_url, state)) = sign_in.start(Some(client)) else {
+        return error_page(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Too many sign-ins are in progress. Try again in a few minutes.",
+        );
+    };
+    html(
+        StatusCode::OK,
+        format!(
+            r#"<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Sign in to Zendesk</title></head>
+<body>
+<h1>Sign in to Zendesk</h1>
+<ol>
+<li><a href="{}" target="_blank" rel="noopener noreferrer">Sign in to Zendesk</a> in a new tab and allow access.</li>
+<li>That tab then fails to load a <code>localhost</code> page. Copy its address and paste it here within 2 minutes:
+<form method="post" action="/authorize">
+<input type="hidden" name="session" value="{}">
+<input type="text" name="redirect" required autofocus size="60" placeholder="http://localhost:19186/?code=...">
+<button type="submit">Continue</button>
+</form></li>
+</ol>
+<p>To sign in without pasting, run <code>zendesk login {}/mcp</code> and use the token it prints.</p>
+</body></html>
+"#,
+            escape_html(&zendesk_url),
+            escape_html(&state),
+            escape_html(&sign_in.public),
+        ),
+    )
+}
+
+/// `POST /authorize`: finish the sign-in with the address the user pasted, and send the
+/// MCP client back to its redirect with a one-time code.
+async fn authorize_paste(
+    State(sign_in): State<Arc<SignIn>>,
+    Form(form): Form<HashMap<String, String>>,
+) -> Response {
+    let field = |name: &str| form.get(name).map(String::as_str).unwrap_or_default();
+    let session = field("session");
+    let Some((pending, client)) = sign_in
+        .take_pending(session)
+        .and_then(|p| p.client.clone().map(|client| (p, client)))
+    else {
+        return error_page(
+            StatusCode::BAD_REQUEST,
+            "This sign-in expired or was already used. Go back and try again.",
+        );
+    };
+    let code = match parse_pasted(field("redirect"))
+        .and_then(|captured| validate_callback(&captured, session))
+    {
+        Ok(code) => code,
+        Err(err) => {
+            return error_page(
+                StatusCode::BAD_REQUEST,
+                &format!("Signing in failed: {err}. Go back and try again."),
+            );
+        }
+    };
+    let signed_in = match sign_in.redeem(&pending.pkce, &code).await {
+        Ok(signed_in) => signed_in,
+        Err(err) if err.is::<ReauthRequired>() => {
+            return error_page(
+                StatusCode::BAD_REQUEST,
+                "Zendesk did not accept the code: it expired (codes last 2 minutes) or was already used. Go back and try again.",
+            );
+        }
+        Err(err) => {
+            return error_page(
+                StatusCode::BAD_REQUEST,
+                &format!("Signing in to Zendesk failed: {err}. Go back and try again."),
+            );
+        }
+    };
+    let Ok(mut redirect) = reqwest::Url::parse(&client.redirect_uri) else {
+        return error_page(
+            StatusCode::BAD_REQUEST,
+            "This sign-in request is not valid. Start the sign-in again from your MCP client.",
+        );
+    };
+    let code = generate_state();
+    {
+        let mut query = redirect.query_pairs_mut();
+        query.append_pair("code", &code);
+        if let Some(state) = &client.state {
+            query.append_pair("state", state);
+        }
+    }
+    {
+        let mut flows = sign_in.flows();
+        flows.codes.retain(|_, c| c.issued.elapsed() < CODE_TTL);
+        flows.codes.insert(
+            code,
+            Issued {
+                issued: Instant::now(),
+                client,
+                signed_in,
+            },
+        );
+    }
+    (
+        StatusCode::SEE_OTHER,
+        [
+            (header::LOCATION, redirect.as_str()),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+    )
+        .into_response()
+}
+
+/// `POST /token`: trade the one-time code for a server token.
+async fn token(
+    State(sign_in): State<Arc<SignIn>>,
+    Form(form): Form<HashMap<String, String>>,
+) -> Response {
+    let field = |name: &str| form.get(name).map(String::as_str);
+    if field("grant_type") != Some("authorization_code") {
+        return bad_request(
+            "unsupported_grant_type",
+            "Only the authorization_code grant is supported.",
+        );
+    }
+    let issued = sign_in
+        .flows()
+        .codes
+        .remove(field("code").unwrap_or_default());
+    let Some(issued) = issued.filter(|i| i.issued.elapsed() < CODE_TTL) else {
+        return bad_request(
+            "invalid_grant",
+            "The code is unknown, expired or already used.",
+        );
+    };
+    let verified = field("code_verifier")
+        .is_some_and(|verifier| challenge_for(verifier) == issued.client.code_challenge);
+    if !verified {
+        return bad_request("invalid_grant", "PKCE verification failed.");
+    }
+    if field("redirect_uri").is_some_and(|uri| uri != issued.client.redirect_uri) {
+        return bad_request("invalid_grant", "redirect_uri does not match the sign-in.");
+    }
+    if field("client_id").is_some_and(|id| id != issued.client.client_id) {
+        return bad_request("invalid_grant", "client_id does not match the sign-in.");
+    }
+    match sign_in.store(&issued.signed_in) {
+        Ok(token) => (
+            [(header::CACHE_CONTROL, "no-store")],
+            Json(json!({ "access_token": token, "token_type": "Bearer" })),
+        )
+            .into_response(),
+        Err(err) => {
+            tracing::error!("Could not store a Zendesk login: {err:#}");
+            oauth_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                "Could not store the Zendesk login.",
+            )
+        }
+    }
 }
 
 /// Clap parser for `--public-url`: an `https` origin, or `http` on this machine.
@@ -509,5 +945,379 @@ mod tests {
         let h = harness().await;
         mock_me(&h, "raw-token").await;
         assert!(call_current_user(&h, "raw-token").await.contains("Alice"));
+    }
+
+    const REDIRECT: &str = "http://127.0.0.1:33333/callback";
+
+    /// Mount Zendesk's token endpoint for code `zcode`, and `users/me` for the token it issues.
+    async fn mock_zendesk_sign_in(zendesk: &MockServer) {
+        Mock::given(method("POST"))
+            .and(path("/oauth/tokens"))
+            .and(body_string_contains("code=zcode"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "zd-access", "refresh_token": "zd-refresh",
+                "expires_in": 1800, "refresh_token_expires_in": 7776000,
+                "token_type": "bearer",
+            })))
+            .mount(zendesk)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/users/me.json"))
+            .and(header("authorization", "Bearer zd-access"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({ "user": { "id": 7, "name": "Alice", "email": "alice@example.com" } }),
+            ))
+            .mount(zendesk)
+            .await;
+    }
+
+    fn assert_page_headers(response: &reqwest::Response) {
+        for (name, value) in [
+            ("cache-control", "no-store"),
+            ("referrer-policy", "no-referrer"),
+            ("x-frame-options", "DENY"),
+            ("content-security-policy", "frame-ancestors 'none'"),
+            ("content-type", "text/html; charset=utf-8"),
+        ] {
+            assert_eq!(
+                response.headers().get(name).and_then(|v| v.to_str().ok()),
+                Some(value),
+                "{name}"
+            );
+        }
+    }
+
+    /// Register a client, load the sign-in page for `verifier`, and return its `session`.
+    async fn open_page(h: &Harness, verifier: &str) -> String {
+        let registered = h
+            .http
+            .post(format!("{}/register", h.url))
+            .json(&json!({ "redirect_uris": [REDIRECT] }))
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap();
+        let response = get_authorize(
+            h,
+            &[
+                ("response_type", "code"),
+                ("client_id", registered["client_id"].as_str().unwrap()),
+                ("redirect_uri", REDIRECT),
+                ("code_challenge", challenge_for(verifier).as_str()),
+                ("code_challenge_method", "S256"),
+                ("state", "client-state"),
+            ],
+        )
+        .await;
+        assert_eq!(response.status(), 200);
+        assert_page_headers(&response);
+        let page = response.text().await.unwrap();
+        assert!(page.contains("zendesk login http://127.0.0.1:"), "{page}");
+        let marker = "name=\"session\" value=\"";
+        let start = page.find(marker).unwrap() + marker.len();
+        page[start..][..page[start..].find('"').unwrap()].to_string()
+    }
+
+    /// `GET /authorize` with `params` as its query.
+    async fn get_authorize(h: &Harness, params: &[(&str, &str)]) -> reqwest::Response {
+        let mut url = reqwest::Url::parse(&format!("{}/authorize", h.url)).unwrap();
+        url.query_pairs_mut().extend_pairs(params);
+        h.http.get(url).send().await.unwrap()
+    }
+
+    async fn paste(h: &Harness, session: &str, pasted: &str) -> reqwest::Response {
+        h.http
+            .post(format!("{}/authorize", h.url))
+            .form(&[("session", session), ("redirect", pasted)])
+            .send()
+            .await
+            .unwrap()
+    }
+
+    async fn token(h: &Harness, form: &[(&str, &str)]) -> reqwest::Response {
+        h.http
+            .post(format!("{}/token", h.url))
+            .form(form)
+            .send()
+            .await
+            .unwrap()
+    }
+
+    /// Mount a Zendesk token endpoint that must never be reached.
+    async fn zendesk_must_not_be_called(h: &Harness) {
+        Mock::given(method("POST"))
+            .and(path("/oauth/tokens"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&h.zendesk)
+            .await;
+    }
+
+    /// Sign in with `verifier` and return the one-time code from the redirect.
+    async fn sign_in_code(h: &Harness, verifier: &str) -> String {
+        mock_zendesk_sign_in(&h.zendesk).await;
+        let session = open_page(h, verifier).await;
+        let response = paste(
+            h,
+            &session,
+            &format!("http://localhost:19186/?code=zcode&state={session}"),
+        )
+        .await;
+        assert_eq!(response.status(), 303);
+        let location = response.headers()["location"].to_str().unwrap();
+        assert!(location.starts_with(REDIRECT), "{location}");
+        assert!(location.contains("state=client-state"), "{location}");
+        let url = reqwest::Url::parse(location).unwrap();
+        url.query_pairs()
+            .find(|(k, _)| k == "code")
+            .unwrap()
+            .1
+            .into_owned()
+    }
+
+    #[test]
+    fn loopback_redirects_only() {
+        for uri in [
+            "http://127.0.0.1:1234/callback",
+            "http://localhost/cb",
+            "http://[::1]:8080/x",
+            "http://127.0.0.1:19876/mcp/oauth/callback",
+        ] {
+            assert!(is_loopback_redirect(uri), "{uri}");
+        }
+        for uri in [
+            "https://127.0.0.1/cb",
+            "http://localhost.evil.com/cb",
+            "http://evil.com/cb",
+            "http://user@evil.com/",
+            "http://127.0.0.1/cb#x",
+            "cursor://callback",
+            "javascript:alert(1)",
+            "",
+        ] {
+            assert!(!is_loopback_redirect(uri), "{uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn register_accepts_loopback_clients_only() {
+        let h = harness().await;
+        let register = |body: &'static str| {
+            h.http
+                .post(format!("{}/register", h.url))
+                .header("content-type", "application/json")
+                .body(body)
+                .send()
+        };
+        let created = register(
+            r#"{"redirect_uris":["http://127.0.0.1:33333/callback"],"client_name":"test"}"#,
+        )
+        .await
+        .unwrap();
+        assert_eq!(created.status(), 201);
+        let created = created.json::<Value>().await.unwrap();
+        assert!(!created["client_id"].as_str().unwrap().is_empty());
+        assert_eq!(created["token_endpoint_auth_method"], "none");
+        assert_eq!(created["client_name"], "test");
+
+        for body in [
+            r#"{"redirect_uris":["https://evil.com/cb"]}"#,
+            r#"{"redirect_uris":[]}"#,
+        ] {
+            let response = register(body).await.unwrap();
+            assert_eq!(response.status(), 400, "{body}");
+            assert_eq!(
+                response.json::<Value>().await.unwrap()["error"],
+                "invalid_redirect_uri"
+            );
+        }
+        let response = register("[1,2]").await.unwrap();
+        assert_eq!(response.status(), 400);
+        assert_eq!(
+            response.json::<Value>().await.unwrap()["error"],
+            "invalid_client_metadata"
+        );
+    }
+
+    #[tokio::test]
+    async fn authorize_rejects_invalid_requests() {
+        let h = harness().await;
+        let challenge = challenge_for("v");
+        for (redirect_uri, method_) in [("https://evil.com/cb", "S256"), (REDIRECT, "plain")] {
+            let response = get_authorize(
+                &h,
+                &[
+                    ("response_type", "code"),
+                    ("client_id", "c"),
+                    ("redirect_uri", redirect_uri),
+                    ("code_challenge", challenge.as_str()),
+                    ("code_challenge_method", method_),
+                ],
+            )
+            .await;
+            assert_eq!(response.status(), 400, "{redirect_uri} {method_}");
+            assert!(response.headers().get("location").is_none());
+            assert_page_headers(&response);
+        }
+    }
+
+    #[tokio::test]
+    async fn client_sign_in_issues_a_working_token() {
+        let h = harness().await;
+        let verifier = "v".repeat(43);
+        let code = sign_in_code(&h, &verifier).await;
+        let form = [
+            ("grant_type", "authorization_code"),
+            ("code", code.as_str()),
+            ("code_verifier", verifier.as_str()),
+            ("redirect_uri", REDIRECT),
+        ];
+        let response = token(&h, &form).await;
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        let body = response.json::<Value>().await.unwrap();
+        let server_token = body["access_token"].as_str().unwrap().to_string();
+        assert!(server_token.starts_with("zmcp_"));
+        assert_eq!(body["token_type"], "Bearer");
+
+        assert!(call_current_user(&h, &server_token).await.contains("Alice"));
+        let user =
+            std::fs::read_to_string(h.sign_in.grant_dir(&server_token).join("user.json")).unwrap();
+        assert!(user.contains("\"email\": \"alice@example.com\""), "{user}");
+
+        let mut stack = vec![h.sign_in.grants()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let entry = entry.unwrap().path();
+                if entry.is_dir() {
+                    stack.push(entry);
+                } else {
+                    let content = std::fs::read_to_string(&entry).unwrap();
+                    assert!(!content.contains(&server_token), "{}", entry.display());
+                }
+            }
+        }
+
+        let again = token(&h, &form).await;
+        assert_eq!(again.status(), 400);
+        assert_eq!(
+            again.json::<Value>().await.unwrap()["error"],
+            "invalid_grant"
+        );
+    }
+
+    #[tokio::test]
+    async fn wrong_verifier_burns_the_code() {
+        let h = harness().await;
+        let verifier = "v".repeat(43);
+        let code = sign_in_code(&h, &verifier).await;
+        for attempt in ["w".repeat(43), verifier] {
+            let response = token(
+                &h,
+                &[
+                    ("grant_type", "authorization_code"),
+                    ("code", code.as_str()),
+                    ("code_verifier", attempt.as_str()),
+                ],
+            )
+            .await;
+            assert_eq!(response.status(), 400);
+            assert_eq!(
+                response.json::<Value>().await.unwrap()["error"],
+                "invalid_grant"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn paste_accepts_a_bare_code() {
+        let h = harness().await;
+        mock_zendesk_sign_in(&h.zendesk).await;
+        let session = open_page(&h, &"v".repeat(43)).await;
+        assert_eq!(paste(&h, &session, "  zcode \n").await.status(), 303);
+    }
+
+    #[tokio::test]
+    async fn paste_rejects_another_sign_ins_address() {
+        let h = harness().await;
+        zendesk_must_not_be_called(&h).await;
+        let session = open_page(&h, &"v".repeat(43)).await;
+        let response = paste(
+            &h,
+            &session,
+            "http://localhost:19186/?code=zcode&state=other",
+        )
+        .await;
+        assert_eq!(response.status(), 400);
+        assert_page_headers(&response);
+        assert!(response.text().await.unwrap().contains("does not match"));
+    }
+
+    #[tokio::test]
+    async fn paste_reports_a_denied_sign_in() {
+        let h = harness().await;
+        zendesk_must_not_be_called(&h).await;
+        let session = open_page(&h, &"v".repeat(43)).await;
+        let pasted = format!(
+            "http://localhost:19186/?error=access_denied&error_description=The+user+denied&state={session}"
+        );
+        let response = paste(&h, &session, &pasted).await;
+        assert_eq!(response.status(), 400);
+        assert!(response.text().await.unwrap().contains("declined"));
+    }
+
+    #[tokio::test]
+    async fn late_paste_says_the_code_expired() {
+        let h = harness().await;
+        Mock::given(method("POST"))
+            .and(path("/oauth/tokens"))
+            .and(body_string_contains("code=late"))
+            .respond_with(
+                ResponseTemplate::new(400).set_body_json(json!({ "error": "invalid_grant" })),
+            )
+            .mount(&h.zendesk)
+            .await;
+        let session = open_page(&h, &"v".repeat(43)).await;
+        let response = paste(&h, &session, "late").await;
+        assert_eq!(response.status(), 400);
+        let page = response.text().await.unwrap();
+        assert!(page.contains("expired"), "{page}");
+        assert!(!page.contains("zendesk-mcp-server auth"), "{page}");
+    }
+
+    #[tokio::test]
+    async fn used_session_cannot_be_pasted_twice() {
+        let h = harness().await;
+        mock_zendesk_sign_in(&h.zendesk).await;
+        let session = open_page(&h, &"v".repeat(43)).await;
+        assert_eq!(paste(&h, &session, "zcode").await.status(), 303);
+        let response = paste(&h, &session, "zcode").await;
+        assert_eq!(response.status(), 400);
+        assert!(
+            response
+                .text()
+                .await
+                .unwrap()
+                .contains("expired or was already used")
+        );
+    }
+
+    #[test]
+    fn html_values_are_escaped() {
+        assert_eq!(
+            escape_html(r#"<a href="x">&'"#),
+            "&lt;a href=&quot;x&quot;&gt;&amp;&#39;"
+        );
+    }
+
+    #[tokio::test]
+    async fn sign_ins_in_progress_are_capped() {
+        let h = harness().await;
+        for _ in 0..1000 {
+            assert!(h.sign_in.start(None).is_some());
+        }
+        assert!(h.sign_in.start(None).is_none());
     }
 }
