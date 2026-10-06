@@ -187,6 +187,11 @@ A few operations have no documented narrow scope: `recover_suspended_ticket`,
 `search_custom_object_records` with a `filter`. If one of them answers 403, add the
 broad `write` scope to `ZENDESK_OAUTH_SCOPES` (reads stay covered by `read`).
 
+The API catalog (the CLI's generated commands, and `call_api_read` and
+`call_api_write` on the server) also reaches families this table does not list,
+such as macros, triggers, webhooks and Talk. Writing to them needs the broad
+`write` scope, or the family's own scope where Zendesk documents one.
+
 `read` alone is the read-only configuration. Zendesk gives search, job statuses
 and ticket audits no narrow read scope (`tickets:read` is not enough for audits),
 so the broad `read` is requested and covers all of these. Narrow the write
