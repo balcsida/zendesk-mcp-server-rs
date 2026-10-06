@@ -48,6 +48,7 @@ struct Flows {
     codes: HashMap<String, Issued>,
 }
 
+#[derive(Clone)]
 struct Pending {
     started: Instant,
     pkce: PkcePair,
@@ -203,10 +204,17 @@ impl SignIn {
         Some((url, state))
     }
 
-    /// Take the sign-in started with `state`; `None` if it is unknown or too old.
-    fn take_pending(&self, state: &str) -> Option<Pending> {
-        let pending = self.flows().pending.remove(state)?;
+    /// The sign-in started with `state`, which stays in progress; `None` if it is unknown
+    /// or too old.
+    fn pending(&self, state: &str) -> Option<Pending> {
+        let pending = self.flows().pending.get(state)?.clone();
         (pending.started.elapsed() < PENDING_TTL).then_some(pending)
+    }
+
+    /// End the sign-in started with `state`. `false` means it was already gone: a
+    /// concurrent request completed it first.
+    fn finish(&self, state: &str) -> bool {
+        self.flows().pending.remove(state).is_some()
     }
 
     /// Exchange Zendesk's authorization `code` for tokens, and look up who they belong to.
@@ -503,13 +511,18 @@ async fn authorize_paste(
 ) -> Response {
     let field = |name: &str| form.get(name).map(String::as_str).unwrap_or_default();
     let session = field("session");
+    const EXPIRED: &str =
+        "This sign-in expired or was already used. Start the sign-in again from your MCP client.";
     let Some((pending, client)) = sign_in
-        .take_pending(session)
+        .pending(session)
         .and_then(|p| p.client.clone().map(|client| (p, client)))
     else {
+        return error_page(StatusCode::BAD_REQUEST, EXPIRED);
+    };
+    let Ok(mut redirect) = reqwest::Url::parse(&client.redirect_uri) else {
         return error_page(
             StatusCode::BAD_REQUEST,
-            "This sign-in expired or was already used. Go back and try again.",
+            "This sign-in request is not valid. Start the sign-in again from your MCP client.",
         );
     };
     let code = match parse_pasted(field("redirect"))
@@ -538,12 +551,9 @@ async fn authorize_paste(
             );
         }
     };
-    let Ok(mut redirect) = reqwest::Url::parse(&client.redirect_uri) else {
-        return error_page(
-            StatusCode::BAD_REQUEST,
-            "This sign-in request is not valid. Start the sign-in again from your MCP client.",
-        );
-    };
+    if !sign_in.finish(session) {
+        return error_page(StatusCode::BAD_REQUEST, EXPIRED);
+    }
     let code = generate_state();
     {
         let mut query = redirect.query_pairs_mut();
@@ -651,10 +661,8 @@ async fn cli_login_finish(
     Json(body): Json<HashMap<String, String>>,
 ) -> Response {
     let field = |name: &str| body.get(name).map(String::as_str).unwrap_or_default();
-    let Some(pending) = sign_in
-        .take_pending(field("state"))
-        .filter(|p| p.client.is_none())
-    else {
+    let state = field("state");
+    let Some(pending) = sign_in.pending(state).filter(|p| p.client.is_none()) else {
         return bad_request(
             "invalid_grant",
             "This sign-in expired or was already used. Run zendesk login again.",
@@ -675,6 +683,9 @@ async fn cli_login_finish(
             );
         }
     };
+    if !sign_in.finish(state) {
+        return bad_request("invalid_grant", "This sign-in was already used.");
+    }
     match sign_in.store(&signed_in) {
         Ok(token) => (
             [(header::CACHE_CONTROL, "no-store")],
@@ -1381,6 +1392,44 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn failed_paste_keeps_the_sign_in() {
+        let h = harness().await;
+        mock_zendesk_sign_in(&h.zendesk).await;
+        let session = open_page(&h, &"v".repeat(43)).await;
+        let wrong = paste(
+            &h,
+            &session,
+            "http://localhost:19186/?code=zcode&state=other",
+        )
+        .await;
+        assert_eq!(wrong.status(), 400);
+        let right = paste(
+            &h,
+            &session,
+            &format!("http://localhost:19186/?code=zcode&state={session}"),
+        )
+        .await;
+        assert_eq!(right.status(), 303);
+    }
+
+    #[tokio::test]
+    async fn late_paste_can_be_retried() {
+        let h = harness().await;
+        Mock::given(method("POST"))
+            .and(path("/oauth/tokens"))
+            .and(body_string_contains("code=late"))
+            .respond_with(
+                ResponseTemplate::new(400).set_body_json(json!({ "error": "invalid_grant" })),
+            )
+            .mount(&h.zendesk)
+            .await;
+        mock_zendesk_sign_in(&h.zendesk).await;
+        let session = open_page(&h, &"v".repeat(43)).await;
+        assert_eq!(paste(&h, &session, "late").await.status(), 400);
+        assert_eq!(paste(&h, &session, "zcode").await.status(), 303);
+    }
+
     #[test]
     fn html_values_are_escaped() {
         assert_eq!(
@@ -1443,7 +1492,6 @@ mod tests {
     #[tokio::test]
     async fn flows_do_not_cross() {
         let h = harness().await;
-        zendesk_must_not_be_called(&h).await;
         let session = open_page(&h, &"v".repeat(43)).await;
         let response = h
             .http
@@ -1470,5 +1518,9 @@ mod tests {
         let response = paste(&h, started["state"].as_str().unwrap(), "zcode").await;
         assert_eq!(response.status(), 400);
         assert_page_headers(&response);
+        assert!(h.zendesk.received_requests().await.unwrap().is_empty());
+
+        mock_zendesk_sign_in(&h.zendesk).await;
+        assert_eq!(paste(&h, &session, "zcode").await.status(), 303);
     }
 }
