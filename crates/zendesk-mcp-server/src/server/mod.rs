@@ -21,7 +21,7 @@ use rmcp::{
     prompt_router, schemars, tool, tool_handler, tool_router,
 };
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tower_http::validate_request::ValidateRequestHeaderLayer;
@@ -102,7 +102,9 @@ Conventions: list tools page with page/per_page or page_size/after_cursor and re
 
 Admin-only: get_sla_breaches, get_sla_policies, list_satisfaction_ratings, list_suspended_tickets. list_deleted_tickets needs a role that can view deleted tickets.
 
-Cautions: delete_ticket, merge_tickets, mark_ticket_as_spam, redact_comment_text, make_comment_private and update_tickets_bulk are destructive and flagged as such. apply_macro only previews; execute_macro saves. create_article makes drafts.";
+Cautions: delete_ticket, merge_tickets, mark_ticket_as_spam, redact_comment_text, make_comment_private and update_tickets_bulk are destructive and flagged as such. apply_macro only previews; execute_macro saves. create_article makes drafts.
+
+For anything else, the whole Zendesk API is reachable: search_api_operations, then get_api_operation, then call_api_read or call_api_write.";
 
 const TICKET_ANALYSIS_TEMPLATE: &str = "
 You are a helpful Zendesk support analyst. You've been asked to analyze ticket #{ticket_id}.
@@ -128,6 +130,7 @@ Please fetch the ticket info, comments and knowledge base to draft a professiona
 The response should be formatted well and ready to be posted as a comment.
 ";
 
+mod catalog;
 mod custom_objects;
 mod help_center;
 mod people;
@@ -165,7 +168,8 @@ impl ZendeskServer {
                 + Self::ticket_ops_router()
                 + Self::workflows_router()
                 + Self::help_center_router()
-                + Self::custom_objects_router(),
+                + Self::custom_objects_router()
+                + Self::catalog_router(),
             prompt_router: Self::prompt_router(),
         }
     }
@@ -670,7 +674,7 @@ async fn shutdown_signal() {
 mod tests {
     use super::*;
 
-    const TOOLS: [&str; 75] = [
+    const TOOLS: [&str; 79] = [
         "get_ticket",
         "list_categories",
         "list_sections",
@@ -746,10 +750,14 @@ mod tests {
         "get_custom_object",
         "search_custom_object_records",
         "get_custom_object_record",
+        "search_api_operations",
+        "get_api_operation",
+        "call_api_read",
+        "call_api_write",
     ];
 
     /// Every tool that only reads.
-    const READ_ONLY: [&str; 56] = [
+    const READ_ONLY: [&str; 59] = [
         "get_ticket",
         "list_categories",
         "list_sections",
@@ -806,16 +814,20 @@ mod tests {
         "get_custom_object",
         "search_custom_object_records",
         "get_custom_object_record",
+        "search_api_operations",
+        "get_api_operation",
+        "call_api_read",
     ];
 
     /// Every tool that deletes, merges, redacts or otherwise cannot be undone.
-    const DESTRUCTIVE: [&str; 6] = [
+    const DESTRUCTIVE: [&str; 7] = [
         "delete_ticket",
         "merge_tickets",
         "redact_comment_text",
         "mark_ticket_as_spam",
         "update_tickets_bulk",
         "make_comment_private",
+        "call_api_write",
     ];
 
     fn server() -> ZendeskServer {
@@ -829,7 +841,7 @@ mod tests {
     }
 
     #[test]
-    fn lists_exactly_the_75_tools() {
+    fn lists_exactly_the_79_tools() {
         let mut names: Vec<String> = server()
             .tool_router
             .list_all()
@@ -877,9 +889,10 @@ mod tests {
             );
         }
         // Tokens that start like a tool name; parameter names such as per_page are not.
-        const VERBS: [&str; 16] = [
+        const VERBS: [&str; 17] = [
             "get_", "list_", "search_", "create_", "update_", "delete_", "apply_", "execute_",
             "merge_", "mark_", "make_", "redact_", "restore_", "recover_", "upload_", "count_",
+            "call_",
         ];
         for token in INSTRUCTIONS.split(|c: char| !(c.is_ascii_lowercase() || c == '_')) {
             if token.contains('_') && VERBS.iter().any(|v| token.starts_with(v)) {

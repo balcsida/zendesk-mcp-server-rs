@@ -8,7 +8,7 @@ This is a Rust rewrite of [reminia/zendesk-mcp-server](https://github.com/remini
 
 ## What is in the repository
 
-- `zendesk-mcp-server`: the MCP server. Tools for tickets, comments and attachments; search and counts; users, organizations, groups and brands; views, macros and triggers; custom objects; Help Center reading and writing; SLA and satisfaction data. Prompts for ticket analysis and response drafting. The Help Center articles as a knowledge base resource. Speaks stdio or streamable HTTP.
+- `zendesk-mcp-server`: the MCP server. Tools for tickets, comments and attachments; search and counts; users, organizations, groups and brands; views, macros and triggers; custom objects; Help Center reading and writing; SLA and satisfaction data. Four catalog tools that search, describe and call any other Zendesk API operation, so the server reaches the full API. Prompts for ticket analysis and response drafting. The Help Center articles as a knowledge base resource. Speaks stdio or streamable HTTP.
 - `zendesk`: the CLI for scripted use: a command for every Zendesk API operation (`zendesk <group> <operation>`), plus `api`, `token`, `auth` and `mobile-auth`.
 - `crates/zendesk`: the shared client library.
 
@@ -566,7 +566,7 @@ Draft a response to a Zendesk ticket.
 
 ## MCP tools
 
-Tools carry MCP annotations (read-only, destructive) so clients can ask for confirmation before changes. The categories below cover tickets, ticket operations, search, users and organizations, views, macros and triggers, account, custom objects, the Help Center, and metrics and SLAs.
+Tools carry MCP annotations (read-only, destructive) so clients can ask for confirmation before changes. The categories below cover tickets, ticket operations, search, users and organizations, views, macros and triggers, account, custom objects, the Help Center, metrics and SLAs, and the API catalog.
 
 ### Tickets
 
@@ -1196,3 +1196,46 @@ List CSAT satisfaction ratings with `score`, `comment`, `reason`, `reason_id`, t
 - `days_back` (integer, optional): Only ratings from the last N days (defaults to 30)
 - `page` (integer, optional): Defaults to 1
 - `per_page` (integer, optional): Max 100 (defaults to 25)
+
+### API catalog
+
+These four tools reach the full Zendesk API (Support, Help Center, Talk, webhooks, chat and more) without one tool per endpoint. Search for an operation, read its description, then call it.
+
+Operations that return or change credentials (API and OAuth tokens, OAuth client and webhook signing secrets, Help Center JWTs, passwords, ZIS connections and inbound webhooks) are left out, so a secret never lands in the model's context through a read a client may approve automatically. The CLI runs them.
+
+#### search_api_operations
+
+Search the full Zendesk API by keywords. Use it when no dedicated tool fits.
+
+- `query` (string): Keywords, e.g. `list ticket comments`; an operation must match every word
+- `limit` (integer, optional): Operations to return, max 100 (defaults to 20)
+
+Returns `total` and the first `limit` operations, each with `id`, `method`, `path` and `summary`.
+
+#### get_api_operation
+
+Describe one API operation.
+
+- `operation_id` (string): An id from `search_api_operations`, e.g. `ShowTicket` (case-insensitive)
+
+Returns the operation with its group, path and query parameters, an example request body and a description, plus `tool`: `call_api_read` or `call_api_write`, whichever runs it.
+
+#### call_api_read
+
+Run a read-only (`GET`) operation. Refuses other operations and points to `call_api_write`.
+
+- `operation_id` (string)
+- `params` (object, optional): Path and query parameters by name, e.g. `{"ticket_id": 1, "include": "users"}`. An array is sent comma-separated, or as repeated pairs when the name ends in `[]` or the API wants the parameter repeated. An object is sent as `name[key]=value`, so `{"page": {"size": 10}}` becomes `page[size]=10`
+- `fields` (array of strings, optional): Keep only these keys of each object in the response, to save tokens. It applies to the elements of top-level arrays and to top-level objects other than `meta` and `links`; other values such as `next_page` and `count` stay. An empty list keeps everything
+
+Returns the response as compact JSON. Page through large listings with the operation's paging parameters, such as `per_page` or `page[size]`.
+
+#### call_api_write
+
+Run an operation that writes (`POST`, `PUT`, `PATCH` or `DELETE`). It may create, change or delete Zendesk data and may notify customers, so call `get_api_operation` first to see the parameters and an example body. Refuses reads and points to `call_api_read`.
+
+- `operation_id` (string)
+- `params` (object, optional): Path and query parameters, as for `call_api_read`
+- `body` (object, optional): The JSON request body
+
+Returns the response as compact JSON, or `{"message": "<METHOD> <path> succeeded"}` when Zendesk answers with an empty body.
