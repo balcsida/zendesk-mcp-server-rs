@@ -500,7 +500,7 @@ async fn authorize_page(
 <li>That tab then fails to load a <code>localhost</code> page. Copy its address and paste it here within 2 minutes:
 <form method="post" action="/authorize">
 <input type="hidden" name="session" value="{}">
-<input type="text" name="redirect" required autofocus size="60" placeholder="http://localhost:19186/?code=...">
+<input type="text" name="redirect" required autofocus size="60" placeholder="{}?code=...">
 <button type="submit">Continue</button>
 </form></li>
 </ol>
@@ -509,6 +509,7 @@ async fn authorize_page(
 "#,
             escape_html(&zendesk_url),
             escape_html(&state),
+            escape_html(&sign_in.settings.redirect_uri),
             escape_html(&sign_in.public),
         ),
     )
@@ -757,6 +758,10 @@ mod tests {
     }
 
     async fn harness() -> Harness {
+        harness_with_redirect("http://localhost:19186/").await
+    }
+
+    async fn harness_with_redirect(redirect_uri: &str) -> Harness {
         let zendesk = MockServer::start().await;
         let dir = tempfile::tempdir().unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -766,7 +771,7 @@ mod tests {
             client_id: "zdg-zcli-oauth".into(),
             token_file: dir.path().join("tokens.json"),
             scopes: "read write".into(),
-            redirect_uri: "http://localhost:19186/".into(),
+            redirect_uri: redirect_uri.into(),
         };
         let http = reqwest::Client::builder()
             .no_proxy()
@@ -1130,6 +1135,10 @@ mod tests {
         assert_page_headers(&response);
         let page = response.text().await.unwrap();
         assert!(page.contains("zendesk login http://127.0.0.1:"), "{page}");
+        assert!(
+            page.contains(r#"placeholder="http://localhost:19186/?code=...""#),
+            "{page}"
+        );
         let marker = "name=\"session\" value=\"";
         let start = page.find(marker).unwrap() + marker.len();
         page[start..][..page[start..].find('"').unwrap()].to_string()
@@ -1320,6 +1329,79 @@ mod tests {
         assert_eq!(
             again.json::<Value>().await.unwrap()["error"],
             "invalid_grant"
+        );
+    }
+
+    #[tokio::test]
+    async fn placeholder_follows_the_configured_redirect_url() {
+        let h = harness_with_redirect("http://localhost:4000/cb?x=1&y=2").await;
+        let page = get_authorize(
+            &h,
+            &[
+                ("response_type", "code"),
+                ("client_id", "c"),
+                ("redirect_uri", REDIRECT),
+                ("code_challenge", challenge_for("v").as_str()),
+                ("code_challenge_method", "S256"),
+            ],
+        )
+        .await
+        .text()
+        .await
+        .unwrap();
+        assert!(
+            page.contains(r#"placeholder="http://localhost:4000/cb?x=1&amp;y=2?code=...""#),
+            "{page}"
+        );
+    }
+
+    #[tokio::test]
+    async fn token_rejects_a_different_redirect_uri_or_client_id() {
+        let h = harness().await;
+        let verifier = "v".repeat(43);
+        let code = sign_in_code(&h, &verifier).await;
+        let response = token(
+            &h,
+            &[
+                ("grant_type", "authorization_code"),
+                ("code", code.as_str()),
+                ("code_verifier", verifier.as_str()),
+                ("redirect_uri", "http://127.0.0.1:44444/callback"),
+            ],
+        )
+        .await;
+        assert_eq!(response.status(), 400);
+        assert_eq!(
+            response.json::<Value>().await.unwrap()["error"],
+            "invalid_grant"
+        );
+
+        let code = sign_in_code(&h, &verifier).await;
+        let response = token(
+            &h,
+            &[
+                ("grant_type", "authorization_code"),
+                ("code", code.as_str()),
+                ("code_verifier", verifier.as_str()),
+                ("client_id", "another-client"),
+            ],
+        )
+        .await;
+        assert_eq!(response.status(), 400);
+        assert_eq!(
+            response.json::<Value>().await.unwrap()["error"],
+            "invalid_grant"
+        );
+    }
+
+    #[tokio::test]
+    async fn token_rejects_other_grant_types() {
+        let h = harness().await;
+        let response = token(&h, &[("grant_type", "refresh_token")]).await;
+        assert_eq!(response.status(), 400);
+        assert_eq!(
+            response.json::<Value>().await.unwrap()["error"],
+            "unsupported_grant_type"
         );
     }
 
