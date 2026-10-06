@@ -561,6 +561,9 @@ fn http_router(
     // Taken from the server, not from `shared_token`, so a server acting with its own
     // Zendesk login can never be opened to any token.
     let per_user = server.is_per_user();
+    // The sign-in middleware lets any other bearer through as the caller's own Zendesk
+    // token, which only makes sense in per-user mode.
+    let sign_in = sign_in.filter(|_| per_user);
     let expected = shared_token.map(str::to_string);
     let service = StreamableHttpService::new(
         move || Ok(server.clone()),
@@ -648,8 +651,9 @@ pub async fn run(transport: Transport, http: reqwest::Client) -> Result<()> {
     let ct = CancellationToken::new();
     let sign_in = match args.public_url {
         Some(public) => {
+            let sign_in = sign_in::SignIn::from_env(public.clone(), http)?;
             tracing::info!("Sign-in through this server is on: {public}/mcp");
-            Some(sign_in::SignIn::from_env(public, http)?)
+            Some(sign_in)
         }
         None => None,
     };
@@ -1121,6 +1125,42 @@ mod tests {
             .await
             .unwrap();
         assert_ne!(authorized.status(), 401);
+    }
+
+    #[tokio::test]
+    async fn sign_in_never_opens_a_shared_login() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = zendesk::config::OAuthSettings {
+            subdomain: "acme".into(),
+            client_id: "zdg-zcli-oauth".into(),
+            token_file: dir.path().join("tokens.json"),
+            scopes: "read write".into(),
+            redirect_uri: "http://localhost:19186/".into(),
+        };
+        let sign_in = sign_in::SignIn::new(
+            "http://127.0.0.1:1".into(),
+            settings,
+            "http://127.0.0.1:1".into(),
+            reqwest::Client::new(),
+        );
+        let router = http_router(
+            server(),
+            Some("right-token"),
+            Some(sign_in),
+            CancellationToken::new(),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await });
+
+        let response = reqwest::Client::new()
+            .post(format!("http://{addr}/mcp"))
+            .bearer_auth("anything")
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 401);
     }
 
     /// POST one JSON-RPC message to `/mcp` as the holder of `token`. Returns the session
