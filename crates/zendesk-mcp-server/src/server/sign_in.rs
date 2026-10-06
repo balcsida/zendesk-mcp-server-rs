@@ -271,12 +271,12 @@ impl SignIn {
     /// there is none, or there was a dead one and it has just been deleted.
     async fn caller(&self, token: &str) -> Result<Option<Auth>> {
         let dir = self.grant_dir(token);
-        let token_file = dir.join("tokens.json");
-        if !token_file.exists() {
+        let tokens_file = dir.join("tokens.json");
+        if !tokens_file.exists() {
             return Ok(None);
         }
         let settings = OAuthSettings {
-            token_file,
+            token_file: tokens_file.clone(),
             ..self.settings.clone()
         };
         let provider = OAuthProvider::new(settings, self.http.clone())
@@ -284,8 +284,19 @@ impl SignIn {
         match provider.access_token().await {
             Ok(_) => Ok(Some(Auth::OAuth(Arc::new(provider)))),
             Err(err) if err.is::<ReauthRequired>() => {
-                std::fs::remove_dir_all(&dir)?;
+                match std::fs::remove_dir_all(&dir) {
+                    Err(err) if err.kind() != std::io::ErrorKind::NotFound => {
+                        return Err(err.into());
+                    }
+                    _ => {}
+                }
                 tracing::info!("Removed a Zendesk login that can no longer be renewed");
+                Ok(None)
+            }
+            Err(_) if !tokens_file.exists() => {
+                // A concurrent request removed the login; waiting on its lock made the
+                // directory again.
+                let _ = std::fs::remove_dir_all(&dir);
                 Ok(None)
             }
             Err(err) => Err(err),
@@ -1013,6 +1024,22 @@ mod tests {
         let response = post_raw(&h, TOKEN).await;
         assert_eq!(response.status(), 401);
         assert!(response.headers().contains_key("www-authenticate"));
+        assert!(!h.sign_in.grant_dir(TOKEN).exists());
+    }
+
+    #[tokio::test]
+    async fn concurrent_requests_on_a_dead_login_get_401() {
+        let h = harness().await;
+        expired_login(&h);
+        refresh_mock()
+            .respond_with(
+                ResponseTemplate::new(400).set_body_json(json!({ "error": "invalid_grant" })),
+            )
+            .mount(&h.zendesk)
+            .await;
+        let (a, b) = tokio::join!(post_raw(&h, TOKEN), post_raw(&h, TOKEN));
+        assert_eq!(a.status(), 401);
+        assert_eq!(b.status(), 401);
         assert!(!h.sign_in.grant_dir(TOKEN).exists());
     }
 
