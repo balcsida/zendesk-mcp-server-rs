@@ -134,6 +134,8 @@ impl SignIn {
                 routing::get(authorize_page).post(authorize_paste),
             )
             .route("/token", routing::post(token))
+            .route("/cli/login", routing::post(cli_login))
+            .route("/cli/login/finish", routing::post(cli_login_finish))
             .with_state(self.clone());
         axum::Router::new()
             .merge(sign_in_routes)
@@ -609,6 +611,81 @@ async fn token(
         Ok(token) => (
             [(header::CACHE_CONTROL, "no-store")],
             Json(json!({ "access_token": token, "token_type": "Bearer" })),
+        )
+            .into_response(),
+        Err(err) => {
+            tracing::error!("Could not store a Zendesk login: {err:#}");
+            oauth_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                "Could not store the Zendesk login.",
+            )
+        }
+    }
+}
+
+/// `POST /cli/login`: start a sign-in for `zendesk login`, which catches the Zendesk
+/// redirect on the user's machine.
+async fn cli_login(State(sign_in): State<Arc<SignIn>>) -> Response {
+    let Some((authorize_url, state)) = sign_in.start(None) else {
+        return oauth_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "temporarily_unavailable",
+            "Too many sign-ins are in progress. Try again in a few minutes.",
+        );
+    };
+    (
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(json!({
+            "authorize_url": authorize_url,
+            "state": state,
+            "redirect_uri": sign_in.settings.redirect_uri,
+        })),
+    )
+        .into_response()
+}
+
+/// `POST /cli/login/finish`: trade the code `zendesk login` caught for a server token.
+async fn cli_login_finish(
+    State(sign_in): State<Arc<SignIn>>,
+    Json(body): Json<HashMap<String, String>>,
+) -> Response {
+    let field = |name: &str| body.get(name).map(String::as_str).unwrap_or_default();
+    let Some(pending) = sign_in
+        .take_pending(field("state"))
+        .filter(|p| p.client.is_none())
+    else {
+        return bad_request(
+            "invalid_grant",
+            "This sign-in expired or was already used. Run zendesk login again.",
+        );
+    };
+    let signed_in = match sign_in.redeem(&pending.pkce, field("code")).await {
+        Ok(signed_in) => signed_in,
+        Err(err) if err.is::<ReauthRequired>() => {
+            return bad_request(
+                "invalid_grant",
+                "Zendesk did not accept the code: it expired (codes last 2 minutes) or was already used. Run zendesk login again.",
+            );
+        }
+        Err(err) => {
+            return bad_request(
+                "invalid_grant",
+                &format!("Signing in to Zendesk failed: {err}. Run zendesk login again."),
+            );
+        }
+    };
+    match sign_in.store(&signed_in) {
+        Ok(token) => (
+            [(header::CACHE_CONTROL, "no-store")],
+            Json(json!({
+                "access_token": token,
+                "user": {
+                    "id": signed_in.user["id"],
+                    "name": signed_in.user["name"],
+                    "email": signed_in.user["email"],
+                },
+            })),
         )
             .into_response(),
         Err(err) => {
@@ -1319,5 +1396,79 @@ mod tests {
             assert!(h.sign_in.start(None).is_some());
         }
         assert!(h.sign_in.start(None).is_none());
+    }
+
+    #[tokio::test]
+    async fn cli_sign_in_issues_a_working_token() {
+        let h = harness().await;
+        mock_zendesk_sign_in(&h.zendesk).await;
+        let started = h
+            .http
+            .post(format!("{}/cli/login", h.url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(started.status(), 200);
+        let started = started.json::<Value>().await.unwrap();
+        let authorize_url = started["authorize_url"].as_str().unwrap();
+        assert!(authorize_url.contains("client_id=zdg-zcli-oauth"));
+        assert!(authorize_url.contains("redirect_uri=http%3A%2F%2Flocalhost%3A19186%2F"));
+        assert_eq!(started["redirect_uri"], "http://localhost:19186/");
+
+        let finish = || async {
+            h.http
+                .post(format!("{}/cli/login/finish", h.url))
+                .json(&json!({ "state": started["state"], "code": "zcode" }))
+                .send()
+                .await
+                .unwrap()
+        };
+        let response = finish().await;
+        assert_eq!(response.status(), 200);
+        let body = response.json::<Value>().await.unwrap();
+        let server_token = body["access_token"].as_str().unwrap();
+        assert!(server_token.starts_with("zmcp_"));
+        assert_eq!(body["user"]["name"], "Alice");
+        assert_eq!(body["user"]["email"], "alice@example.com");
+        assert!(call_current_user(&h, server_token).await.contains("Alice"));
+
+        let again = finish().await;
+        assert_eq!(again.status(), 400);
+        assert_eq!(
+            again.json::<Value>().await.unwrap()["error"],
+            "invalid_grant"
+        );
+    }
+
+    #[tokio::test]
+    async fn flows_do_not_cross() {
+        let h = harness().await;
+        zendesk_must_not_be_called(&h).await;
+        let session = open_page(&h, &"v".repeat(43)).await;
+        let response = h
+            .http
+            .post(format!("{}/cli/login/finish", h.url))
+            .json(&json!({ "state": session, "code": "zcode" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 400);
+        assert_eq!(
+            response.json::<Value>().await.unwrap()["error"],
+            "invalid_grant"
+        );
+
+        let started = h
+            .http
+            .post(format!("{}/cli/login", h.url))
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap();
+        let response = paste(&h, started["state"].as_str().unwrap(), "zcode").await;
+        assert_eq!(response.status(), 400);
+        assert_page_headers(&response);
     }
 }

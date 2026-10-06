@@ -5,7 +5,7 @@ use std::io::Read;
 use std::path::Path;
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use serde_json::Value;
 use tracing_subscriber::EnvFilter;
@@ -40,6 +40,12 @@ enum Command {
         /// Use the token saved by mobile-auth even when other credentials are configured.
         #[arg(long)]
         mobile: bool,
+    },
+    /// Sign in through a remote zendesk-mcp-server and print the token for its
+    /// Authorization header.
+    Login {
+        /// The server's address, like https://zendesk-mcp.example.com/mcp.
+        url: String,
     },
     /// Call the Zendesk API and print the JSON response.
     Api {
@@ -96,6 +102,7 @@ async fn run(cli: Cli) -> Result<i32> {
     match cli.command {
         Command::Auth { manual } => return zendesk::authorize::run(http, manual).await,
         Command::MobileAuth => mobile_auth::run_auth_cli(http).await?,
+        Command::Login { url } => login(&http, &url).await?,
         Command::Token { mobile } => {
             let (_, auth) = resolve_auth(&http, mobile).await?;
             let value = auth.value().await?;
@@ -127,6 +134,77 @@ async fn run(cli: Cli) -> Result<i32> {
         }
     }
     Ok(0)
+}
+
+/// Sign in through the zendesk-mcp-server at `url`, catching the Zendesk redirect on this
+/// machine. Prints the server token on stdout and how to use it on stderr.
+async fn login(http: &reqwest::Client, url: &str) -> Result<()> {
+    let parsed = url::Url::parse(url).with_context(|| format!("{url} is not a valid URL"))?;
+    let local = matches!(parsed.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
+    if !(parsed.scheme() == "https" || (parsed.scheme() == "http" && local)) {
+        bail!("{url} must use https: the token it returns is a credential.");
+    }
+    let origin = parsed.origin().ascii_serialization();
+
+    let started = post_json(http, &format!("{origin}/cli/login"), None).await?;
+    let field = |value: &Value, name: &str| -> Result<String> {
+        value[name]
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| anyhow!("{origin} sent an unexpected answer: {name} is missing"))
+    };
+    let state = field(&started, "state")?;
+    let captured = zendesk::authorize::receive_code_via_loopback(
+        &field(&started, "redirect_uri")?,
+        &state,
+        &field(&started, "authorize_url")?,
+    )
+    .await?;
+    let code = zendesk::authorize::validate_callback(&captured, &state)?;
+
+    let finished = post_json(
+        http,
+        &format!("{origin}/cli/login/finish"),
+        Some(serde_json::json!({ "state": state, "code": code })),
+    )
+    .await?;
+    let token = field(&finished, "access_token")?;
+    let user = &finished["user"];
+    let user_field = |name| user[name].as_str().unwrap_or_default();
+    eprintln!(
+        "Signed in to {origin} as {} <{}>.\n\
+         Send the token below as \"Authorization: Bearer <token>\". With it in ZENDESK_MCP_TOKEN:\n  \
+         Claude Code: claude mcp add --transport http zendesk {origin}/mcp --header \"Authorization: Bearer $ZENDESK_MCP_TOKEN\"\n  \
+         Pi:          \"headers\": {{\"Authorization\": \"Bearer ${{ZENDESK_MCP_TOKEN}}\"}}\n  \
+         OpenCode:    \"headers\": {{\"Authorization\": \"Bearer {{env:ZENDESK_MCP_TOKEN}}\"}}, \"oauth\": false",
+        user_field("name"),
+        user_field("email"),
+    );
+    println!("{token}");
+    Ok(())
+}
+
+/// POST `body` (if any) to `url` and return the JSON answer. A failure status becomes an
+/// error carrying the server's `error_description`.
+async fn post_json(http: &reqwest::Client, url: &str, body: Option<Value>) -> Result<Value> {
+    let request = http.post(url);
+    let request = match body {
+        Some(body) => request.json(&body),
+        None => request,
+    };
+    let response = request
+        .send()
+        .await
+        .with_context(|| format!("POST {url}"))?;
+    let status = response.status();
+    let answer: Value = response.json().await.unwrap_or(Value::Null);
+    if !status.is_success() {
+        match answer["error_description"].as_str() {
+            Some(description) => bail!("{description}"),
+            None => bail!("{url} answered {status}"),
+        }
+    }
+    Ok(answer)
 }
 
 /// Print `value` as pretty JSON, nothing for null.
@@ -223,5 +301,13 @@ mod tests {
         let err = read_data("{nope", &mut std::io::empty()).unwrap_err();
         assert!(err.to_string().contains("not valid JSON"), "{err}");
         assert!(read_data("@/nonexistent/body.json", &mut std::io::empty()).is_err());
+    }
+
+    #[tokio::test]
+    async fn login_requires_https() {
+        let err = login(&reqwest::Client::new(), "http://mcp.example.com/mcp")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("https"), "{err}");
     }
 }
