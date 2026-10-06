@@ -641,7 +641,7 @@ pub async fn run(transport: Transport, http: reqwest::Client) -> Result<()> {
 fn signed_in_server(http: reqwest::Client) -> Result<ZendeskServer> {
     let credentials = config::load_credentials()?.ok_or_else(|| {
         anyhow!(
-            "No Zendesk credentials are configured. Set ZENDESK_CLIENT_ID and run `zendesk-mcp-server auth`, or set ZENDESK_OAUTH_TOKEN, ZENDESK_EMAIL + ZENDESK_API_KEY, or ZENDESK_SESSION_COOKIE. A token from `zendesk mobile-auth` can be passed as ZENDESK_OAUTH_TOKEN=$(zendesk token)."
+            "No Zendesk credentials are configured. Set ZENDESK_SUBDOMAIN (for https://acme.zendesk.com, 'acme') and run `zendesk-mcp-server auth` once to sign in."
         )
     })?;
     Ok(ZendeskServer::new(credentials, http))

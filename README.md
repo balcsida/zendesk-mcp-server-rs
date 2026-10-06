@@ -44,7 +44,7 @@ On x86-64 Windows, the TLS library (aws-lc) needs [NASM](https://www.nasm.us/) t
 
 ## MCP server
 
-- Configure authentication: see [Authentication](#authentication).
+- Sign in once: see [Authentication](#authentication).
 - Configure Claude Desktop (or any MCP client that runs a command over stdio):
 
 ```json
@@ -53,8 +53,7 @@ On x86-64 Windows, the TLS library (aws-lc) needs [NASM](https://www.nasm.us/) t
     "zendesk": {
       "command": "/path/to/zendesk-mcp-server",
       "env": {
-        "ZENDESK_SUBDOMAIN": "acme",
-        "ZENDESK_CLIENT_ID": "your-client-identifier"
+        "ZENDESK_SUBDOMAIN": "acme"
       }
     }
   }
@@ -64,7 +63,7 @@ On x86-64 Windows, the TLS library (aws-lc) needs [NASM](https://www.nasm.us/) t
 - Or add it to Claude Code:
 
 ```bash
-claude mcp add zendesk -e ZENDESK_SUBDOMAIN=acme -e ZENDESK_CLIENT_ID=your-client-identifier -- /path/to/zendesk-mcp-server
+claude mcp add zendesk -e ZENDESK_SUBDOMAIN=acme -- /path/to/zendesk-mcp-server
 ```
 
 The server also reads a `.env` file from its working directory or any parent.
@@ -83,45 +82,27 @@ ticket access. Comments they post are authored by them.
 API token authentication still works but is deprecated. See
 [Migrating from an API token](#migrating-from-an-api-token).
 
-### 1. Register a public OAuth client
-
-In Admin Center, go to **Apps and integrations > APIs > OAuth clients** and
-create a client:
-
-| Field | Value |
-| --- | --- |
-| Client kind | **Public**. The server and the CLI run on each operator's machine, so there is no secret they could keep. PKCE is used instead. |
-| Redirect URLs | `http://localhost:4567/callback` |
-| Allowed scopes | `read tickets:write ticket_attachments:write users:write organizations:write hc:write` |
-
-Setting **Allowed scopes** is optional but recommended. It caps what any token
-from this client can ever request, even if the code changes.
-
-Note the client's **Identifier**. That is the `ZENDESK_CLIENT_ID` below.
-
-If Zendesk rejects `http://localhost:4567/callback`, register `https://localhost`
-instead and use `zendesk-mcp-server auth --manual` (or `zendesk auth --manual`) in step 3.
-
-### 2. Configure the environment
+### 1. Set the subdomain
 
 Copy `.env.example` to `.env` and set:
 
 ```bash
 # for https://acme.zendesk.com
 ZENDESK_SUBDOMAIN=acme
-ZENDESK_CLIENT_ID=your-client-identifier
 ```
 
 Keep `.env` out of version control.
 
-Two optional settings must agree with the OAuth client:
+No OAuth client has to be registered. Unless `ZENDESK_CLIENT_ID` is set, the
+server and the CLI sign in through the public OAuth client of
+[zcli](https://github.com/zendesk/zcli), Zendesk's own command-line tool: client
+`zdg-zcli-oauth`, redirect URL `http://localhost:19186/`, scopes `read write`.
 
-| Variable | Default | When to change it |
-| --- | --- | --- |
-| `ZENDESK_OAUTH_REDIRECT_URI` | `http://localhost:4567/callback` | Port 4567 is in use, or the client is registered with a different redirect URL. Must match a redirect URL on the client exactly. |
-| `ZENDESK_TOKEN_FILE` | `$XDG_CONFIG_HOME/zendesk-mcp/tokens.json` | Storing tokens elsewhere, for example a Docker volume. |
+Zendesk does not document that client for other tools. It may rename or restrict
+it, and an account's admins may block it. If sign-in fails for that reason,
+[use your own OAuth client](#using-your-own-oauth-client).
 
-### 3. Authorize this machine, once
+### 2. Authorize this machine, once
 
 ```bash
 zendesk-mcp-server auth
@@ -143,10 +124,40 @@ zendesk-mcp-server auth --manual
 
 (`zendesk auth --manual` works the same way.)
 
+If port 19186 is in use, set `ZENDESK_OAUTH_REDIRECT_URI` to
+`http://localhost:19187/` or `http://localhost:19188/`. zcli's client accepts
+those three.
+
 Tokens are written to `$XDG_CONFIG_HOME/zendesk-mcp/tokens.json`
 (`~/.config/zendesk-mcp/tokens.json` by default), created `0600` inside a `0700`
 directory. Override the location with `ZENDESK_TOKEN_FILE`. The file holds live
 credentials. Treat it like a password and never commit it.
+
+### Using your own OAuth client
+
+Admins, and agents with the Manage APIs permission, can register an OAuth client
+instead. It does not depend on zcli's client, and its allowed scopes cap what any
+token can request.
+
+In Admin Center, go to **Apps and integrations > APIs > OAuth clients** and
+create a client:
+
+| Field | Value |
+| --- | --- |
+| Client kind | **Public**. The server and the CLI run on each operator's machine, so there is no secret they could keep. PKCE is used instead. |
+| Redirect URLs | `http://localhost:4567/callback` |
+| Allowed scopes | `read tickets:write ticket_attachments:write users:write organizations:write hc:write` |
+
+Setting **Allowed scopes** is optional but recommended. It caps what any token
+from this client can ever request, even if the code changes.
+
+Set the client's **Identifier** as `ZENDESK_CLIENT_ID` and run `auth` as above.
+
+`ZENDESK_OAUTH_REDIRECT_URI` then defaults to `http://localhost:4567/callback`.
+Change it when port 4567 is in use or the client has a different redirect URL. It
+must match a redirect URL on the client exactly. If Zendesk rejects
+`http://localhost:4567/callback`, register `https://localhost` instead and use
+`zendesk-mcp-server auth --manual` (or `zendesk auth --manual`).
 
 ### How token renewal works
 
@@ -171,7 +182,11 @@ telling the operator to re-run `zendesk-mcp-server auth` (or `zendesk auth`).
 
 ### Choosing scopes
 
-The default scopes cover the documented tool families this server exposes:
+zcli's client gets `read write`, the broad scopes, which cover every tool and the
+whole API catalog. `ZENDESK_OAUTH_SCOPES=read` makes it read-only.
+
+With your own client the default scopes are narrower. They cover the documented
+tool families this server exposes:
 
 | Scope | Needed for |
 | --- | --- |
@@ -214,9 +229,9 @@ Zendesk is retiring API tokens on this schedule:
 | 2027-04-30 | All API tokens stop working permanently. |
 
 Until then `ZENDESK_EMAIL` + `ZENDESK_API_KEY` continue to work, with a deprecation
-warning from the server and the CLI. Set
-`ZENDESK_CLIENT_ID` and OAuth takes precedence, so you can migrate without
-removing the old variables.
+warning from the server and the CLI. To migrate, remove them and run
+`zendesk-mcp-server auth`. Setting `ZENDESK_CLIENT_ID` (`zdg-zcli-oauth` for
+zcli's client) also puts OAuth first, without removing them.
 
 There is a reason to move sooner: a Zendesk API token is account-level and
 unscoped. Whoever holds it gets the full access of the user it is paired with,
@@ -241,11 +256,12 @@ The first match wins:
 
 | # | Set | Credentials used |
 | --- | --- | --- |
-| 1 | `ZENDESK_CLIENT_ID` | OAuth with PKCE (needs `ZENDESK_SUBDOMAIN`) |
+| 1 | `ZENDESK_CLIENT_ID` | OAuth with PKCE through that client (needs `ZENDESK_SUBDOMAIN`) |
 | 2 | `ZENDESK_OAUTH_TOKEN` | Fixed bearer token (needs `ZENDESK_SUBDOMAIN`) |
 | 3 | `ZENDESK_EMAIL` + `ZENDESK_API_KEY` | API token, deprecated (needs `ZENDESK_SUBDOMAIN`) |
 | 4 | `ZENDESK_SESSION_COOKIE` | Session cookie (needs `ZENDESK_SUBDOMAIN`) |
-| 5 | nothing | Server: fails with an error. CLI: the saved mobile token, or a browser sign-in |
+| 5 | `ZENDESK_SUBDOMAIN` alone | OAuth with PKCE through zcli's client |
+| 6 | nothing | Server: fails with an error. CLI: the saved mobile token, or a browser sign-in |
 
 ## CLI
 
@@ -265,9 +281,9 @@ zendesk api "$(zendesk api tickets.json | jq -r .next_page)"     # follow pagina
 ZENDESK_OAUTH_TOKEN=$(zendesk token) zendesk-mcp-server          # hand the CLI's token to the server
 ```
 
-`zendesk token` prints the bearer access token the CLI would use, refreshing OAuth first. It fails for API-token and cookie credentials. `zendesk token --mobile` prints the saved mobile token even when `ZENDESK_CLIENT_ID` or another credential is configured.
+`zendesk token` prints the bearer access token the CLI would use, refreshing OAuth first. It fails for API-token and cookie credentials. `zendesk token --mobile` prints the saved mobile token even when other credentials are configured.
 
-`token` and `api` read the same environment variables as the server, in the same [precedence](#credential-precedence), also from a `.env` file in the working directory or any parent. When none is set, they use the saved mobile token (checked with a `users/me` call). A browser sign-in opens if it is missing or rejected.
+`token` and `api` read the same environment variables as the server, in the same [precedence](#credential-precedence), also from a `.env` file in the working directory or any parent. When none is set, not even `ZENDESK_SUBDOMAIN`, they use the saved mobile token (checked with a `users/me` call). A browser sign-in opens if it is missing or rejected.
 
 The CLI logs only warnings unless `RUST_LOG` is set.
 
@@ -294,8 +310,9 @@ Output and errors work as for `api`. The commands are built from the catalog on 
 zendesk mobile-auth
 ```
 
-This signs in through the Zendesk mobile app's OAuth flow. No OAuth client is
-needed. Use it when you cannot register an OAuth client in Admin Center.
+This signs in through the Zendesk mobile app's OAuth flow. Like `auth`, it needs
+no OAuth client of your own. Use it for [per-user mode](#per-user-mode), or when
+zcli's client is blocked on your account.
 
 - Accounts with email and password sign in directly, without a browser.
 - Accounts with SSO (SAML, Google, Office 365) open the system browser. The final
@@ -320,7 +337,7 @@ version, so an old file can be copied over.
 The MCP server does not read this file. Pass the token to it as a fixed bearer token:
 
 ```bash
-ZENDESK_OAUTH_TOKEN=$(zendesk token) zendesk-mcp-server
+ZENDESK_OAUTH_TOKEN=$(zendesk token --mobile) zendesk-mcp-server
 ```
 
 ## Docker
@@ -449,7 +466,7 @@ claude mcp add --transport http zendesk https://host/mcp \
   --header "Authorization: Bearer $(zendesk token --mobile)"
 ```
 
-`--mobile` makes sure the 30-minute OAuth token is not picked up when `ZENDESK_CLIENT_ID` is also set.
+`--mobile` makes sure the 30-minute OAuth token from `auth` is not picked up instead.
 
 - A `mobile-auth` token suits a fixed header because it has no refresh token to
   rotate. When Zendesk stops accepting it, run `zendesk mobile-auth` again and add the
@@ -478,13 +495,13 @@ Both binaries read these from the environment or from a `.env` file in the worki
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `ZENDESK_SUBDOMAIN` | none | Zendesk subdomain (`acme` for `acme.zendesk.com`). Required for credentials 1 to 4 and for per-user mode. |
-| `ZENDESK_CLIENT_ID` | none | Identifier of a public OAuth client. Enables OAuth. |
-| `ZENDESK_OAUTH_SCOPES` | `read tickets:write ticket_attachments:write users:write organizations:write hc:write` | Scopes requested at sign-in. |
-| `ZENDESK_OAUTH_REDIRECT_URI` | `http://localhost:4567/callback` | Redirect URL registered on the OAuth client. |
+| `ZENDESK_SUBDOMAIN` | none | Zendesk subdomain (`acme` for `acme.zendesk.com`). Required for credentials 1 to 5 and for per-user mode. Alone, it signs in through zcli's OAuth client. |
+| `ZENDESK_CLIENT_ID` | `zdg-zcli-oauth` (zcli's client) | Identifier of a public OAuth client. Setting it puts OAuth ahead of the other credentials. |
+| `ZENDESK_OAUTH_SCOPES` | `read write` for zcli's client, else `read tickets:write ticket_attachments:write users:write organizations:write hc:write` | Scopes requested at sign-in. |
+| `ZENDESK_OAUTH_REDIRECT_URI` | `http://localhost:19186/` for zcli's client, else `http://localhost:4567/callback` | Redirect URL registered on the OAuth client. |
 | `ZENDESK_TOKEN_FILE` | `~/.config/zendesk-mcp/tokens.json` | OAuth token store. |
 | `ZENDESK_OAUTH_TOKEN` | none | Fixed bearer token. |
-| `ZENDESK_MOBILE_TOKEN_FILE` | `~/.config/zendesk-mcp/mobile_token.json` | CLI only: token store for `zendesk mobile-auth` and the CLI's fallback when no other credentials are set. |
+| `ZENDESK_MOBILE_TOKEN_FILE` | `~/.config/zendesk-mcp/mobile_token.json` | CLI only: token store for `zendesk mobile-auth` and the CLI's fallback when nothing is configured, not even `ZENDESK_SUBDOMAIN`. |
 | `ZENDESK_EMAIL` | none | Email for API token auth (deprecated). |
 | `ZENDESK_API_KEY` | none | API token (deprecated). |
 | `ZENDESK_SESSION_COOKIE` | none | `_zendesk_session` cookie of a signed-in browser. |

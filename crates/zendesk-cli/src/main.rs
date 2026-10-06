@@ -16,8 +16,8 @@ use zendesk::config;
 /// Command-line client for Zendesk.
 ///
 /// Configuration comes from the environment and a .env file in the working directory or
-/// any parent. With no credentials configured, commands use the token saved by
-/// `mobile-auth`.
+/// any parent. With nothing configured, not even ZENDESK_SUBDOMAIN, commands use the token
+/// saved by `mobile-auth`.
 #[derive(Parser)]
 #[command(name = "zendesk", version, about)]
 struct Cli {

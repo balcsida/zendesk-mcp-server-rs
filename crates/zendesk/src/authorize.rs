@@ -27,7 +27,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
-use crate::config::{Credentials, OAuthSettings, load_credentials};
+use crate::config::{Credentials, MISSING_SUBDOMAIN, OAuthSettings, load_credentials};
 use crate::oauth::{
     PkcePair, build_authorization_url, exchange_authorization_code, generate_pkce_pair,
     generate_state,
@@ -55,16 +55,20 @@ type Captured = HashMap<String, String>;
 
 /// Run the authorization flow. Returns the process exit code: 0 on success, 1 when
 /// authorization or the token exchange failed, 2 when OAuth is not configured
-/// (no `ZENDESK_CLIENT_ID`), 130 on Ctrl-C.
+/// (no `ZENDESK_SUBDOMAIN`, or another credential takes precedence), 130 on Ctrl-C.
 pub async fn run(http: reqwest::Client, manual: bool) -> Result<i32> {
     let settings = match load_credentials() {
         Ok(Some(Credentials::OAuth { settings })) => settings,
-        Ok(Some(_)) | Ok(None) => {
+        Ok(Some(_)) => {
             eprintln!(
-                "error: OAuth is not configured. Set ZENDESK_CLIENT_ID to the identifier of a \
-                 public OAuth client from Admin Center (Apps and integrations > APIs > OAuth \
-                 clients)."
+                "error: ZENDESK_OAUTH_TOKEN, ZENDESK_EMAIL + ZENDESK_API_KEY or \
+                 ZENDESK_SESSION_COOKIE is set and takes precedence over OAuth. Unset it, or \
+                 set ZENDESK_CLIENT_ID to put OAuth first."
             );
+            return Ok(2);
+        }
+        Ok(None) => {
+            eprintln!("error: {MISSING_SUBDOMAIN}");
             return Ok(2);
         }
         Err(err) => {
