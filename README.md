@@ -9,7 +9,7 @@ This is a Rust rewrite of [reminia/zendesk-mcp-server](https://github.com/remini
 ## What is in the repository
 
 - `zendesk-mcp-server`: the MCP server. Tools for tickets, comments and attachments; search and counts; users, organizations, groups and brands; views, macros and triggers; custom objects; Help Center reading and writing; SLA and satisfaction data. Four catalog tools that search, describe and call any other Zendesk API operation, so the server reaches the full API. Prompts for ticket analysis and response drafting. The Help Center articles as a knowledge base resource. Speaks stdio or streamable HTTP.
-- `zendesk`: the CLI for scripted use: a command for every Zendesk API operation (`zendesk <group> <operation>`), plus `api`, `token`, `auth` and `mobile-auth`.
+- `zendesk`: the CLI for scripted use: a command for every Zendesk API operation (`zendesk <group> <operation>`), plus `api`, `token`, `auth`, `mobile-auth` and `login`.
 - `crates/zendesk`: the shared client library.
 
 Both binaries are single files with no runtime dependencies.
@@ -486,8 +486,89 @@ claude mcp add --transport http zendesk https://host/mcp \
 - The tokens are personal credentials. Serve them over TLS only, and keep
   request headers out of the proxy's logs.
 - The MCP specification calls this token passthrough. It works in clients that
-  let you set headers, such as Claude Code, Cursor and VS Code. Clients that only
-  support OAuth sign-in cannot connect this way.
+  let you set headers, such as Claude Code, Cursor and VS Code. For clients that
+  only support OAuth sign-in, see [Sign-in through the server](#sign-in-through-the-server).
+
+### Sign-in through the server
+
+The server can sign users in itself, so they need no Zendesk token of their own. Turn
+it on in per-user mode with the server's public address:
+
+```bash
+ZENDESK_SUBDOMAIN=acme zendesk-mcp-server http --per-user-auth --public-url https://zendesk-mcp.example.com
+```
+
+`--public-url` (or `MCP_PUBLIC_URL`) must be an `https` origin with nothing after the
+host: the server has to sit at the root of its host. The server uses the Zendesk
+variables from [Authentication](#authentication), with zcli's OAuth client by default.
+If any other credential variable is set, it does not start.
+
+MCP clients sign in on their own. Add the server without a header, and the client opens
+a browser:
+
+```bash
+claude mcp add --transport http zendesk https://zendesk-mcp.example.com/mcp
+```
+
+Pi, in `~/.pi/agent/mcp.json`:
+
+```json
+{"mcpServers": {"zendesk": {"url": "https://zendesk-mcp.example.com/mcp"}}}
+```
+
+OpenCode, in `opencode.json`:
+
+```json
+{"mcp": {"zendesk": {"type": "remote", "url": "https://zendesk-mcp.example.com/mcp"}}}
+```
+
+The page the server shows sends the user to Zendesk. Zendesk then redirects to a
+`localhost` page that fails to load. The user copies that page's address and pastes it
+into the form within 2 minutes.
+
+To skip the paste, run `zendesk login` on your own machine. It catches the redirect
+itself and prints a server token on stdout:
+
+```bash
+export ZENDESK_MCP_TOKEN=$(zendesk login https://zendesk-mcp.example.com/mcp)
+```
+
+Send the token as `Authorization: Bearer <token>`.
+
+```bash
+claude mcp add --transport http zendesk https://zendesk-mcp.example.com/mcp \
+  --header "Authorization: Bearer $ZENDESK_MCP_TOKEN"
+```
+
+Pi:
+
+```json
+{"mcpServers": {"zendesk": {"url": "https://zendesk-mcp.example.com/mcp", "headers": {"Authorization": "Bearer ${ZENDESK_MCP_TOKEN}"}}}}
+```
+
+OpenCode also needs `"oauth": false`:
+
+```json
+{"mcp": {"zendesk": {"type": "remote", "url": "https://zendesk-mcp.example.com/mcp", "oauth": false, "headers": {"Authorization": "Bearer {env:ZENDESK_MCP_TOKEN}"}}}}
+```
+
+Some OpenCode versions send `{env:...}` headers empty. If yours does, put the token in
+the file directly.
+
+A sign-in lasts until it goes 90 days without use, until the login is revoked in
+Zendesk, or until its directory is deleted. The client then signs in again. A login
+revoked in Zendesk keeps failing tool calls for up to 30 minutes, until its access
+token expires.
+
+- Logins are kept in `grants/`, next to `ZENDESK_TOKEN_FILE`: `/tokens/grants/` in
+  Docker.
+- Each login has its own directory. Its `user.json` names the user. Deleting the
+  directory signs that user out.
+- The volume holds every signed-in user's Zendesk refresh token. Protect it like a
+  password store.
+- Run one server process only. Logins are renewed and removed on local disk, and
+  sign-ins in progress live in memory.
+- Raw Zendesk tokens are still passed through, as in per-user mode above.
 
 ## Environment variables
 
@@ -508,6 +589,7 @@ Both binaries read these from the environment or from a `.env` file in the worki
 | `MCP_HTTP_ADDR` | `127.0.0.1:8080` (`0.0.0.0:8080` in Docker) | Listen address for the `http` subcommand. Same as `--bind`. |
 | `MCP_BEARER_TOKEN` | none | Bearer token clients must present to the `http` transport, unless `MCP_PER_USER_AUTH` is set. Same as `--bearer-token`. |
 | `MCP_PER_USER_AUTH` | `false` | `true` has every `http` client act with its own Zendesk token, see [Per-user mode](#per-user-mode). Same as `--per-user-auth`. |
+| `MCP_PUBLIC_URL` | none | Public origin of the server, like `https://zendesk-mcp.example.com`. With `MCP_PER_USER_AUTH`, MCP clients sign in through the server; see [Sign-in through the server](#sign-in-through-the-server). |
 | `RUST_LOG` | `info` (server), `warn` (CLI) | Log filter. Logs go to stderr. |
 
 ## Development
