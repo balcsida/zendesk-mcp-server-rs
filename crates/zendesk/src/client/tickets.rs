@@ -174,6 +174,13 @@ impl ZendeskClient {
                 "Attachment host is not trusted. Only Zendesk-hosted attachment URLs are allowed."
             );
         }
+        // Credentials go only to the attachment route, not to any other API endpoint or port.
+        if send_credentials && (url.port().is_some() || !url.path().starts_with("/attachments/")) {
+            bail!(
+                "content_url must be an attachment URL on {}.zendesk.com (/attachments/...) or a *.zdusercontent.com URL",
+                self.subdomain
+            );
+        }
         Ok((url, send_credentials))
     }
 
@@ -184,7 +191,12 @@ impl ZendeskClient {
         let mut resp = if send_credentials {
             self.send(|| self.http.get(url.clone())).await?
         } else {
-            let resp = self.http.get(url.clone()).send().await?;
+            let resp = self
+                .http
+                .get(url.clone())
+                .send()
+                .await
+                .map_err(reqwest::Error::without_url)?;
             ensure_success(resp, &format!("GET {}", url.path())).await?
         };
 
@@ -203,7 +215,7 @@ impl ZendeskClient {
         }
 
         let mut content = Vec::new();
-        while let Some(chunk) = resp.chunk().await? {
+        while let Some(chunk) = resp.chunk().await.map_err(reqwest::Error::without_url)? {
             if content.len() + chunk.len() > MAX_ATTACHMENT_BYTES {
                 bail!(
                     "Attachment exceeds the {} MB size limit.",
@@ -349,7 +361,7 @@ impl ZendeskClient {
                 "sort_by": sort_by,
                 "sort_order": sort_order,
                 "has_more": has_next,
-                "next_page": has_next.then_some(page + 1),
+                "next_page": has_next.then(|| page.saturating_add(1)),
                 "previous_page": has_previous.then(|| page - 1),
             }))
         }
@@ -546,6 +558,9 @@ impl ZendeskClient {
     /// Fetches in chunks of 100 ids, the `show_many` limit.
     pub async fn get_tickets_bulk(&self, ticket_ids: &[u64]) -> Result<Value> {
         async {
+            if ticket_ids.len() > 1000 {
+                bail!("Give at most 1000 ids per call");
+            }
             let mut tickets = Vec::new();
             for chunk in ticket_ids.chunks(100) {
                 let ids = chunk
@@ -580,6 +595,9 @@ impl ZendeskClient {
         async {
             if source_ids.is_empty() {
                 bail!("Give at least one source ticket to merge");
+            }
+            if source_ids.len() > 100 {
+                bail!("Give at most 100 source tickets per merge");
             }
             if source_ids.contains(&target_id) {
                 bail!("A source ticket cannot be the target ticket");
@@ -1573,10 +1591,43 @@ mod tests {
     }
 
     #[test]
+    fn attachment_url_on_account_host_must_be_an_attachment_route() {
+        let c = offline_client();
+        for url in [
+            "https://acme.zendesk.com/api/v2/users/me.json",
+            "https://acme.zendesk.com:8443/attachments/token/abc/?name=x.png",
+        ] {
+            let err = c.validate_attachment_url(url).unwrap_err().to_string();
+            assert!(
+                err.starts_with("content_url must be an attachment URL on acme.zendesk.com"),
+                "{url}"
+            );
+        }
+        let (_, creds) = c
+            .validate_attachment_url("https://acme.zendesk.com/attachments/token/abc/?name=x.png")
+            .unwrap();
+        assert!(creds);
+    }
+
+    #[tokio::test]
+    async fn bulk_and_merge_inputs_are_capped() {
+        let c = offline_client();
+        let ids: Vec<u64> = (1..=1001).collect();
+        let err = c.get_tickets_bulk(&ids).await.unwrap_err().to_string();
+        assert!(err.contains("at most 1000 ids per call"), "{err}");
+        let err = c
+            .merge_tickets(9999, &ids[..101], "t", "s", None, None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("at most 100 source tickets"), "{err}");
+    }
+
+    #[test]
     fn attachment_url_credentials_only_for_account_host() {
         let c = offline_client();
         let (url, creds) = c
-            .validate_attachment_url("https://ACME.Zendesk.com/a.png")
+            .validate_attachment_url("https://ACME.Zendesk.com/attachments/token/a.png")
             .unwrap();
         assert!(creds);
         assert_eq!(url.host_str(), Some("acme.zendesk.com"));

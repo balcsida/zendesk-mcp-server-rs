@@ -139,8 +139,8 @@ impl fmt::Debug for Credentials {
 /// version control or a Docker build context.
 pub fn config_dir() -> PathBuf {
     let base = std::env::var_os("XDG_CONFIG_HOME")
-        .filter(|v| !v.is_empty())
         .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
         .or_else(|| std::env::home_dir().map(|h| h.join(".config")))
         .unwrap_or_else(|| PathBuf::from(".config"));
     base.join("zendesk-mcp")
@@ -161,13 +161,31 @@ pub fn expand_home(path: &str) -> PathBuf {
     }
 }
 
+/// Trim `raw` and check that it is one DNS label, so it cannot redirect the URLs built
+/// from it (`acme/x#`, `evil.example/#`) to another host.
+pub fn validate_subdomain(raw: &str) -> Result<String> {
+    let value = raw.trim();
+    let alnum = |c: char| c.is_ascii_alphanumeric();
+    let valid = (1..=63).contains(&value.len())
+        && value.starts_with(alnum)
+        && value.ends_with(alnum)
+        && value.chars().all(|c| alnum(c) || c == '-');
+    if !valid {
+        bail!(
+            "ZENDESK_SUBDOMAIN '{value}' is not a valid subdomain. For https://acme.zendesk.com the subdomain is 'acme': letters, digits and hyphens only, no dots, slashes or spaces."
+        );
+    }
+    Ok(value.to_string())
+}
+
 /// `ZENDESK_SUBDOMAIN` alone, for per-user mode.
 pub fn load_subdomain() -> Result<String> {
-    std::env::var("ZENDESK_SUBDOMAIN")
+    let raw = std::env::var("ZENDESK_SUBDOMAIN")
         .ok()
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
-        .ok_or_else(|| anyhow!(MISSING_SUBDOMAIN))
+        .ok_or_else(|| anyhow!(MISSING_SUBDOMAIN))?;
+    validate_subdomain(&raw)
 }
 
 /// Read credentials from the process environment; `None` when none are configured.
@@ -183,7 +201,9 @@ pub fn load_credentials_from(get: impl Fn(&str) -> Option<String>) -> Result<Opt
             .filter(|v| !v.is_empty())
     };
 
-    let subdomain = clean("ZENDESK_SUBDOMAIN");
+    let subdomain = clean("ZENDESK_SUBDOMAIN")
+        .map(|v| validate_subdomain(&v))
+        .transpose()?;
     let require_subdomain = || -> Result<String> {
         match &subdomain {
             Some(s) => Ok(s.clone()),
@@ -346,6 +366,33 @@ mod tests {
         ]))
         .unwrap();
         assert!(matches!(bearer, Some(Credentials::Bearer { .. })));
+    }
+
+    #[test]
+    fn validate_subdomain_accepts_one_dns_label() {
+        for ok in ["acme", "acme-1", "A1", " acme "] {
+            assert_eq!(validate_subdomain(ok).unwrap(), ok.trim());
+        }
+        assert!(validate_subdomain(&"a".repeat(63)).is_ok());
+    }
+
+    #[test]
+    fn validate_subdomain_rejects_anything_else() {
+        let long = "a".repeat(64);
+        for bad in [
+            "acme/x#", "a.b", "a@b", "a b", "acme%2f", "-acme", "acme-", "", &long,
+        ] {
+            assert!(validate_subdomain(bad).is_err(), "{bad:?} was accepted");
+        }
+        let err = validate_subdomain("acme/x#").unwrap_err().to_string();
+        assert!(err.contains("acme/x#") && err.contains("https://acme.zendesk.com"));
+    }
+
+    #[test]
+    fn credentials_reject_invalid_subdomain() {
+        let err =
+            load_credentials_from(env(&[("ZENDESK_SUBDOMAIN", "evil.example/#")])).unwrap_err();
+        assert!(err.to_string().contains("evil.example/#"));
     }
 
     #[test]

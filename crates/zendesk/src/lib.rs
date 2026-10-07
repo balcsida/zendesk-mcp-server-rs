@@ -8,4 +8,4 @@ pub mod config;
 pub mod oauth;
 pub mod tokens;
 
-pub use client::{ArticleSearch, CreateTicket, ZendeskClient};
+pub use client::{ArticleSearch, CreateTicket, ZendeskClient, redirect_policy};

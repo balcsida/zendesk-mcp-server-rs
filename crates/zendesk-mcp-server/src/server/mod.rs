@@ -75,8 +75,9 @@ pub enum Transport {
 pub struct ZendeskServer {
     login: Arc<Login>,
     http: reqwest::Client,
-    /// The knowledge base with the time it was fetched; reused for [`KB_TTL`].
-    kb_cache: Arc<Mutex<Option<(Instant, Value)>>>,
+    /// The knowledge base with the time it was fetched and whether it was cut at
+    /// [`KB_MAX_ARTICLES`]; reused for [`KB_TTL`].
+    kb_cache: Arc<Mutex<Option<(Instant, Value, bool)>>>,
     tool_router: ToolRouter<ZendeskServer>,
     prompt_router: PromptRouter<ZendeskServer>,
 }
@@ -100,6 +101,7 @@ tokio::task_local! {
 }
 
 const KB_TTL: Duration = Duration::from_secs(3600);
+const KB_MAX_ARTICLES: usize = 500;
 const KB_URI: &str = "zendesk://knowledge-base";
 
 const INSTRUCTIONS: &str = "Zendesk server. Tool families: tickets and comments; search (ZQL) with count_tickets; users, organizations, groups, brands and account settings; views, macros and triggers; custom objects; Help Center articles; SLA data; deleted and suspended tickets; satisfaction ratings.
@@ -406,22 +408,26 @@ impl ZendeskServer {
     }
 
     /// The knowledge base, fetched at most once per [`KB_TTL`].
-    async fn knowledge_base(&self) -> Result<Value> {
+    async fn knowledge_base(&self) -> Result<(Value, bool)> {
         // Articles can be restricted to some users, so one caller's knowledge base must
         // never be served to another.
         // ponytail: per-user mode fetches on every read; cache per caller if that is slow.
         if self.is_per_user() {
-            return self.client().await?.get_all_articles().await;
+            return self.client().await?.get_all_articles(KB_MAX_ARTICLES).await;
         }
         let mut cache = self.kb_cache.lock().await;
-        if let Some((fetched, kb)) = cache.as_ref()
+        if let Some((fetched, kb, truncated)) = cache.as_ref()
             && fetched.elapsed() < KB_TTL
         {
-            return Ok(kb.clone());
+            return Ok((kb.clone(), *truncated));
         }
-        let kb = self.client().await?.get_all_articles().await?;
-        *cache = Some((Instant::now(), kb.clone()));
-        Ok(kb)
+        let (kb, truncated) = self
+            .client()
+            .await?
+            .get_all_articles(KB_MAX_ARTICLES)
+            .await?;
+        *cache = Some((Instant::now(), kb.clone(), truncated));
+        Ok((kb, truncated))
     }
 }
 
@@ -511,7 +517,7 @@ impl ServerHandler for ZendeskServer {
                 Some(json!({ "uri": request.uri })),
             ));
         }
-        let kb = as_caller(self.caller(&context), self.knowledge_base())
+        let (kb, truncated) = as_caller(self.caller(&context), self.knowledge_base())
             .await
             .map_err(|e| {
                 tracing::error!("Error fetching knowledge base: {e:#}");
@@ -525,7 +531,11 @@ impl ServerHandler for ZendeskServer {
         });
         let body = json!({
             "knowledge_base": kb,
-            "metadata": { "sections": sections, "total_articles": total_articles },
+            "metadata": {
+                "sections": sections,
+                "total_articles": total_articles,
+                "truncated": truncated,
+            },
         });
         let text = serde_json::to_string_pretty(&body)
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
