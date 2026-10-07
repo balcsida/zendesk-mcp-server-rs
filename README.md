@@ -48,7 +48,7 @@ cargo install --locked --git https://github.com/balcsida/zendesk-rs zendesk-mcp-
 cargo install --locked --git https://github.com/balcsida/zendesk-rs zendesk-cli         # the zendesk CLI
 ```
 
-Cargo installs them to `~/.cargo/bin`. This builds the latest `main`. To build a release instead, add its tag, for example `--tag v0.4.0`.
+Cargo installs them to `~/.cargo/bin`. This builds the latest `main`. To build a release instead, add its tag, for example `--tag v0.5.0`.
 
 From a clone, run `cargo install --locked --path crates/zendesk-mcp-server` (or `crates/zendesk-cli`), or `cargo build --release`, which puts both binaries in `target/release/`.
 
