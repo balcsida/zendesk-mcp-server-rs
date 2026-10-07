@@ -17,7 +17,7 @@ schemars = "1"
 tokio = { version = "1", features = ["rt", "macros", "io-std", "sync", "time", "signal", "net"] }
 tokio-util = "0.7"
 axum = "0.8"
-tower-http = { version = "0.6", features = ["validate-request"] }
+tower-http = { version = "0.7", features = ["validate-request"] }
 # Zendesk HTTP client. rustls with the platform verifier, so the Docker image only
 # needs ca-certificates. HTTP/1.1 only: http2 and charset are left out to save size.
 reqwest = { version = "0.13", default-features = false, features = ["json", "form", "rustls", "system-proxy"] }
