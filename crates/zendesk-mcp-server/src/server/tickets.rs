@@ -415,7 +415,7 @@ impl ZendeskServer {
 
     #[tool(
         description = "Update fields on an existing Zendesk ticket (e.g., status, priority, assignee_id, group_id), and add or remove CCs and followers. To avoid overwriting concurrent changes, set safe_update=true with updated_stamp (the ticket's updated_at from get_ticket): Zendesk then rejects the update with a 409 conflict if the ticket changed in the meantime.",
-        annotations(destructive_hint = false, idempotent_hint = true)
+        annotations(destructive_hint = true, idempotent_hint = true)
     )]
     async fn update_ticket(&self, Parameters(p): Parameters<UpdateTicketParams>) -> CallToolResult {
         self.call_json(|c| async move {
@@ -638,7 +638,7 @@ impl ZendeskServer {
 
     #[tool(
         description = "Add and/or remove specific tags on a ticket and return its current tags. Unlike update_ticket's tags, which replaces the whole list, this changes only the tags given.",
-        annotations(destructive_hint = false, idempotent_hint = true)
+        annotations(destructive_hint = true, idempotent_hint = true)
     )]
     async fn update_ticket_tags(
         &self,

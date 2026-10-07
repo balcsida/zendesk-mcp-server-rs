@@ -221,7 +221,7 @@ impl ZendeskServer {
 
     #[tool(
         description = "Create a user, or update the existing one that matches the email or external_id. A new user is an end user; this tool never changes the role.",
-        annotations(destructive_hint = false, idempotent_hint = true)
+        annotations(destructive_hint = true, idempotent_hint = true)
     )]
     async fn create_or_update_user(
         &self,
@@ -249,7 +249,7 @@ impl ZendeskServer {
 
     #[tool(
         description = "Update a user's profile. Role, suspension and password changes are deliberately not supported. A new email is added as a secondary identity (Zendesk behaviour), not made primary.",
-        annotations(destructive_hint = false, idempotent_hint = true)
+        annotations(destructive_hint = true, idempotent_hint = true)
     )]
     async fn update_user(&self, Parameters(p): Parameters<UpdateUserParams>) -> CallToolResult {
         self.call_json(|c| async move {
@@ -290,7 +290,7 @@ impl ZendeskServer {
 
     #[tool(
         description = "Update an organization. domain_names and tags replace the whole list. Agents without extra permission can usually change only notes.",
-        annotations(destructive_hint = false, idempotent_hint = true)
+        annotations(destructive_hint = true, idempotent_hint = true)
     )]
     async fn update_organization(
         &self,

@@ -214,7 +214,7 @@ impl ZendeskServer {
 
     #[tool(
         description = "Apply a macro to a ticket for real: applies only the fields the macro changes plus its comment, and records the macro in the ticket audit. Fails if the ticket changed meanwhile (409), so retry after reading it again. The macro's comment may be public and email the requester. apply_macro previews first. Returns the updated ticket.",
-        annotations(destructive_hint = false)
+        annotations(destructive_hint = true)
     )]
     async fn execute_macro(&self, Parameters(p): Parameters<ApplyMacroParams>) -> CallToolResult {
         self.call_json(|c| async move {

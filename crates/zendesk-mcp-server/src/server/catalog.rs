@@ -6,10 +6,11 @@ const DEFAULT_LIMIT: u64 = 20;
 const MAX_LIMIT: u64 = 100;
 
 /// Path fragments of the operations that return or set credentials: API and OAuth tokens,
-/// OAuth client and webhook signing secrets, Help Center JWTs, passwords, and ZIS
-/// connections and inbound webhooks. A read of one could be auto-approved and put the
-/// secret in the model's context, so the tools leave them out; the CLI runs them.
-const CREDENTIAL_PATHS: [&str; 8] = [
+/// OAuth client and webhook signing secrets, Help Center JWTs, passwords, SSO shared
+/// secrets, external-service targets, and ZIS connections and inbound webhooks. A read
+/// of one could be auto-approved and put the secret in the model's context, so the tools
+/// leave them out; the CLI runs them.
+const CREDENTIAL_PATHS: [&str; 10] = [
     "/api_tokens",
     "/oauth/",
     "/signing_secret",
@@ -18,10 +19,40 @@ const CREDENTIAL_PATHS: [&str; 8] = [
     "/session/renew",
     "/connections",
     "/inbound_webhooks",
+    "/remote_authentications",
+    "/targets",
 ];
+
+/// Groups whose writes administer the account.
+const ADMIN_WRITE_GROUPS: [&str; 12] = [
+    "Account Settings",
+    "Custom Roles",
+    "Deletion Schedules",
+    "Global Clients",
+    "Reseller",
+    "Sessions",
+    "Themes",
+    "Ticket Import",
+    "User Identities",
+    "User Passwords",
+    "Users",
+    "Webhooks",
+];
+
+/// Path fragments of bulk and permanent deletes, in any group.
+const ADMIN_WRITE_PATHS: [&str; 2] = ["/destroy_many", "/deleted_tickets/"];
 
 fn handles_credentials(op: &Operation) -> bool {
     CREDENTIAL_PATHS.iter().any(|p| op.path.contains(p))
+}
+
+/// Whether `op` writes in a way that changes who can do what, where data flows, or
+/// deletes in bulk. The dedicated tools, which never set a role, cover the day-to-day
+/// cases, and the CLI runs the rest under an operator's eyes.
+fn is_admin_write(op: &Operation) -> bool {
+    !op.is_read()
+        && (ADMIN_WRITE_GROUPS.contains(&op.group.as_str())
+            || ADMIN_WRITE_PATHS.iter().any(|p| op.path.contains(p)))
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -66,6 +97,12 @@ fn operation(id: &str) -> Result<&'static Operation> {
     if handles_credentials(op) {
         bail!(
             "{} returns or changes credentials, so it is not available here; run it with the zendesk CLI.",
+            op.id
+        );
+    }
+    if is_admin_write(op) {
+        bail!(
+            "{} changes account administration (users, roles, identities, passwords, webhooks, targets, settings, themes, imports, sessions, or bulk and permanent deletes), so the MCP server does not run it; use the zendesk CLI.",
             op.id
         );
     }
@@ -150,7 +187,7 @@ impl ZendeskServer {
         let limit = p.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT) as usize;
         let hits: Vec<&Operation> = catalog::search(&p.query)
             .into_iter()
-            .filter(|op| !handles_credentials(op))
+            .filter(|op| !handles_credentials(op) && !is_admin_write(op))
             .collect();
         let operations: Vec<Value> = hits
             .iter()
@@ -429,6 +466,127 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn admin_writes_are_hidden_and_refused() {
+        let mock = MockServer::start().await;
+        let server = server(&mock);
+        let ids = [
+            "CreateOrCloneWebhook",
+            "UpdateAccountSettings",
+            "BulkPermanentlyDeleteTickets",
+            "CreateUser",
+            "DeleteUser",
+            "DestroyManyUsers",
+        ];
+        for query in ["webhook", "account settings", "permanently delete", "user"] {
+            let p = SearchOperationsParams {
+                query: query.into(),
+                limit: Some(100),
+            };
+            let found = json_of(&server.search_api_operations(Parameters(p)).await);
+            let ops = found["operations"].as_array().unwrap();
+            assert!(!ops.is_empty(), "{query}");
+            for op in ops {
+                assert!(!ids.contains(&op["id"].as_str().unwrap()), "{found}");
+            }
+        }
+        for id in ids {
+            let write = CallWriteParams {
+                operation_id: id.into(),
+                params: None,
+                body: None,
+            };
+            let (message, is_error) = text(&server.call_api_write(Parameters(write)).await);
+            assert!(is_error);
+            assert!(
+                message.contains("changes account administration")
+                    && message.contains("zendesk CLI"),
+                "{id}: {message}"
+            );
+            let get = GetOperationParams {
+                operation_id: id.into(),
+            };
+            let (message, is_error) = text(&server.get_api_operation(Parameters(get)).await);
+            assert!(is_error);
+            assert!(
+                message.contains("changes account administration"),
+                "{id}: {message}"
+            );
+        }
+        assert!(mock.received_requests().await.unwrap().is_empty());
+
+        // Every guard still names something, so a renamed group or path cannot slip through.
+        for group in ADMIN_WRITE_GROUPS {
+            assert!(
+                catalog::operations().iter().any(|op| op.group == group),
+                "{group}"
+            );
+        }
+        for marker in ADMIN_WRITE_PATHS {
+            assert!(
+                catalog::operations()
+                    .iter()
+                    .any(|op| op.path.contains(marker)),
+                "{marker}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_reads_still_run() {
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/webhooks"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "webhooks": [] })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+        let server = server(&mock);
+        let p = SearchOperationsParams {
+            query: "list webhooks".into(),
+            limit: Some(100),
+        };
+        let found = json_of(&server.search_api_operations(Parameters(p)).await);
+        assert!(
+            found["operations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|op| op["id"] == "ListWebhooks")
+        );
+        let result = server.call_api_read(read("ListWebhooks", json!({}))).await;
+        assert_eq!(json_of(&result), json!({ "webhooks": [] }));
+    }
+
+    #[test]
+    fn credential_paths_cover_every_secret_bearing_path() {
+        const MARKERS: [&str; 9] = [
+            "token",
+            "secret",
+            "password",
+            "credential",
+            "jwt",
+            "oauth",
+            "signing",
+            "remote_authentication",
+            "/targets",
+        ];
+        // Paths that match a marker but carry no secret.
+        const BENIGN: [&str; 2] = [
+            // The token names an upload, not a credential.
+            "/api/v2/uploads/{token}",
+            // Checks a token the caller already holds; it returns none.
+            "/api/v2/any_channel/validate_token",
+        ];
+        let uncovered: Vec<_> = catalog::operations()
+            .iter()
+            .filter(|op| MARKERS.iter().any(|m| op.path.contains(m)))
+            .filter(|op| !BENIGN.contains(&op.path.as_str()) && !handles_credentials(op))
+            .map(|op| format!("{} {} {}", op.id, op.method, op.path))
+            .collect();
+        assert!(uncovered.is_empty(), "{uncovered:#?}");
+    }
+
+    #[tokio::test]
     async fn credential_operations_are_hidden_and_refused() {
         let mock = MockServer::start().await;
         let server = server(&mock);
@@ -438,7 +596,8 @@ mod tests {
         };
         let found = json_of(&server.search_api_operations(Parameters(p)).await);
         let ops = found["operations"].as_array().unwrap();
-        assert!(!ops.is_empty());
+        // The search matched something, which was all hidden.
+        assert!(!catalog::search("webhook signing secret").is_empty());
         assert!(
             ops.iter()
                 .all(|op| !op["path"].as_str().unwrap().contains("/signing_secret")),

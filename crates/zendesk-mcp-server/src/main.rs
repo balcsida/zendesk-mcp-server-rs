@@ -9,7 +9,7 @@ use tracing_subscriber::EnvFilter;
 /// Model Context Protocol server for Zendesk.
 ///
 /// Without a subcommand it serves over stdio. Configuration comes from the environment
-/// and a .env file in the working directory or any parent.
+/// and a .env file in the working directory.
 #[derive(Parser)]
 #[command(name = "zendesk-mcp-server", version, about)]
 struct Cli {
@@ -33,7 +33,7 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    dotenvy::dotenv().ok();
+    dotenvy::from_path(".env").ok();
     // stdout is the MCP channel in stdio mode, so logs go to stderr.
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -47,6 +47,7 @@ async fn main() -> Result<()> {
     let http = reqwest::Client::builder()
         .user_agent(concat!("zendesk-mcp-server/", env!("CARGO_PKG_VERSION")))
         .timeout(Duration::from_secs(30))
+        .redirect(zendesk::redirect_policy())
         .build()?;
 
     match cli.command.unwrap_or(Command::Stdio) {
