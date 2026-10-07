@@ -147,6 +147,7 @@ The response should be formatted well and ready to be posted as a comment.
 mod catalog;
 mod custom_objects;
 mod help_center;
+mod home;
 mod people;
 mod sign_in;
 mod ticket_ops;
@@ -194,6 +195,13 @@ impl ZendeskServer {
     fn read_only(mut self, on: bool) -> Self {
         self.read_only = on;
         self
+    }
+
+    fn subdomain(&self) -> &str {
+        match &*self.login {
+            Login::Shared(client) => client.subdomain(),
+            Login::PerUser { subdomain, .. } => subdomain,
+        }
     }
 
     fn is_per_user(&self) -> bool {
@@ -610,7 +618,7 @@ fn bearer_token(headers: &axum::http::HeaderMap) -> Option<&str> {
 
 /// `/mcp` requires a bearer token: `shared_token`, or in per-user mode any token, since
 /// it is the caller's own Zendesk token and Zendesk checks it on every call. `/healthz`
-/// is open for load balancers.
+/// is open for load balancers, and `/` is a setup page for people.
 fn http_router(
     server: ZendeskServer,
     shared_token: Option<&str>,
@@ -623,6 +631,17 @@ fn http_router(
     // The sign-in middleware lets any other bearer through as the caller's own Zendesk
     // token, which only makes sense in per-user mode.
     let sign_in = sign_in.filter(|_| per_user);
+    let home = home::Home {
+        subdomain: server.subdomain().to_string(),
+        read_only: server.read_only,
+        access: match &sign_in {
+            Some(sign_in) => home::Access::SignIn {
+                public: sign_in.public().to_string(),
+            },
+            None if per_user => home::Access::PerUser,
+            None => home::Access::SharedToken,
+        },
+    };
     let expected = shared_token.map(str::to_string);
     let service = StreamableHttpService::new(
         move || Ok(server.clone()),
@@ -668,7 +687,13 @@ fn http_router(
         Some(sign_in) => mcp.merge(sign_in.routes()),
         None => mcp,
     };
-    router.merge(axum::Router::new().route("/healthz", axum::routing::get(|| async { "ok" })))
+    router
+        .merge(axum::Router::new().route("/healthz", axum::routing::get(|| async { "ok" })))
+        .merge(
+            axum::Router::new()
+                .route("/", axum::routing::get(home::page))
+                .with_state(Arc::new(home)),
+        )
 }
 
 /// Serve over the chosen transport.
@@ -951,7 +976,7 @@ mod tests {
         "execute_macro",
     ];
 
-    fn server() -> ZendeskServer {
+    pub(super) fn server() -> ZendeskServer {
         ZendeskServer::new(
             Credentials::Bearer {
                 subdomain: "acme".into(),

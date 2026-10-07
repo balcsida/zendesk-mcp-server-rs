@@ -357,6 +357,11 @@ pub(super) fn help_center_path(locale: Option<&str>) -> Result<String> {
 }
 
 impl ZendeskClient {
+    /// The Zendesk subdomain this client talks to.
+    pub fn subdomain(&self) -> &str {
+        &self.subdomain
+    }
+
     pub fn new(subdomain: &str, auth: Auth, http: reqwest::Client) -> Self {
         let base_url = format!("https://{subdomain}.zendesk.com/api/v2");
         Self::with_base_url(subdomain, auth, http, base_url)
