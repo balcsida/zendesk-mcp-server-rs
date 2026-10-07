@@ -451,6 +451,7 @@ zendesk-mcp-server http --bind 0.0.0.0:8080 --bearer-token "$(openssl rand -hex 
 - `--bind` (or `MCP_HTTP_ADDR`) defaults to `127.0.0.1:8080`; the Docker image sets it to `0.0.0.0:8080`.
 - The `http` transport requires a bearer token (`--bearer-token` or `MCP_BEARER_TOKEN`), unless it runs in [per-user mode](#per-user-mode). Clients send it as `Authorization: Bearer <token>`.
 - `GET /healthz` is unauthenticated, for health checks.
+- `GET /` is a setup page for people: the MCP endpoint, how to authenticate and the Zendesk subdomain, with the commands to add the server to an MCP client. Like `/healthz`, it needs no token. Behind a proxy it shows `https` addresses when the proxy sends `X-Forwarded-Proto: https`.
 - The server speaks plain HTTP. Put TLS in front with a reverse proxy such as Caddy or nginx. The proxy must terminate TLS and should enforce request timeouts and rate limits, particularly on `/authorize` and `/cli/*`: the server has no connection limits of its own.
 
 Add it to Claude Code:

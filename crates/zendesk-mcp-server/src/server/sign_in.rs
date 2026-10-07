@@ -130,6 +130,11 @@ impl SignIn {
         Ok(sign_in)
     }
 
+    /// The server's origin, such as `https://host`.
+    pub(super) fn public(&self) -> &str {
+        &self.public
+    }
+
     /// The routes that need no token: the OAuth metadata documents and the sign-in
     /// endpoints.
     pub fn routes(self: &Arc<Self>) -> axum::Router {
@@ -420,7 +425,7 @@ fn is_loopback_redirect(uri: &str) -> bool {
     })
 }
 
-fn escape_html(text: &str) -> String {
+pub(super) fn escape_html(text: &str) -> String {
     let mut escaped = String::with_capacity(text.len());
     for c in text.chars() {
         match c {
@@ -436,7 +441,7 @@ fn escape_html(text: &str) -> String {
 }
 
 /// An HTML answer that browsers will not cache, leak the address of or frame.
-fn html(status: StatusCode, body: String) -> Response {
+pub(super) fn html(status: StatusCode, body: String) -> Response {
     (
         status,
         [
