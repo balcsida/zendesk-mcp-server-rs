@@ -22,6 +22,18 @@ Install the binary you need, or both. The MCP server is also published as a [Doc
 
 Download the archives for your platform from the [releases](https://github.com/balcsida/zendesk-rs/releases) page. Each has a `.sha256` file. Unpack them and put the binaries on your `PATH`.
 
+Each archive carries a build provenance attestation. Verify a download with the [GitHub CLI](https://cli.github.com/):
+
+```bash
+gh attestation verify <archive> --repo balcsida/zendesk-rs
+```
+
+The image is attested too:
+
+```bash
+gh attestation verify oci://ghcr.io/balcsida/zendesk-mcp-server:<version> --repo balcsida/zendesk-rs
+```
+
 | Binary | Archives |
 | --- | --- |
 | `zendesk-mcp-server` | `zendesk-mcp-server-x86_64-unknown-linux-gnu.tar.gz`, `zendesk-mcp-server-aarch64-unknown-linux-gnu.tar.gz`, `zendesk-mcp-server-aarch64-apple-darwin.tar.gz`, `zendesk-mcp-server-x86_64-apple-darwin.tar.gz`, `zendesk-mcp-server-x86_64-pc-windows-msvc.zip` |
@@ -406,7 +418,7 @@ Claude Code or Claude Desktop configuration:
 ```bash
 docker run -d --name zendesk-mcp \
   --env-file .env \
-  -e MCP_BEARER_TOKEN=change-me \
+  -e MCP_BEARER_TOKEN="$(openssl rand -hex 32)" \
   -v zendesk-tokens:/tokens \
   -p 8080:8080 \
   ghcr.io/balcsida/zendesk-mcp-server http
@@ -417,7 +429,7 @@ Inside the image `http` listens on `0.0.0.0:8080` by default.
 ### Compose
 
 `compose.yaml` runs the HTTP transport with a persistent `zendesk-tokens` volume.
-Put `MCP_BEARER_TOKEN` in `.env`, then:
+Put `MCP_BEARER_TOKEN` in `.env` (generate it with `openssl rand -hex 32`). Compose publishes the port on `127.0.0.1` only, so put a TLS reverse proxy on the host in front of it. Then:
 
 ```bash
 docker compose up -d --build
@@ -617,10 +629,10 @@ The tests use mocked HTTP and never contact Zendesk.
 
 ### Releasing
 
-Bump `version` in `Cargo.toml`, commit it together with the updated `Cargo.lock` (the release builds with `--locked`), tag `vX.Y.Z` and push the tag. The release
+Bump `version` in `Cargo.toml`, commit it together with the updated `Cargo.lock` (the release builds with `--locked`), tag `vX.Y.Z` and push the tag. The tagged commit must be on `main`; the release workflow fails otherwise. The release
 workflow builds both binaries (`zendesk-mcp-server` and `zendesk`) for five targets and the
 two-arch `ghcr.io/balcsida/zendesk-mcp-server` image, then publishes the draft
-release once everything has succeeded.
+release once everything has succeeded. The binaries and the image carry build provenance attestations.
 
 ## Troubleshooting
 

@@ -5,8 +5,14 @@ services:
     command: ["http"]
     # .env must also contain MCP_BEARER_TOKEN, or MCP_PER_USER_AUTH=true.
     env_file: .env
+    # Loopback only: a TLS reverse proxy on the host fronts it (Docker's published
+    # ports bypass host firewalls).
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
+    read_only: true
+    tmpfs: ["/tmp"]
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
     volumes:
       - zendesk-tokens:/tokens
     restart: unless-stopped

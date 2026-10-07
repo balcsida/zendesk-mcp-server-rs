@@ -17,7 +17,14 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Require the tagged commit to be on main
+        run: |
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main ||
+            { echo "::error::$GITHUB_REF_NAME is not on main; tag a commit from main"; exit 1; }
       - name: Create the draft release
         run: |
           gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 ||
@@ -40,13 +47,18 @@ jobs:
           - {target: x86_64-pc-windows-msvc, runner: windows-latest}
     runs-on: ${{ matrix.runner }}
     permissions:
-      contents: write
+      contents: read
+      id-token: write
+      attestations: write
     env:
       # The Windows runner has no NASM; aws-lc-sys uses prebuilt objects.
       AWS_LC_SYS_PREBUILT_NASM: "1"
     steps:
-      - uses: actions/checkout@v7
-      - uses: taiki-e/upload-rust-binary-action@v1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: server
+        uses: taiki-e/upload-rust-binary-action@f0d45ae91ee7b8ee928de7a9d04d893a08bcbec6 # v1.30.2
         with:
           bin: zendesk-mcp-server
           target: ${{ matrix.target }}
@@ -55,8 +67,10 @@ jobs:
           checksum: sha256
           locked: true
           include: LICENSE
-          token: ${{ secrets.GITHUB_TOKEN }}
-      - uses: taiki-e/upload-rust-binary-action@v1
+          dry-run: true
+          dry-run-intended: true
+      - id: cli
+        uses: taiki-e/upload-rust-binary-action@f0d45ae91ee7b8ee928de7a9d04d893a08bcbec6 # v1.30.2
         with:
           bin: zendesk
           target: ${{ matrix.target }}
@@ -65,7 +79,42 @@ jobs:
           checksum: sha256
           locked: true
           include: LICENSE
-          token: ${{ secrets.GITHUB_TOKEN }}
+          dry-run: true
+          dry-run-intended: true
+      - uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
+        with:
+          subject-path: |
+            ${{ steps.server.outputs.tar || steps.server.outputs.zip }}
+            ${{ steps.cli.outputs.tar || steps.cli.outputs.zip }}
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: binaries-${{ matrix.target }}
+          path: |
+            ${{ steps.server.outputs.tar || steps.server.outputs.zip }}
+            ${{ steps.cli.outputs.tar || steps.cli.outputs.zip }}
+            ${{ steps.server.outputs.sha256 }}
+            ${{ steps.cli.outputs.sha256 }}
+          if-no-files-found: error
+          retention-days: 1
+
+  # Only this job can write to the release; the build jobs run dependency code.
+  upload:
+    needs: [release, binaries]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: ${{ runner.temp }}/binaries
+          pattern: binaries-*
+          merge-multiple: true
+      - name: Upload the archives to the draft release
+        working-directory: ${{ runner.temp }}/binaries
+        run: gh release upload "$GITHUB_REF_NAME" ./* --clobber
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
 
   image:
     strategy:
@@ -79,23 +128,25 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Prepare
         run: echo "PLATFORM_PAIR=${PLATFORM//\//-}" >> "$GITHUB_ENV"
         env:
           PLATFORM: ${{ matrix.platform }}
       - id: meta
-        uses: docker/metadata-action@v6
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: ${{ env.REGISTRY_IMAGE }}
-      - uses: docker/login-action@v4
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/setup-buildx-action@v4
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - id: build
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           platforms: ${{ matrix.platform }}
@@ -110,7 +161,7 @@ jobs:
           mkdir -p "${{ runner.temp }}/digests"
           digest="${{ steps.build.outputs.digest }}"
           touch "${{ runner.temp }}/digests/${digest#sha256:}"
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: digests-${{ env.PLATFORM_PAIR }}
           path: ${{ runner.temp }}/digests/*
@@ -123,20 +174,22 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write
+      attestations: write
     steps:
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: ${{ runner.temp }}/digests
           pattern: digests-*
           merge-multiple: true
-      - uses: docker/login-action@v4
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/setup-buildx-action@v4
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - id: meta
-        uses: docker/metadata-action@v6
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: ${{ env.REGISTRY_IMAGE }}
           tags: |
@@ -149,13 +202,23 @@ jobs:
           docker buildx imagetools create \
             $(jq -cr '.tags | map("-t " + .) | join(" ")' \
               <<< "$DOCKER_METADATA_OUTPUT_JSON") \
-            $(printf '${{ env.REGISTRY_IMAGE }}@sha256:%s ' *)
-      - run: |
-          docker buildx imagetools inspect \
-            ${{ env.REGISTRY_IMAGE }}:${{ steps.meta.outputs.version }}
+            $(printf "$REGISTRY_IMAGE@sha256:%s " *)
+      - id: inspect
+        run: |
+          docker buildx imagetools inspect "$REGISTRY_IMAGE:$VERSION"
+          digest="$(docker buildx imagetools inspect "$REGISTRY_IMAGE:$VERSION" \
+            --format '{{json .Manifest.Digest}}')"
+          echo "digest=${digest//\"/}" >> "$GITHUB_OUTPUT"
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+      - uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
+        with:
+          subject-name: ${{ env.REGISTRY_IMAGE }}
+          subject-digest: ${{ steps.inspect.outputs.digest }}
+          push-to-registry: true
 
   publish:
-    needs: [binaries, image-merge]
+    needs: [upload, image-merge]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
