@@ -271,6 +271,23 @@ mod tests {
     }
 
     #[test]
+    fn catalog_ids_and_paths_have_a_safe_shape() {
+        for op in operations() {
+            let id_ok = op.id.starts_with(|c: char| c.is_ascii_alphabetic())
+                && op.id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+            assert!(id_ok, "bad id {}", op.id);
+            let path_ok = op.path.starts_with('/')
+                && !op.path.contains("//")
+                && !op.path.contains("..")
+                && op
+                    .path
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "._~-/{}".contains(c));
+            assert!(path_ok, "bad path {} for {}", op.path, op.id);
+        }
+    }
+
+    #[test]
     fn catalog_ids_are_unique_and_paths_match_their_params() {
         let ops = operations();
         assert!(!ops.is_empty());

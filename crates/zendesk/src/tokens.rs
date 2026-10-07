@@ -224,6 +224,12 @@ impl TokenStore {
 
     async fn lock_with_timeout(&self, timeout: Duration) -> Result<TokenLock> {
         ensure_directory(&self.path)?;
+        if fs::symlink_metadata(&self.lock_path).is_ok_and(|m| m.file_type().is_symlink()) {
+            bail!(
+                "refusing to use {} as the lock file: it is a symlink",
+                self.lock_path.display()
+            );
+        }
         let mut options = OpenOptions::new();
         options.create(true).truncate(false).write(true);
         #[cfg(unix)]
@@ -244,9 +250,8 @@ impl TokenStore {
             }
             if tokio::time::Instant::now() >= deadline {
                 bail!(
-                    "Timed out after {}s waiting for the token store lock at {}. Another \
-                     process may be stuck; remove the lock file if no other Zendesk MCP \
-                     server is running.",
+                    "Timed out after {}s: another process is holding the token store lock at \
+                     {}. Wait for it to finish.",
                     timeout.as_secs(),
                     self.lock_path.display()
                 );
@@ -259,6 +264,16 @@ impl TokenStore {
     /// to run `zendesk-mcp-server auth` (or `zendesk auth`).
     pub fn load(&self) -> Result<TokenSet> {
         let path = self.path.display();
+        #[cfg(unix)]
+        if let Ok(meta) = fs::metadata(&self.path) {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = meta.permissions().mode() & 0o777;
+            if mode & 0o077 != 0 {
+                tracing::warn!(
+                    "{path} has mode {mode:o}, so it is readable by other users; run chmod 600 on it."
+                );
+            }
+        }
         let raw = fs::read_to_string(&self.path).map_err(|err| {
             if err.kind() == std::io::ErrorKind::NotFound {
                 anyhow!(
@@ -282,30 +297,49 @@ impl TokenStore {
     /// with mode 0700 first.
     pub fn save(&self, tokens: &TokenSet) -> Result<()> {
         ensure_directory(&self.path)?;
+        match fs::read(&self.path) {
+            Ok(existing) => {
+                let is_token_file = serde_json::from_slice::<serde_json::Value>(&existing)
+                    .is_ok_and(|v| v.get("access_token").is_some());
+                if !is_token_file {
+                    bail!(
+                        "refusing to overwrite {}: it is not a Zendesk token file",
+                        self.path.display()
+                    );
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => bail!("Could not read {}: {err}", self.path.display()),
+        }
         let mut payload = serde_json::to_string_pretty(&serde_json::to_value(tokens)?)?;
         payload.push('\n');
-
-        let mut temp_name = self.path.file_name().unwrap_or_default().to_os_string();
-        temp_name.push(format!(".{}.tmp", uuid::Uuid::new_v4().simple()));
-        let temp_path = self.path.with_file_name(temp_name);
-
-        let write = || -> std::io::Result<()> {
-            let mut options = OpenOptions::new();
-            options.write(true).create_new(true);
-            #[cfg(unix)]
-            std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-            let mut file = options.open(&temp_path)?;
-            file.write_all(payload.as_bytes())?;
-            file.sync_all()?;
-            fs::rename(&temp_path, &self.path)
-        };
-        write().map_err(|err| {
-            let _ = fs::remove_file(&temp_path);
-            anyhow!("Could not write {}: {err}", self.path.display())
-        })?;
+        write_private(&self.path, payload.as_bytes())?;
         tracing::debug!("Stored Zendesk OAuth tokens at {}", self.path.display());
         Ok(())
     }
+}
+
+/// Write `contents` to `path` atomically with mode 0600: a random-named temp file beside
+/// it, fsync, rename. The temp file is removed if anything fails.
+pub fn write_private(path: &Path, contents: &[u8]) -> Result<()> {
+    let mut temp_name = path.file_name().unwrap_or_default().to_os_string();
+    temp_name.push(format!(".{}.tmp", uuid::Uuid::new_v4().simple()));
+    let temp_path = path.with_file_name(temp_name);
+
+    let write = || -> std::io::Result<()> {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let mut file = options.open(&temp_path)?;
+        file.write_all(contents)?;
+        file.sync_all()?;
+        fs::rename(&temp_path, path)
+    };
+    write().map_err(|err| {
+        let _ = fs::remove_file(&temp_path);
+        anyhow!("Could not write {}: {err}", path.display())
+    })
 }
 
 fn lock_path_for(path: &Path) -> PathBuf {
@@ -390,6 +424,64 @@ mod tests {
         let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&store.path), 0o600);
         assert_eq!(mode(store.path.parent().unwrap()), 0o700);
+    }
+
+    #[test]
+    fn save_refuses_to_overwrite_a_foreign_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TokenStore::new(dir.path().join("tokens.json"));
+        for foreign in ["not json", "[1]", r#"{"other": 1}"#, ""] {
+            fs::write(&store.path, foreign).unwrap();
+            let err = store.save(&sample(None)).unwrap_err().to_string();
+            assert!(
+                err.contains("refusing to overwrite") && err.contains("not a Zendesk token file")
+            );
+            assert_eq!(fs::read_to_string(&store.path).unwrap(), foreign);
+        }
+        fs::write(&store.path, r#"{"access_token": "old"}"#).unwrap();
+        store.save(&sample(None)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_private_is_0600_and_leaves_no_temp_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secret");
+        write_private(&path, b"one").unwrap();
+        write_private(&path, b"two").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"two");
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+        // A missing directory fails and leaves nothing behind.
+        assert!(write_private(&dir.path().join("no/such/secret"), b"x").is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn lock_refuses_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TokenStore::new(dir.path().join("tokens.json"));
+        let target = dir.path().join("victim");
+        fs::write(&target, "keep").unwrap();
+        std::os::unix::fs::symlink(&target, &store.lock_path).unwrap();
+        let err = store.lock().await.unwrap_err().to_string();
+        assert!(err.contains("it is a symlink"));
+        assert_eq!(fs::read_to_string(&target).unwrap(), "keep");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_still_reads_a_group_readable_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let store = TokenStore::new(dir.path().join("tokens.json"));
+        store.save(&sample(None)).unwrap();
+        fs::set_permissions(&store.path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(store.load().unwrap(), sample(None));
     }
 
     #[test]
@@ -510,7 +602,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains(&first.lock_path.display().to_string()));
-        assert!(err.contains("remove the lock file"));
+        assert!(err.contains("holding the token store lock") && !err.contains("remove"));
         drop(held);
         second
             .lock_with_timeout(Duration::from_millis(250))

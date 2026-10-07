@@ -22,6 +22,18 @@ Install the binary you need, or both. The MCP server is also published as a [Doc
 
 Download the archives for your platform from the [releases](https://github.com/balcsida/zendesk-rs/releases) page. Each has a `.sha256` file. Unpack them and put the binaries on your `PATH`.
 
+Each archive carries a build provenance attestation. Verify a download with the [GitHub CLI](https://cli.github.com/):
+
+```bash
+gh attestation verify <archive> --repo balcsida/zendesk-rs
+```
+
+The image is attested too:
+
+```bash
+gh attestation verify oci://ghcr.io/balcsida/zendesk-mcp-server:<version> --repo balcsida/zendesk-rs
+```
+
 | Binary | Archives |
 | --- | --- |
 | `zendesk-mcp-server` | `zendesk-mcp-server-x86_64-unknown-linux-gnu.tar.gz`, `zendesk-mcp-server-aarch64-unknown-linux-gnu.tar.gz`, `zendesk-mcp-server-aarch64-apple-darwin.tar.gz`, `zendesk-mcp-server-x86_64-apple-darwin.tar.gz`, `zendesk-mcp-server-x86_64-pc-windows-msvc.zip` |
@@ -66,7 +78,7 @@ On x86-64 Windows, the TLS library (aws-lc) needs [NASM](https://www.nasm.us/) t
 claude mcp add zendesk -e ZENDESK_SUBDOMAIN=acme -- /path/to/zendesk-mcp-server
 ```
 
-The server also reads a `.env` file from its working directory or any parent.
+The server also reads a `.env` file from its working directory.
 
 Without a subcommand the binary serves over stdio; `zendesk-mcp-server stdio` is
 the same thing. `zendesk-mcp-server http` serves streamable HTTP instead, see
@@ -130,8 +142,8 @@ those three.
 
 Tokens are written to `$XDG_CONFIG_HOME/zendesk-mcp/tokens.json`
 (`~/.config/zendesk-mcp/tokens.json` by default), created `0600` inside a `0700`
-directory. Override the location with `ZENDESK_TOKEN_FILE`. The file holds live
-credentials. Treat it like a password and never commit it.
+directory on Unix. On Windows the file inherits the folder's permissions. Override the
+location with `ZENDESK_TOKEN_FILE`. The file holds live credentials. Treat it like a password and never commit it.
 
 ### Using your own OAuth client
 
@@ -205,7 +217,10 @@ broad `write` scope to `ZENDESK_OAUTH_SCOPES` (reads stay covered by `read`).
 The API catalog (the CLI's generated commands, and `call_api_read` and
 `call_api_write` on the server) also reaches families this table does not list,
 such as macros, triggers, webhooks and Talk. Writing to them needs the broad
-`write` scope, or the family's own scope where Zendesk documents one.
+`write` scope, or the family's own scope where Zendesk documents one. The server's
+catalog tools hide and refuse the operations that return or change credentials, and
+the account-administration writes (see [API catalog](#api-catalog)); the CLI runs them.
+`MCP_READ_ONLY=true` makes the server list and run only its read-only tools.
 
 `read` alone is the read-only configuration. Zendesk gives search, job statuses
 and ticket audits no narrow read scope (`tickets:read` is not enough for audits),
@@ -283,7 +298,7 @@ ZENDESK_OAUTH_TOKEN=$(zendesk token) zendesk-mcp-server          # hand the CLI'
 
 `zendesk token` prints the bearer access token the CLI would use, refreshing OAuth first. It fails for API-token and cookie credentials. `zendesk token --mobile` prints the saved mobile token even when other credentials are configured.
 
-`token` and `api` read the same environment variables as the server, in the same [precedence](#credential-precedence), also from a `.env` file in the working directory or any parent. When none is set, not even `ZENDESK_SUBDOMAIN`, they use the saved mobile token (checked with a `users/me` call). A browser sign-in opens if it is missing or rejected.
+`token` and `api` read the same environment variables as the server, in the same [precedence](#credential-precedence), also from a `.env` file in the working directory. When none is set, not even `ZENDESK_SUBDOMAIN`, they use the saved mobile token (checked with a `users/me` call). A browser sign-in opens if it is missing or rejected.
 
 The CLI logs only warnings unless `RUST_LOG` is set.
 
@@ -406,7 +421,7 @@ Claude Code or Claude Desktop configuration:
 ```bash
 docker run -d --name zendesk-mcp \
   --env-file .env \
-  -e MCP_BEARER_TOKEN=change-me \
+  -e MCP_BEARER_TOKEN="$(openssl rand -hex 32)" \
   -v zendesk-tokens:/tokens \
   -p 8080:8080 \
   ghcr.io/balcsida/zendesk-mcp-server http
@@ -417,7 +432,7 @@ Inside the image `http` listens on `0.0.0.0:8080` by default.
 ### Compose
 
 `compose.yaml` runs the HTTP transport with a persistent `zendesk-tokens` volume.
-Put `MCP_BEARER_TOKEN` in `.env`, then:
+Put `MCP_BEARER_TOKEN` in `.env` (generate it with `openssl rand -hex 32`). Compose publishes the port on `127.0.0.1` only, so put a TLS reverse proxy on the host in front of it. Then:
 
 ```bash
 docker compose up -d --build
@@ -436,7 +451,7 @@ zendesk-mcp-server http --bind 0.0.0.0:8080 --bearer-token "$(openssl rand -hex 
 - `--bind` (or `MCP_HTTP_ADDR`) defaults to `127.0.0.1:8080`; the Docker image sets it to `0.0.0.0:8080`.
 - The `http` transport requires a bearer token (`--bearer-token` or `MCP_BEARER_TOKEN`), unless it runs in [per-user mode](#per-user-mode). Clients send it as `Authorization: Bearer <token>`.
 - `GET /healthz` is unauthenticated, for health checks.
-- The server speaks plain HTTP. Put TLS in front with a reverse proxy such as Caddy or nginx.
+- The server speaks plain HTTP. Put TLS in front with a reverse proxy such as Caddy or nginx. The proxy must terminate TLS and should enforce request timeouts and rate limits, particularly on `/authorize` and `/cli/*`: the server has no connection limits of its own.
 
 Add it to Claude Code:
 
@@ -502,7 +517,8 @@ ZENDESK_SUBDOMAIN=acme zendesk-mcp-server http --per-user-auth --public-url http
 ```
 
 `--public-url` (or `MCP_PUBLIC_URL`) must be an `https` origin with nothing after the
-host: the server has to sit at the root of its host. The server uses the Zendesk
+host (`http` only on localhost, for testing): the server has to sit at the root of its
+host. The server uses the Zendesk
 variables from [Authentication](#authentication), with zcli's OAuth client by default.
 If any other credential variable is set, it does not start.
 
@@ -565,6 +581,8 @@ token expires.
 
 - Logins are kept in `grants/`, next to `ZENDESK_TOKEN_FILE`: `/tokens/grants/` in
   Docker.
+- A pasted sign-in ends after three failed attempts. Logins unused for 90 days are
+  deleted.
 - Each login has its own directory. Its `user.json` names the user. Deleting the
   directory signs that user out.
 - The volume holds every signed-in user's Zendesk refresh token. Protect it like a
@@ -575,7 +593,7 @@ token expires.
 
 ## Environment variables
 
-Both binaries read these from the environment or from a `.env` file in the working directory or any parent. The `MCP_*` variables apply to the server only.
+Both binaries read these from the environment or from a `.env` file in the working directory. The `MCP_*` variables apply to the server only.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
@@ -590,10 +608,13 @@ Both binaries read these from the environment or from a `.env` file in the worki
 | `ZENDESK_API_KEY` | none | API token (deprecated). |
 | `ZENDESK_SESSION_COOKIE` | none | `_zendesk_session` cookie of a signed-in browser. |
 | `MCP_HTTP_ADDR` | `127.0.0.1:8080` (`0.0.0.0:8080` in Docker) | Listen address for the `http` subcommand. Same as `--bind`. |
-| `MCP_BEARER_TOKEN` | none | Bearer token clients must present to the `http` transport, unless `MCP_PER_USER_AUTH` is set. Same as `--bearer-token`. |
+| `MCP_BEARER_TOKEN` | none | Bearer token clients must present to the `http` transport, unless `MCP_PER_USER_AUTH` is set. At least 16 characters; prefer the variable over `--bearer-token`, whose value shows in `ps`. |
+| `MCP_READ_ONLY` | `false` | `true` (or `1`) lists and runs only the read-only tools. |
 | `MCP_PER_USER_AUTH` | `false` | `true` has every `http` client act with its own Zendesk token, see [Per-user mode](#per-user-mode). Same as `--per-user-auth`. |
 | `MCP_PUBLIC_URL` | none | Public origin of the server, like `https://zendesk-mcp.example.com`. With `MCP_PER_USER_AUTH`, MCP clients sign in through the server; see [Sign-in through the server](#sign-in-through-the-server). |
 | `RUST_LOG` | `info` (server), `warn` (CLI) | Log filter. Logs go to stderr. |
+
+Both binaries honour `HTTPS_PROXY`, `ALL_PROXY` and `NO_PROXY`.
 
 ## Development
 
@@ -617,10 +638,10 @@ The tests use mocked HTTP and never contact Zendesk.
 
 ### Releasing
 
-Bump `version` in `Cargo.toml`, commit it together with the updated `Cargo.lock` (the release builds with `--locked`), tag `vX.Y.Z` and push the tag. The release
+Bump `version` in `Cargo.toml`, commit it together with the updated `Cargo.lock` (the release builds with `--locked`), tag `vX.Y.Z` and push the tag. The tagged commit must be on `main`; the release workflow fails otherwise. The release
 workflow builds both binaries (`zendesk-mcp-server` and `zendesk`) for five targets and the
 two-arch `ghcr.io/balcsida/zendesk-mcp-server` image, then publishes the draft
-release once everything has succeeded.
+release once everything has succeeded. The binaries and the image carry build provenance attestations.
 
 ## Troubleshooting
 
@@ -673,7 +694,7 @@ Draft a response to a Zendesk ticket.
 
 ## MCP tools
 
-Tools carry MCP annotations (read-only, destructive) so clients can ask for confirmation before changes. The categories below cover tickets, ticket operations, search, users and organizations, views, macros and triggers, account, custom objects, the Help Center, metrics and SLAs, and the API catalog.
+Tools carry MCP annotations (read-only, destructive) so clients can ask for confirmation before changes. The tools that overwrite data, such as the update tools and `execute_macro`, are marked destructive, so clients ask before running them. With `MCP_READ_ONLY=true` the server lists and runs only the read-only tools. The categories below cover tickets, ticket operations, search, users and organizations, views, macros and triggers, account, custom objects, the Help Center, metrics and SLAs, and the API catalog.
 
 ### Tickets
 
@@ -1232,7 +1253,7 @@ List every locale version of an article with its draft and outdated state, as `{
 
 #### create_article
 
-Create a Help Center article. It is a draft unless `draft` is false. Publish later with `update_article` and `draft` false. Returns the article in the `get_article` shape.
+Create a Help Center article. The Markdown body is converted to HTML without sanitising; Zendesk sanitises on its side. It is a draft unless `draft` is false. Publish later with `update_article` and `draft` false. Returns the article in the `get_article` shape.
 
 - `section_id` (integer)
 - `title` (string)
@@ -1246,7 +1267,7 @@ Create a Help Center article. It is a draft unless `draft` is false. Publish lat
 
 #### update_article
 
-Edit the text of one locale and/or the article's metadata. Set `draft` to false to publish, true to unpublish. Returns the updated article in the `get_article` shape. It may make two writes (the translation, then the metadata), so if the second fails the first stays applied.
+Edit the text of one locale and/or the article's metadata. Markdown is converted to HTML without sanitising; Zendesk sanitises on its side. Set `draft` to false to publish, true to unpublish. Returns the updated article in the `get_article` shape. It may make two writes (the translation, then the metadata), so if the second fails the first stays applied.
 
 - `article_id` (integer)
 - `locale` (string, optional): Required with `title`, `body` or `draft`
@@ -1308,7 +1329,7 @@ List CSAT satisfaction ratings with `score`, `comment`, `reason`, `reason_id`, t
 
 These four tools reach the full Zendesk API (Support, Help Center, Talk, webhooks, chat and more) without one tool per endpoint. Search for an operation, read its description, then call it.
 
-Operations that return or change credentials (API and OAuth tokens, OAuth client and webhook signing secrets, Help Center JWTs, passwords, ZIS connections and inbound webhooks) are left out, so a secret never lands in the model's context through a read a client may approve automatically. The CLI runs them.
+Operations that return or change credentials (API and OAuth tokens, OAuth client and webhook signing secrets, Help Center JWTs, passwords, SSO shared secrets, targets, ZIS connections and inbound webhooks) are hidden and refused, so a secret never lands in the model's context through a read a client may approve automatically. So are the writes that administer the account: users, custom roles, user identities and passwords, webhooks, account settings, themes, ticket imports, sessions, deletion schedules, global clients, reseller operations, and bulk or permanent deletes. Reads in those families still run. The CLI runs everything the server refuses.
 
 #### search_api_operations
 
@@ -1317,7 +1338,7 @@ Search the full Zendesk API by keywords. Use it when no dedicated tool fits.
 - `query` (string): Keywords, e.g. `list ticket comments`; an operation must match every word
 - `limit` (integer, optional): Operations to return, max 100 (defaults to 20)
 
-Returns `total` and the first `limit` operations, each with `id`, `method`, `path` and `summary`.
+Returns `total` and the first `limit` operations, each with `id`, `method`, `path` and `summary`. Operations the server refuses (credentials, account administration) are not listed.
 
 #### get_api_operation
 
@@ -1325,11 +1346,11 @@ Describe one API operation.
 
 - `operation_id` (string): An id from `search_api_operations`, e.g. `ShowTicket` (case-insensitive)
 
-Returns the operation with its group, path and query parameters, an example request body and a description, plus `tool`: `call_api_read` or `call_api_write`, whichever runs it.
+Returns the operation with its group, path and query parameters, an example request body and a description, plus `tool`: `call_api_read` or `call_api_write`, whichever runs it. Refuses credential and account-administration operations, which the CLI runs.
 
 #### call_api_read
 
-Run a read-only (`GET`) operation. Refuses other operations and points to `call_api_write`.
+Run a read-only (`GET`) operation. Refuses other operations and points to `call_api_write`, and refuses credential operations. With `MCP_READ_ONLY=true` it is the only catalog tool that runs.
 
 - `operation_id` (string)
 - `params` (object, optional): Path and query parameters by name, e.g. `{"ticket_id": 1, "include": "users"}`. An array is sent comma-separated, or as repeated pairs when the name ends in `[]` or the API wants the parameter repeated. An object is sent as `name[key]=value`, so `{"page": {"size": 10}}` becomes `page[size]=10`
@@ -1339,7 +1360,7 @@ Returns the response as compact JSON. Page through large listings with the opera
 
 #### call_api_write
 
-Run an operation that writes (`POST`, `PUT`, `PATCH` or `DELETE`). It may create, change or delete Zendesk data and may notify customers, so call `get_api_operation` first to see the parameters and an example body. Refuses reads and points to `call_api_read`.
+Run an operation that writes (`POST`, `PUT`, `PATCH` or `DELETE`). It may create, change or delete Zendesk data and may notify customers, so call `get_api_operation` first to see the parameters and an example body. Refuses reads and points to `call_api_read`, and refuses credential operations and the account-administration writes, which the CLI runs. Unavailable with `MCP_READ_ONLY=true`.
 
 - `operation_id` (string)
 - `params` (object, optional): Path and query parameters, as for `call_api_read`

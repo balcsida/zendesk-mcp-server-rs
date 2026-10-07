@@ -294,28 +294,34 @@ impl OAuthProvider {
         self
     }
 
+    /// Refuse tokens issued for another subdomain or client than the configured ones.
+    fn check_stored_for_settings(&self, tokens: &TokenSet) -> Result<()> {
+        if tokens.subdomain != self.settings.subdomain
+            || tokens.client_id != self.settings.client_id
+        {
+            return Err(anyhow::Error::new(ReauthRequired(format!(
+                "The stored Zendesk tokens were issued for subdomain {} and client {}, \
+                 not the configured {} and {}. Run zendesk-mcp-server auth (or zendesk auth) \
+                 to authorize the configured account, or point ZENDESK_TOKEN_FILE at the right file.",
+                tokens.subdomain,
+                tokens.client_id,
+                self.settings.subdomain,
+                self.settings.client_id
+            ))));
+        }
+        Ok(())
+    }
+
     /// A usable access token: the cached one, else the stored one, refreshed first if
-    /// it has expired. Warns (once per load) when the stored tokens belong to another
-    /// subdomain or client than the configured ones.
+    /// it has expired. Fails with [`ReauthRequired`] when the stored tokens belong to
+    /// another subdomain or client than the configured ones.
     pub async fn access_token(&self) -> Result<String> {
         let mut cached = self.tokens.lock().await;
         let tokens = match cached.as_ref() {
             Some(tokens) => tokens.clone(),
             None => {
                 let tokens = self.store.load()?;
-                if tokens.subdomain != self.settings.subdomain
-                    || tokens.client_id != self.settings.client_id
-                {
-                    tracing::warn!(
-                        "The stored Zendesk tokens were issued for subdomain {} and client {}, \
-                         not the configured {} and {}. Re-run zendesk-mcp-server auth (or zendesk auth) if \
-                         requests fail.",
-                        tokens.subdomain,
-                        tokens.client_id,
-                        self.settings.subdomain,
-                        self.settings.client_id
-                    );
-                }
+                self.check_stored_for_settings(&tokens)?;
                 *cached = Some(tokens.clone());
                 tokens
             }
@@ -356,6 +362,7 @@ impl OAuthProvider {
     ) -> Result<TokenSet> {
         let _lock = self.store.lock().await?;
         let stored = self.store.load()?;
+        self.check_stored_for_settings(&stored)?;
 
         let already_renewed = match rejected_token {
             Some(rejected) => stored.access_token != rejected,
@@ -695,6 +702,29 @@ mod tests {
         assert!(err.contains("refresh token is missing or expired"));
         assert!(err.contains("the stored access token has expired"));
         assert!(err.contains("zendesk-mcp-server auth"));
+    }
+
+    #[tokio::test]
+    async fn stored_tokens_for_another_account_are_refused() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(token_response("x"))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        for (subdomain, client_id) in [("other", "client-1"), ("acme", "client-2")] {
+            let mut tokens = stored("good", 3600);
+            tokens.subdomain = subdomain.into();
+            tokens.client_id = client_id.into();
+            let provider = provider(dir.path(), &server, &tokens);
+            let err = provider.access_token().await.unwrap_err();
+            assert!(err.is::<ReauthRequired>());
+            let err = err.to_string();
+            assert!(err.contains(subdomain) && err.contains(client_id));
+            assert!(err.contains("acme") && err.contains("client-1"));
+            assert!(err.contains("zendesk-mcp-server auth") && err.contains("ZENDESK_TOKEN_FILE"));
+        }
     }
 
     #[test]

@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, bail};
 use axum::Json;
 use axum::body::Bytes;
-use axum::extract::{Query, Request, State};
+use axum::extract::{DefaultBodyLimit, Query, Request, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -36,6 +36,12 @@ const PENDING_TTL: Duration = Duration::from_secs(600);
 /// The most sign-ins that may be in progress at once.
 const MAX_PENDING: usize = 1000;
 
+/// How many failed code redemptions end a sign-in.
+const MAX_FAILURES: u8 = 3;
+
+/// How long a stored login may go unused before it is deleted.
+const GRANT_IDLE: Duration = Duration::from_secs(90 * 24 * 3600);
+
 /// How long a one-time code for `/token` stays valid.
 const CODE_TTL: Duration = Duration::from_secs(60);
 
@@ -54,6 +60,10 @@ struct Pending {
     pkce: PkcePair,
     /// `None` for a sign-in started by the CLI rather than by an MCP client.
     client: Option<Client>,
+    /// The PKCE challenge of a sign-in started by the CLI; `None` for an MCP client's.
+    cli_challenge: Option<String>,
+    /// Codes Zendesk refused so far.
+    failures: u8,
 }
 
 /// The MCP client's side of a sign-in, as sent to `/authorize`.
@@ -106,14 +116,17 @@ impl SignIn {
 
     /// Sign-in settings from the environment, which must describe Zendesk OAuth.
     pub fn from_env(public: String, http: reqwest::Client) -> Result<Arc<SignIn>> {
+        const NEEDS_OAUTH: &str = "--public-url needs Zendesk OAuth settings: set ZENDESK_SUBDOMAIN, and do not set ZENDESK_OAUTH_TOKEN, ZENDESK_EMAIL + ZENDESK_API_KEY or ZENDESK_SESSION_COOKIE.";
+        if other_credentials_set(|name| std::env::var(name).ok()).is_some() {
+            bail!(NEEDS_OAUTH);
+        }
         let Some(Credentials::OAuth { settings }) = config::load_credentials()? else {
-            bail!(
-                "--public-url needs Zendesk OAuth settings: set ZENDESK_SUBDOMAIN, and do not set ZENDESK_OAUTH_TOKEN, ZENDESK_EMAIL + ZENDESK_API_KEY or ZENDESK_SESSION_COOKIE."
-            );
+            bail!(NEEDS_OAUTH);
         };
         let zendesk = format!("https://{}.zendesk.com", settings.subdomain);
         let sign_in = SignIn::new(public, settings, zendesk, http);
         tracing::info!("Zendesk logins are kept in {}", sign_in.grants().display());
+        sign_in.sweep_grants();
         Ok(sign_in)
     }
 
@@ -137,6 +150,7 @@ impl SignIn {
             .route("/token", routing::post(token))
             .route("/cli/login", routing::post(cli_login))
             .route("/cli/login/finish", routing::post(cli_login_finish))
+            .layer(DefaultBodyLimit::max(16 * 1024))
             .with_state(self.clone());
         axum::Router::new()
             .merge(sign_in_routes)
@@ -182,7 +196,11 @@ impl SignIn {
 
     /// Begin a sign-in. Returns the Zendesk authorize URL and its state, or `None` when
     /// too many sign-ins are in progress.
-    fn start(&self, client: Option<Client>) -> Option<(String, String)> {
+    fn start(
+        &self,
+        client: Option<Client>,
+        cli_challenge: Option<String>,
+    ) -> Option<(String, String)> {
         let mut flows = self.flows();
         flows
             .pending
@@ -199,6 +217,8 @@ impl SignIn {
                 started: Instant::now(),
                 pkce,
                 client,
+                cli_challenge,
+                failures: 0,
             },
         );
         Some((url, state))
@@ -215,6 +235,21 @@ impl SignIn {
     /// concurrent request completed it first.
     fn finish(&self, state: &str) -> bool {
         self.flows().pending.remove(state).is_some()
+    }
+
+    /// Count a code Zendesk refused for the sign-in started with `state`. `false` means
+    /// the sign-in has now ended.
+    fn note_failure(&self, state: &str) -> bool {
+        let mut flows = self.flows();
+        let Some(pending) = flows.pending.get_mut(state) else {
+            return false;
+        };
+        pending.failures += 1;
+        let ended = pending.failures >= MAX_FAILURES;
+        if ended {
+            flows.pending.remove(state);
+        }
+        !ended
     }
 
     /// Exchange Zendesk's authorization `code` for tokens, and look up who they belong to.
@@ -239,7 +274,14 @@ impl SignIn {
 
     /// Keep a sign-in on disk under a new server token, and return that token.
     fn store(&self, signed_in: &SignedIn) -> Result<String> {
+        self.sweep_grants();
         let token = format!("{SERVER_TOKEN_PREFIX}{}", generate_state());
+        let grants = self.grants();
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        builder.create(&grants)?;
         let dir = self.grant_dir(&token);
         TokenStore::new(dir.join("tokens.json")).save(&signed_in.tokens)?;
         let user = &signed_in.user;
@@ -249,11 +291,31 @@ impl SignIn {
             "email": user["email"],
             "signed_in_at": chrono::Utc::now().to_rfc3339(),
         });
-        std::fs::write(
-            dir.join("user.json"),
-            serde_json::to_string_pretty(&record)?,
+        zendesk::tokens::write_private(
+            &dir.join("user.json"),
+            serde_json::to_string_pretty(&record)?.as_bytes(),
         )?;
         Ok(token)
+    }
+
+    /// Delete the stored logins whose `tokens.json` has not been written for
+    /// [`GRANT_IDLE`]; a login in use is rewritten whenever its access token renews.
+    fn sweep_grants(&self) {
+        let Ok(entries) = std::fs::read_dir(self.grants()) else {
+            return;
+        };
+        let removed = entries
+            .flatten()
+            .filter(|entry| {
+                std::fs::metadata(entry.path().join("tokens.json"))
+                    .and_then(|m| m.modified())
+                    .is_ok_and(|modified| modified.elapsed().is_ok_and(|age| age > GRANT_IDLE))
+            })
+            .filter(|entry| std::fs::remove_dir_all(entry.path()).is_ok())
+            .count();
+        if removed > 0 {
+            tracing::info!("Removed {removed} Zendesk logins unused for 90 days");
+        }
     }
 
     /// Where all stored logins live, next to the operator's own token file.
@@ -465,6 +527,12 @@ async fn authorize_page(
         Some("code_challenge is missing")
     } else if param("code_challenge_method") != Some("S256") {
         Some("code_challenge_method must be S256")
+    } else if ["client_id", "state", "code_challenge"]
+        .iter()
+        .any(|name| param(name).is_some_and(|v| v.len() > 256))
+        || param("redirect_uri").is_some_and(|v| v.len() > 2048)
+    {
+        Some("a parameter is too long")
     } else {
         None
     };
@@ -482,7 +550,7 @@ async fn authorize_page(
         code_challenge: params["code_challenge"].clone(),
         state: params.get("state").cloned(),
     };
-    let Some((zendesk_url, state)) = sign_in.start(Some(client)) else {
+    let Some((zendesk_url, state)) = sign_in.start(Some(client), None) else {
         return error_page(
             StatusCode::SERVICE_UNAVAILABLE,
             "Too many sign-ins are in progress. Try again in a few minutes.",
@@ -550,17 +618,18 @@ async fn authorize_paste(
     };
     let signed_in = match sign_in.redeem(&pending.pkce, &code).await {
         Ok(signed_in) => signed_in,
-        Err(err) if err.is::<ReauthRequired>() => {
-            return error_page(
-                StatusCode::BAD_REQUEST,
-                "Zendesk did not accept the code: it expired (codes last 2 minutes) or was already used. Go back and try again.",
-            );
-        }
         Err(err) => {
-            return error_page(
-                StatusCode::BAD_REQUEST,
-                &format!("Signing in to Zendesk failed: {err}. Go back and try again."),
-            );
+            let next = if sign_in.note_failure(session) {
+                "Go back and try again."
+            } else {
+                "This sign-in has ended after too many failed attempts. Start the sign-in again from your MCP client."
+            };
+            let reason = if err.is::<ReauthRequired>() {
+                "Zendesk did not accept the code: it expired (codes last 2 minutes) or was already used.".to_string()
+            } else {
+                format!("Signing in to Zendesk failed: {err}.")
+            };
+            return error_page(StatusCode::BAD_REQUEST, &format!("{reason} {next}"));
         }
     };
     if !sign_in.finish(session) {
@@ -648,8 +717,19 @@ async fn token(
 
 /// `POST /cli/login`: start a sign-in for `zendesk login`, which catches the Zendesk
 /// redirect on the user's machine.
-async fn cli_login(State(sign_in): State<Arc<SignIn>>) -> Response {
-    let Some((authorize_url, state)) = sign_in.start(None) else {
+async fn cli_login(State(sign_in): State<Arc<SignIn>>, body: Bytes) -> Response {
+    let body: HashMap<String, String> = serde_json::from_slice(&body).unwrap_or_default();
+    let challenge = body
+        .get("code_challenge")
+        .filter(|c| !c.is_empty() && c.len() <= 256)
+        .filter(|_| body.get("code_challenge_method").map(String::as_str) == Some("S256"));
+    let Some(challenge) = challenge else {
+        return bad_request(
+            "invalid_request",
+            "Send a code_challenge (at most 256 bytes) with code_challenge_method S256.",
+        );
+    };
+    let Some((authorize_url, state)) = sign_in.start(None, Some(challenge.clone())) else {
         return oauth_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "temporarily_unavailable",
@@ -674,25 +754,36 @@ async fn cli_login_finish(
 ) -> Response {
     let field = |name: &str| body.get(name).map(String::as_str).unwrap_or_default();
     let state = field("state");
-    let Some(pending) = sign_in.pending(state).filter(|p| p.client.is_none()) else {
+    let Some((pending, challenge)) = sign_in
+        .pending(state)
+        .and_then(|p| p.cli_challenge.clone().map(|challenge| (p, challenge)))
+    else {
         return bad_request(
             "invalid_grant",
             "This sign-in expired or was already used. Run zendesk login again.",
         );
     };
+    if challenge_for(field("code_verifier")) != challenge {
+        sign_in.finish(state);
+        return bad_request(
+            "invalid_grant",
+            "PKCE verification failed. Run zendesk login again.",
+        );
+    }
     let signed_in = match sign_in.redeem(&pending.pkce, field("code")).await {
         Ok(signed_in) => signed_in,
-        Err(err) if err.is::<ReauthRequired>() => {
-            return bad_request(
-                "invalid_grant",
-                "Zendesk did not accept the code: it expired (codes last 2 minutes) or was already used. Run zendesk login again.",
-            );
-        }
         Err(err) => {
-            return bad_request(
-                "invalid_grant",
-                &format!("Signing in to Zendesk failed: {err}. Run zendesk login again."),
-            );
+            let next = if sign_in.note_failure(state) {
+                "Run zendesk login again."
+            } else {
+                "This sign-in has ended after too many failed attempts. Run zendesk login again."
+            };
+            let reason = if err.is::<ReauthRequired>() {
+                "Zendesk did not accept the code: it expired (codes last 2 minutes) or was already used.".to_string()
+            } else {
+                format!("Signing in to Zendesk failed: {err}.")
+            };
+            return bad_request("invalid_grant", &format!("{reason} {next}"));
         }
     };
     if !sign_in.finish(state) {
@@ -720,6 +811,19 @@ async fn cli_login_finish(
             )
         }
     }
+}
+
+/// The first of the credential variables besides Zendesk OAuth that `get` finds set to
+/// something other than blank, which rules out sign-in mode.
+fn other_credentials_set(get: impl Fn(&str) -> Option<String>) -> Option<&'static str> {
+    [
+        "ZENDESK_OAUTH_TOKEN",
+        "ZENDESK_EMAIL",
+        "ZENDESK_API_KEY",
+        "ZENDESK_SESSION_COOKIE",
+    ]
+    .into_iter()
+    .find(|name| get(name).is_some_and(|v| !v.trim().is_empty()))
 }
 
 /// Clap parser for `--public-url`: an `https` origin, or `http` on this machine.
@@ -1523,6 +1627,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn third_failed_paste_ends_the_sign_in() {
+        let h = harness().await;
+        Mock::given(method("POST"))
+            .and(path("/oauth/tokens"))
+            .and(body_string_contains("code=late"))
+            .respond_with(
+                ResponseTemplate::new(400).set_body_json(json!({ "error": "invalid_grant" })),
+            )
+            .mount(&h.zendesk)
+            .await;
+        mock_zendesk_sign_in(&h.zendesk).await;
+        let session = open_page(&h, &"v".repeat(43)).await;
+        for _ in 0..2 {
+            let page = paste(&h, &session, "late").await.text().await.unwrap();
+            assert!(!page.contains("has ended"), "{page}");
+        }
+        let page = paste(&h, &session, "late").await.text().await.unwrap();
+        assert!(page.contains("has ended"), "{page}");
+        // Even a good code finds nothing to finish.
+        let response = paste(&h, &session, "zcode").await;
+        assert_eq!(response.status(), 400);
+        assert!(h.sign_in.pending(&session).is_none());
+    }
+
+    #[tokio::test]
     async fn late_paste_can_be_retried() {
         let h = harness().await;
         Mock::given(method("POST"))
@@ -1551,21 +1680,17 @@ mod tests {
     async fn sign_ins_in_progress_are_capped() {
         let h = harness().await;
         for _ in 0..1000 {
-            assert!(h.sign_in.start(None).is_some());
+            assert!(h.sign_in.start(None, None).is_some());
         }
-        assert!(h.sign_in.start(None).is_none());
+        assert!(h.sign_in.start(None, None).is_none());
     }
 
     #[tokio::test]
     async fn cli_sign_in_issues_a_working_token() {
         let h = harness().await;
         mock_zendesk_sign_in(&h.zendesk).await;
-        let started = h
-            .http
-            .post(format!("{}/cli/login", h.url))
-            .send()
-            .await
-            .unwrap();
+        let verifier = "v".repeat(43);
+        let started = cli_start(&h, &challenge_for(&verifier)).await;
         assert_eq!(started.status(), 200);
         let started = started.json::<Value>().await.unwrap();
         let authorize_url = started["authorize_url"].as_str().unwrap();
@@ -1576,7 +1701,11 @@ mod tests {
         let finish = || async {
             h.http
                 .post(format!("{}/cli/login/finish", h.url))
-                .json(&json!({ "state": started["state"], "code": "zcode" }))
+                .json(&json!({
+                    "state": started["state"],
+                    "code": "zcode",
+                    "code_verifier": verifier,
+                }))
                 .send()
                 .await
                 .unwrap()
@@ -1598,6 +1727,173 @@ mod tests {
         );
     }
 
+    async fn cli_start(h: &Harness, challenge: &str) -> reqwest::Response {
+        h.http
+            .post(format!("{}/cli/login", h.url))
+            .json(&json!({ "code_challenge": challenge, "code_challenge_method": "S256" }))
+            .send()
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn cli_login_requires_a_challenge() {
+        let h = harness().await;
+        let post = |body: Value| {
+            h.http
+                .post(format!("{}/cli/login", h.url))
+                .json(&body)
+                .send()
+        };
+        let long = "c".repeat(257);
+        for body in [
+            json!({}),
+            json!({ "code_challenge": "abc" }),
+            json!({ "code_challenge_method": "S256" }),
+            json!({ "code_challenge": "abc", "code_challenge_method": "plain" }),
+            json!({ "code_challenge": long, "code_challenge_method": "S256" }),
+        ] {
+            let response = post(body).await.unwrap();
+            assert_eq!(response.status(), 400);
+            assert_eq!(
+                response.json::<Value>().await.unwrap()["error"],
+                "invalid_request"
+            );
+        }
+        let bare = h
+            .http
+            .post(format!("{}/cli/login", h.url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(bare.status(), 400);
+    }
+
+    #[tokio::test]
+    async fn cli_login_rejects_a_wrong_verifier() {
+        let h = harness().await;
+        zendesk_must_not_be_called(&h).await;
+        let started = cli_start(&h, &challenge_for(&"v".repeat(43)))
+            .await
+            .json::<Value>()
+            .await
+            .unwrap();
+        let finish = |verifier: &str| {
+            h.http
+                .post(format!("{}/cli/login/finish", h.url))
+                .json(&json!({
+                    "state": started["state"],
+                    "code": "zcode",
+                    "code_verifier": verifier,
+                }))
+                .send()
+        };
+        let response = finish(&"w".repeat(43)).await.unwrap();
+        assert_eq!(response.status(), 400);
+        let body = response.json::<Value>().await.unwrap();
+        assert_eq!(body["error"], "invalid_grant");
+        assert!(
+            body["error_description"]
+                .as_str()
+                .unwrap()
+                .contains("PKCE verification failed")
+        );
+        // The wrong guess ended the sign-in, so the right verifier is too late.
+        assert_eq!(finish(&"v".repeat(43)).await.unwrap().status(), 400);
+        assert!(h.zendesk.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn authorize_rejects_overlong_parameters() {
+        let h = harness().await;
+        let challenge = "c".repeat(257);
+        let response = h
+            .http
+            .get(format!(
+                "{}/authorize?response_type=code&client_id=c&redirect_uri=http://localhost:1/&code_challenge={challenge}&code_challenge_method=S256",
+                h.url
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 400);
+        assert!(response.text().await.unwrap().contains("too long"));
+    }
+
+    #[tokio::test]
+    async fn oversized_sign_in_bodies_are_refused() {
+        let h = harness().await;
+        let response = h
+            .http
+            .post(format!("{}/register", h.url))
+            .body("x".repeat(20 * 1024))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 413);
+    }
+
+    #[tokio::test]
+    async fn stored_logins_are_private() {
+        let h = harness().await;
+        let signed_in = SignedIn {
+            tokens: zd_tokens("zd-a", "r1", 3600),
+            user: json!({ "id": 7, "name": "Alice", "email": "alice@example.com" }),
+        };
+        let token = h.sign_in.store(&signed_in).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |p: PathBuf| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(h.sign_in.grants()), 0o700);
+            assert_eq!(mode(h.sign_in.grant_dir(&token)), 0o700);
+            assert_eq!(mode(h.sign_in.grant_dir(&token).join("user.json")), 0o600);
+        }
+        assert!(h.sign_in.grant_dir(&token).join("user.json").exists());
+    }
+
+    #[tokio::test]
+    async fn idle_logins_are_swept() {
+        let h = harness().await;
+        seed(&h, "zmcp_old", &zd_tokens("zd-old", "r1", 3600));
+        seed(&h, "zmcp_fresh", &zd_tokens("zd-ok", "r1", 3600));
+        let stale = std::time::SystemTime::now() - GRANT_IDLE - Duration::from_secs(3600);
+        std::fs::File::options()
+            .write(true)
+            .open(h.sign_in.grant_dir("zmcp_old").join("tokens.json"))
+            .unwrap()
+            .set_modified(stale)
+            .unwrap();
+        mock_me(&h, "zd-ok").await;
+        h.sign_in.sweep_grants();
+        assert!(!h.sign_in.grant_dir("zmcp_old").exists());
+        assert!(h.sign_in.grant_dir("zmcp_fresh").exists());
+        assert!(call_current_user(&h, "zmcp_fresh").await.contains("Alice"));
+    }
+
+    #[test]
+    fn other_credential_variables_rule_out_sign_in() {
+        let with = |set: &'static [(&'static str, &'static str)]| {
+            other_credentials_set(move |name| {
+                set.iter()
+                    .find(|(n, _)| *n == name)
+                    .map(|(_, v)| v.to_string())
+            })
+        };
+        assert_eq!(with(&[]), None);
+        assert_eq!(with(&[("ZENDESK_API_KEY", "  ")]), None);
+        assert_eq!(with(&[("ZENDESK_SUBDOMAIN", "acme")]), None);
+        for name in [
+            "ZENDESK_OAUTH_TOKEN",
+            "ZENDESK_EMAIL",
+            "ZENDESK_API_KEY",
+            "ZENDESK_SESSION_COOKIE",
+        ] {
+            let set: &'static [(&str, &str)] = Box::leak(Box::new([(name, "x")]));
+            assert_eq!(with(set), Some(name));
+        }
+    }
+
     #[tokio::test]
     async fn flows_do_not_cross() {
         let h = harness().await;
@@ -1615,12 +1911,8 @@ mod tests {
             "invalid_grant"
         );
 
-        let started = h
-            .http
-            .post(format!("{}/cli/login", h.url))
-            .send()
+        let started = cli_start(&h, &challenge_for(&"v".repeat(43)))
             .await
-            .unwrap()
             .json::<Value>()
             .await
             .unwrap();

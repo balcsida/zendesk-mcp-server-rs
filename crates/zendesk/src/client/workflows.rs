@@ -433,10 +433,7 @@ impl ZendeskClient {
                 if data["end_of_stream"] == true {
                     break;
                 }
-                match self.next_page(&mut seen, link)? {
-                    Some(next) => url = next,
-                    None => break,
-                }
+                url = self.next_page(&mut seen, link)?;
             }
 
             let mut tickets = std::collections::HashSet::new();

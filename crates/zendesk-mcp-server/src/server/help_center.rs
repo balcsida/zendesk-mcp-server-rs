@@ -239,7 +239,7 @@ impl ZendeskServer {
 
     #[tool(
         description = "Edit the text of one locale (title, body, draft; needs locale) and/or the article's metadata (section_id, promoted, position, label_names, user_segment_id, permission_group_id). Set draft to false to publish, true to unpublish. Returns the updated article.",
-        annotations(destructive_hint = false, idempotent_hint = true)
+        annotations(destructive_hint = true, idempotent_hint = true)
     )]
     async fn update_article(
         &self,

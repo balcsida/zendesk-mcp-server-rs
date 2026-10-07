@@ -15,9 +15,9 @@ use zendesk::config;
 
 /// Command-line client for Zendesk.
 ///
-/// Configuration comes from the environment and a .env file in the working directory or
-/// any parent. With nothing configured, not even ZENDESK_SUBDOMAIN, commands use the token
-/// saved by `mobile-auth`.
+/// Configuration comes from the environment and a .env file in the working directory. With
+/// nothing configured, not even ZENDESK_SUBDOMAIN, commands use the token saved by
+/// `mobile-auth`.
 #[derive(Parser)]
 #[command(name = "zendesk", version, about)]
 struct Cli {
@@ -65,7 +65,7 @@ enum Command {
 
 #[tokio::main]
 async fn main() {
-    dotenvy::dotenv().ok();
+    dotenvy::from_path(".env").ok();
     // A CLI must not log on every call; RUST_LOG overrides.
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -93,6 +93,7 @@ fn http_client() -> Result<reqwest::Client> {
     Ok(reqwest::Client::builder()
         .user_agent(concat!("zendesk-cli/", env!("CARGO_PKG_VERSION")))
         .timeout(Duration::from_secs(30))
+        .redirect(zendesk::redirect_policy())
         .build()?)
 }
 
@@ -111,7 +112,7 @@ async fn run(cli: Cli) -> Result<i32> {
 
     match cli.command {
         Command::Auth { manual } => return zendesk::authorize::run(http, manual).await,
-        Command::MobileAuth => mobile_auth::run_auth_cli(http).await?,
+        Command::MobileAuth => mobile_auth::run_auth_cli(login_client()?).await?,
         Command::Login { url } => login(&login_client()?, &url).await?,
         Command::Token { mobile } => {
             let (_, auth) = resolve_auth(&http, mobile).await?;
@@ -149,6 +150,19 @@ async fn run(cli: Cli) -> Result<i32> {
 /// Sign in through the zendesk-mcp-server at `url`, catching the Zendesk redirect on this
 /// machine. Prints the server token on stdout and how to use it on stderr.
 async fn login(http: &reqwest::Client, url: &str) -> Result<()> {
+    login_with(http, url, |redirect_uri, state, authorize_url| async move {
+        zendesk::authorize::receive_code_via_loopback(&redirect_uri, &state, &authorize_url).await
+    })
+    .await
+}
+
+/// [`login`], with `receive` standing in for the browser round trip: it gets the
+/// redirect URI, state and sign-in URL and returns the captured redirect query.
+async fn login_with<F, Fut>(http: &reqwest::Client, url: &str, receive: F) -> Result<()>
+where
+    F: FnOnce(String, String, String) -> Fut,
+    Fut: std::future::Future<Output = Result<zendesk::authorize::Captured>>,
+{
     let parsed = url::Url::parse(url).with_context(|| format!("{url} is not a valid URL"))?;
     let local = matches!(parsed.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
     if !(parsed.scheme() == "https" || (parsed.scheme() == "http" && local)) {
@@ -156,7 +170,16 @@ async fn login(http: &reqwest::Client, url: &str) -> Result<()> {
     }
     let origin = parsed.origin().ascii_serialization();
 
-    let started = post_json(http, &format!("{origin}/cli/login"), None).await?;
+    let pkce = zendesk::oauth::generate_pkce_pair();
+    let started = post_json(
+        http,
+        &format!("{origin}/cli/login"),
+        Some(serde_json::json!({
+            "code_challenge": pkce.challenge,
+            "code_challenge_method": zendesk::oauth::PkcePair::METHOD,
+        })),
+    )
+    .await?;
     let field = |value: &Value, name: &str| -> Result<String> {
         value[name]
             .as_str()
@@ -168,10 +191,10 @@ async fn login(http: &reqwest::Client, url: &str) -> Result<()> {
     if !url::Url::parse(&authorize_url).is_ok_and(|u| u.scheme() == "https") {
         bail!("The server sent a sign-in URL that is not https, so it was not opened.");
     }
-    let captured = zendesk::authorize::receive_code_via_loopback(
-        &field(&started, "redirect_uri")?,
-        &state,
-        &authorize_url,
+    let captured = receive(
+        field(&started, "redirect_uri")?,
+        state.clone(),
+        authorize_url,
     )
     .await?;
     let code = zendesk::authorize::validate_callback(&captured, &state)?;
@@ -179,12 +202,16 @@ async fn login(http: &reqwest::Client, url: &str) -> Result<()> {
     let finished = post_json(
         http,
         &format!("{origin}/cli/login/finish"),
-        Some(serde_json::json!({ "state": state, "code": code })),
+        Some(serde_json::json!({
+            "state": state,
+            "code": code,
+            "code_verifier": pkce.verifier,
+        })),
     )
     .await?;
     let token = field(&finished, "access_token")?;
     let user = &finished["user"];
-    let user_field = |name| user[name].as_str().unwrap_or_default();
+    let user_field = |name| printable(user[name].as_str().unwrap_or_default());
     eprintln!(
         "Signed in to {origin} as {} <{}>.\n\
          Send the token below as \"Authorization: Bearer <token>\". With it in ZENDESK_MCP_TOKEN:\n  \
@@ -214,11 +241,16 @@ async fn post_json(http: &reqwest::Client, url: &str, body: Option<Value>) -> Re
     let answer: Value = response.json().await.unwrap_or(Value::Null);
     if !status.is_success() {
         match answer["error_description"].as_str() {
-            Some(description) => bail!("{description}"),
+            Some(description) => bail!("{}", printable(description)),
             None => bail!("{url} answered {status}"),
         }
     }
     Ok(answer)
+}
+
+/// `s` without control characters, so server text cannot drive the terminal.
+fn printable(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control()).collect()
 }
 
 /// Print `value` as pretty JSON, nothing for null.
@@ -235,7 +267,7 @@ async fn resolve_auth(http: &reqwest::Client, mobile: bool) -> Result<(String, A
         return Ok(Auth::from_credentials(&creds, http));
     }
     let subdomain = config::load_subdomain().ok();
-    let token = mobile_auth::ensure_auth(http, subdomain.as_deref()).await?;
+    let token = mobile_auth::ensure_auth(&login_client()?, subdomain.as_deref()).await?;
     Ok((token.subdomain, Auth::bearer(&token.access_token)))
 }
 
@@ -345,6 +377,73 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "The server sent a sign-in URL that is not https, so it was not opened."
+        );
+    }
+
+    #[test]
+    fn printable_drops_control_characters() {
+        assert_eq!(
+            printable("Ada\x1b[31m Lovelace\r\n\u{7}"),
+            "Ada[31m Lovelace"
+        );
+        assert_eq!(printable("Zoë <z@acme.example>"), "Zoë <z@acme.example>");
+    }
+
+    #[tokio::test]
+    async fn login_sends_a_pkce_challenge_and_verifier() {
+        use wiremock::matchers::{body_partial_json, method, path};
+        let mock = wiremock::MockServer::start().await;
+        wiremock::Mock::given(method("POST"))
+            .and(path("/cli/login"))
+            .and(body_partial_json(
+                serde_json::json!({"code_challenge_method": "S256"}),
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "authorize_url": "https://acme.zendesk.com/oauth",
+                    "state": "s",
+                    "redirect_uri": "http://localhost:19186/",
+                })),
+            )
+            .expect(1)
+            .mount(&mock)
+            .await;
+        wiremock::Mock::given(method("POST"))
+            .and(path("/cli/login/finish"))
+            .and(body_partial_json(
+                serde_json::json!({"state": "s", "code": "c"}),
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "access_token": "t",
+                    "user": {"name": "Ada", "email": "ada@acme.example"},
+                })),
+            )
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let receive = |_, _, _| async {
+            Ok(zendesk::authorize::Captured::from([
+                ("code".to_string(), "c".to_string()),
+                ("state".to_string(), "s".to_string()),
+            ]))
+        };
+        login_with(&reqwest::Client::new(), &mock.uri(), receive)
+            .await
+            .unwrap();
+
+        let requests = mock.received_requests().await.unwrap();
+        let body = |p: &str| -> Value {
+            let request = requests.iter().find(|r| r.url.path() == p).unwrap();
+            serde_json::from_slice(&request.body).unwrap()
+        };
+        let started = body("/cli/login");
+        let finished = body("/cli/login/finish");
+        let verifier = finished["code_verifier"].as_str().unwrap();
+        assert_eq!(
+            started["code_challenge"],
+            zendesk::oauth::challenge_for(verifier)
         );
     }
 

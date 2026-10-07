@@ -24,8 +24,14 @@ pub const ALLOWED_IMAGE_TYPES: [&str; 4] = ["image/jpeg", "image/png", "image/gi
 const MAX_RETRIES: u32 = 3;
 /// Longest `Retry-After` honoured, in seconds.
 const MAX_RETRY_AFTER_SECS: u64 = 30;
-/// Pages followed per listing before returning what was collected.
+/// Pages followed per listing before giving up.
 const MAX_PAGES: usize = 1000;
+/// Largest response body read, against one huge response exhausting memory.
+const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
+/// Largest error body read; only the first 500 characters are shown.
+const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
+/// Redirects followed per request.
+const MAX_REDIRECTS: usize = 10;
 /// Largest `days_back` accepted by `get_sla_breaches` (100 years).
 const MAX_DAYS_BACK: u64 = 36_500;
 
@@ -249,9 +255,22 @@ pub(super) fn ctx(prefix: impl Display) -> impl FnOnce(anyhow::Error) -> anyhow:
     move |e| anyhow!("{prefix}: {e:#}")
 }
 
+/// Read a response body, failing once more than `max` bytes have arrived. The reqwest
+/// error is stripped of its URL, which carries search terms and cursors.
+async fn read_body(mut resp: reqwest::Response, max: usize) -> Result<Vec<u8>> {
+    let mut body = Vec::new();
+    while let Some(chunk) = resp.chunk().await.map_err(reqwest::Error::without_url)? {
+        if body.len() + chunk.len() > max {
+            bail!("Zendesk answered with more than {max} bytes");
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
 /// Parse a response body as JSON; some Zendesk endpoints answer 200 with no body.
 async fn json_or_null(resp: reqwest::Response) -> Result<Value> {
-    let bytes = resp.bytes().await?;
+    let bytes = read_body(resp, MAX_BODY_BYTES).await?;
     if bytes.trim_ascii().is_empty() {
         return Ok(Value::Null);
     }
@@ -277,8 +296,33 @@ pub(super) async fn ensure_success(
     if status.is_success() {
         return Ok(resp);
     }
-    let body = resp.bytes().await.unwrap_or_default();
+    let body = read_body(resp, MAX_ERROR_BODY_BYTES)
+        .await
+        .unwrap_or_default();
     Err(status_error(status, label, &body))
+}
+
+/// Whether a redirect to `url`, after `followed` redirects, stays on Zendesk over https.
+fn redirect_allowed(url: &url::Url, followed: usize) -> bool {
+    followed < MAX_REDIRECTS
+        && url.scheme() == "https"
+        && url.host_str().is_some_and(|host| {
+            host == "zendesk.com"
+                || host.ends_with(".zendesk.com")
+                || host.ends_with(".zdusercontent.com")
+        })
+}
+
+/// Redirect policy for the HTTP client: follow only https redirects to Zendesk hosts, so
+/// a redirect cannot carry a request to another host.
+pub fn redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        if redirect_allowed(attempt.url(), attempt.previous().len()) {
+            attempt.follow()
+        } else {
+            attempt.stop()
+        }
+    })
 }
 
 pub(super) fn status_error(status: reqwest::StatusCode, label: &str, body: &[u8]) -> anyhow::Error {
@@ -360,15 +404,21 @@ impl ZendeskClient {
         &self,
         make: impl Fn() -> reqwest::RequestBuilder,
     ) -> Result<reqwest::Response> {
-        let request = make().build()?;
+        let request = make().build().map_err(reqwest::Error::without_url)?;
         let label = format!("{} {}", request.method(), request.url().path());
 
         let value = self.auth.value().await?;
-        let mut resp = value.apply(make()).send().await?;
+        let mut resp = value
+            .apply(make())?
+            .send()
+            .await
+            .map_err(reqwest::Error::without_url)?;
         if resp.status() == reqwest::StatusCode::UNAUTHORIZED
             && let Some(provider) = self.auth.oauth()
         {
-            let body = resp.bytes().await.unwrap_or_default();
+            let body = read_body(resp, MAX_ERROR_BODY_BYTES)
+                .await
+                .unwrap_or_default();
             if !crate::oauth::is_invalid_token_body(&body) {
                 return Err(status_error(
                     reqwest::StatusCode::UNAUTHORIZED,
@@ -383,7 +433,11 @@ impl ZendeskClient {
                 )
                 .await?;
             let fresh = self.auth.value().await?;
-            resp = fresh.apply(make()).send().await?;
+            resp = fresh
+                .apply(make())?
+                .send()
+                .await
+                .map_err(reqwest::Error::without_url)?;
         }
 
         // A 503 may come after Zendesk processed a write, so only reads and deletes are
@@ -407,20 +461,26 @@ impl ZendeskClient {
                 resp.status(),
                 attempt + 1
             );
-            let _ = resp.bytes().await;
+            let _ = read_body(resp, MAX_ERROR_BODY_BYTES).await;
             tokio::time::sleep(Duration::from_secs(delay)).await;
-            resp = self.auth.value().await?.apply(make()).send().await?;
+            resp = self
+                .auth
+                .value()
+                .await?
+                .apply(make())?
+                .send()
+                .await
+                .map_err(reqwest::Error::without_url)?;
             attempt += 1;
         }
         ensure_success(resp, &label).await
     }
 
     pub(super) async fn get_url(&self, url: url::Url) -> Result<Value> {
-        Ok(self
-            .send(|| self.http.get(url.clone()))
-            .await?
-            .json()
-            .await?)
+        let resp = self.send(|| self.http.get(url.clone())).await?;
+        Ok(serde_json::from_slice(
+            &read_body(resp, MAX_BODY_BYTES).await?,
+        )?)
     }
 
     pub(super) async fn api_get(
@@ -546,12 +606,8 @@ impl ZendeskClient {
 
     /// Validate a `next_page` link: same scheme, host and port as `base_url`, and not a
     /// page already fetched. `seen` holds the URLs fetched so far; the link is added to it.
-    /// Returns `None` (after a warning) once `MAX_PAGES` pages have been fetched.
-    pub(super) fn next_page(
-        &self,
-        seen: &mut HashSet<String>,
-        link: &str,
-    ) -> Result<Option<url::Url>> {
+    /// Fails once `MAX_PAGES` pages have been fetched, so a listing is never silently cut.
+    pub(super) fn next_page(&self, seen: &mut HashSet<String>, link: &str) -> Result<url::Url> {
         let next = url::Url::parse(link)?;
         if !self.is_account_url(&next)? {
             bail!(
@@ -560,13 +616,12 @@ impl ZendeskClient {
             );
         }
         if seen.len() >= MAX_PAGES {
-            tracing::warn!("Stopped following next_page after {MAX_PAGES} pages");
-            return Ok(None);
+            bail!("stopped after {MAX_PAGES} pages of results; narrow the query");
         }
         if !seen.insert(next.to_string()) {
             bail!("Zendesk pagination returned a page it already returned");
         }
-        Ok(Some(next))
+        Ok(next)
     }
 
     /// Collect `key` from a listing, following the absolute `next_page` URLs until null.
@@ -608,10 +663,7 @@ impl ZendeskClient {
                 .map(str::to_string);
             pages.push(data);
             let Some(link) = link else { break };
-            match self.next_page(&mut seen, &link)? {
-                Some(next) => url = next,
-                None => break,
-            }
+            url = self.next_page(&mut seen, &link)?;
         }
         Ok(pages)
     }
@@ -662,10 +714,7 @@ impl ZendeskClient {
             let Some(link) = data["links"]["next"].as_str() else {
                 break;
             };
-            match self.next_page(&mut seen, link)? {
-                Some(next) => data = self.get_url(next).await?,
-                None => break,
-            }
+            data = self.get_url(self.next_page(&mut seen, link)?).await?;
         }
         Ok(items)
     }
@@ -986,6 +1035,62 @@ mod tests {
                 .contains("Zendesk pagination returned a page it already returned"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn next_page_fails_after_max_pages() {
+        let c = offline_client();
+        let mut seen: HashSet<String> = (0..MAX_PAGES).map(|n| format!("page-{n}")).collect();
+        let err = c
+            .next_page(&mut seen, "https://acme.zendesk.com/api/v2/x.json?p=1")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("stopped after 1000 pages") && err.contains("narrow the query"));
+    }
+
+    #[tokio::test]
+    async fn read_body_stops_past_the_cap() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![b'x'; 100]))
+            .mount(&server)
+            .await;
+        let get = || reqwest::get(server.uri());
+        assert_eq!(
+            read_body(get().await.unwrap(), 100).await.unwrap().len(),
+            100
+        );
+        let err = read_body(get().await.unwrap(), 99).await.unwrap_err();
+        assert!(err.to_string().contains("more than 99 bytes"));
+    }
+
+    #[tokio::test]
+    async fn transport_errors_do_not_carry_the_request_url() {
+        let c = ZendeskClient::with_base_url(
+            "acme",
+            Auth::bearer("t"),
+            reqwest::Client::new(),
+            "http://127.0.0.1:1/api/v2".into(),
+        );
+        let err = c
+            .api_get("search.json", &[("query", &"SECRET-TERM")])
+            .await
+            .unwrap_err();
+        assert!(!format!("{err:#}").contains("SECRET-TERM"), "{err:#}");
+    }
+
+    #[test]
+    fn redirects_stay_on_zendesk_over_https() {
+        let allowed =
+            |url: &str, followed| redirect_allowed(&url::Url::parse(url).unwrap(), followed);
+        assert!(allowed("https://acme.zendesk.com/x", 0));
+        assert!(allowed("https://zendesk.com/x", 0));
+        assert!(allowed("https://p1.zdusercontent.com/x", 9));
+        assert!(!allowed("https://evil.example/", 0));
+        assert!(!allowed("https://evilzendesk.com/", 0));
+        assert!(!allowed("https://acme.zendesk.com.evil.example/", 0));
+        assert!(!allowed("http://acme.zendesk.com/x", 0));
+        assert!(!allowed("https://acme.zendesk.com/x", 10));
     }
 
     #[tokio::test]

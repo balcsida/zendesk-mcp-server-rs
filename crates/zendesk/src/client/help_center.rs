@@ -53,12 +53,24 @@ fn article_detail(article: &Value) -> Value {
 }
 
 impl ZendeskClient {
-    /// Every article in the sections the caller can view, grouped by section ID.
-    pub async fn get_all_articles(&self) -> Result<Value> {
+    /// Up to `max_articles` articles in the sections the caller can view, grouped by
+    /// section ID. The second value is true when the cap cut the listing short.
+    pub async fn get_all_articles(&self, max_articles: usize) -> Result<(Value, bool)> {
         async {
-            let sections = self
-                .get_cursor_paged("help_center/sections.json", &[], "sections", usize::MAX)
+            let mut truncated = false;
+            // One more than the cap, to tell "exactly the cap" from "cut short".
+            let mut sections = self
+                .get_cursor_paged(
+                    "help_center/sections.json",
+                    &[],
+                    "sections",
+                    max_articles.saturating_add(1),
+                )
                 .await?;
+            if sections.len() > max_articles {
+                sections.truncate(max_articles);
+                truncated = true;
+            }
             // A section's articles live under its own locale; the locale-less path only
             // serves the default one, so non-English help centers came back empty
             // (upstream issue #10).
@@ -70,10 +82,12 @@ impl ZendeskClient {
             // One listing per locale rather than one per section: tens of requests, not
             // hundreds.
             let mut by_section: HashMap<u64, Vec<Value>> = HashMap::new();
-            for locale in locales {
+            let mut collected = 0;
+            'locales: for locale in locales {
                 let path = format!("{}/articles.json", help_center_path(locale)?);
+                let budget = (max_articles - collected).saturating_add(1);
                 for a in self
-                    .get_cursor_paged(&path, &[], "articles", usize::MAX)
+                    .get_cursor_paged(&path, &[], "articles", budget)
                     .await?
                 {
                     let Some(section_id) = a["section_id"].as_u64() else {
@@ -82,6 +96,11 @@ impl ZendeskClient {
                     // Skip translations whose section is listed under another locale, and
                     // articles in sections the caller cannot view.
                     if locale_of.get(&section_id) == Some(&locale) {
+                        if collected == max_articles {
+                            truncated = true;
+                            break 'locales;
+                        }
+                        collected += 1;
                         let mut out = pick(&a, &["id", "title", "body", "updated_at"], &[]);
                         out["url"] = a["html_url"].clone();
                         by_section.entry(section_id).or_default().push(out);
@@ -105,7 +124,7 @@ impl ZendeskClient {
                     }),
                 );
             }
-            Ok(Value::Object(kb))
+            Ok((Value::Object(kb), truncated))
         }
         .await
         .map_err(ctx("Failed to fetch knowledge base"))
@@ -478,7 +497,8 @@ mod tests {
                 .mount(&server)
                 .await;
         }
-        let kb = client(&server).get_all_articles().await.unwrap();
+        let (kb, truncated) = client(&server).get_all_articles(500).await.unwrap();
+        assert!(!truncated);
         let ids = |section: &str| -> Vec<Value> {
             kb[section]["articles"]
                 .as_array()
@@ -496,6 +516,52 @@ mod tests {
             kb["1"]["articles"][0],
             json!({"id": 10, "title": "t", "body": "b", "updated_at": "u", "url": "h"})
         );
+    }
+
+    #[tokio::test]
+    async fn knowledge_base_stops_at_max_articles_and_says_so() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/help_center/sections.json"))
+            .respond_with(json_page(
+                "sections",
+                json!([{"id": 1, "name": "FAQ", "description": "a", "locale": "en-us"}]),
+                None,
+            ))
+            .mount(&server)
+            .await;
+        let article = |id: u64| json!({"id": id, "section_id": 1, "html_url": "h"});
+        let next = format!(
+            "{}/api/v2/help_center/en-us/articles.json?page%5Bafter%5D=2",
+            server.uri()
+        );
+        Mock::given(method("GET"))
+            .and(path("/api/v2/help_center/en-us/articles.json"))
+            .and(query_param("page[after]", "2"))
+            .respond_with(cursor_articles(json!([article(3), article(4)]), None))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/help_center/en-us/articles.json"))
+            .respond_with(cursor_articles(json!([article(1), article(2)]), Some(next)))
+            .mount(&server)
+            .await;
+        let c = client(&server);
+        let (kb, truncated) = c.get_all_articles(3).await.unwrap();
+        assert!(truncated);
+        assert_eq!(kb["1"]["articles"].as_array().unwrap().len(), 3);
+        // Exactly the total is not a cut.
+        let (kb, truncated) = c.get_all_articles(4).await.unwrap();
+        assert!(!truncated);
+        assert_eq!(kb["1"]["articles"].as_array().unwrap().len(), 4);
+    }
+
+    fn cursor_articles(items: Value, next: Option<String>) -> ResponseTemplate {
+        ResponseTemplate::new(200).set_body_json(json!({
+            "articles": items,
+            "meta": { "has_more": next.is_some() },
+            "links": { "next": next },
+        }))
     }
 
     #[tokio::test]

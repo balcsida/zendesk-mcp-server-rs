@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["pyyaml"]
+# dependencies = ["pyyaml==6.0.3"]
 # ///
 """Generate crates/zendesk/src/catalog.json: every Zendesk API operation, as data.
 
@@ -100,6 +100,11 @@ REPEATED_PARAMS = {("ListAuditLogs", "filter[created_at]"), ("ExportAuditLogs", 
 
 CHAT_WORDS = {"oauth": "OAuth", "incremental": "Incremental Exports", "ip": "IP"}
 
+MAX_BODY = 50_000_000
+ID_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]*")
+PATH_RE = re.compile(r"/[A-Za-z0-9._~\-/{}]*")
+CONTROL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
 METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE"]
 POSTMAN_TYPES = {"integer": "integer", "long": "integer", "number": "number",
                  "double": "number", "boolean": "boolean"}
@@ -124,8 +129,10 @@ def spec_loader():
 def fetch(url):
     for _ in range(10):
         request = urllib.request.Request(url, headers={"User-Agent": "gen_catalog"})  # noqa: S310
-        with urllib.request.urlopen(request) as r:  # noqa: S310 - fixed https URLs only
-            data = r.read()
+        with urllib.request.urlopen(request, timeout=60) as r:  # noqa: S310 - fixed https URLs only
+            data = r.read(MAX_BODY + 1)
+        if len(data) > MAX_BODY:
+            sys.exit(f"response larger than {MAX_BODY // 1_000_000} MB: {url}")
         if b'"rate limited"' not in data[:200]:
             return data
         print(f"rate limited, retrying {url}", file=sys.stderr)
@@ -430,6 +437,19 @@ def compact(op):
     return out
 
 
+def validate(ops):
+    for op in ops:
+        name = op["id"]
+        if not isinstance(name, str) or not ID_RE.fullmatch(name):
+            sys.exit(f"invalid operation id: {name!r}")
+        path = op["path"]
+        if not PATH_RE.fullmatch(path) or "//" in path or ".." in path:
+            sys.exit(f"{name}: invalid path {path!r}")
+        for field in ("group", "summary", "description"):
+            if CONTROL_RE.search(op[field]):
+                sys.exit(f"{name}: control character in {field}")
+
+
 def dumps(value):
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
@@ -440,6 +460,7 @@ def main():
     args = parser.parse_args()
 
     ops, per_source, skipped = build(args.specs)
+    validate(ops)
     lines = ",\n".join(dumps(compact(op)) for op in ops)
     OUT.write_text(f"[\n{lines}\n]\n", encoding="utf-8")
 

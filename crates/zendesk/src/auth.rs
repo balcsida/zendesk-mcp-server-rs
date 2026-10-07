@@ -46,11 +46,17 @@ impl std::fmt::Debug for AuthValue {
 }
 
 impl AuthValue {
-    pub fn apply(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        match self {
-            AuthValue::Authorization(v) => req.header(reqwest::header::AUTHORIZATION, v),
-            AuthValue::Cookie(v) => req.header(reqwest::header::COOKIE, v),
-        }
+    /// Fails, without echoing the credential, when it is not a valid header value.
+    pub fn apply(&self, req: reqwest::RequestBuilder) -> Result<reqwest::RequestBuilder> {
+        let (name, raw) = match self {
+            AuthValue::Authorization(v) => (reqwest::header::AUTHORIZATION, v),
+            AuthValue::Cookie(v) => (reqwest::header::COOKIE, v),
+        };
+        let mut value = reqwest::header::HeaderValue::from_str(raw).map_err(|_| {
+            anyhow::anyhow!("The Zendesk credential is not a valid {name} header value")
+        })?;
+        value.set_sensitive(true);
+        Ok(req.header(name, value))
     }
 
     /// The bearer token carried by this value, if any. Used to tell "Zendesk rejected
@@ -150,6 +156,29 @@ mod tests {
         let value = Auth::bearer("tok").value().await.unwrap();
         assert_eq!(value, AuthValue::Authorization("Bearer tok".into()));
         assert_eq!(value.bearer_token(), Some("tok"));
+    }
+
+    #[test]
+    fn apply_marks_the_header_sensitive_and_rejects_invalid_values() {
+        let http = reqwest::Client::new();
+        let req = AuthValue::Authorization("Bearer tok".into())
+            .apply(http.get("http://localhost/"))
+            .unwrap()
+            .build()
+            .unwrap();
+        assert!(req.headers()["authorization"].is_sensitive());
+        let req = AuthValue::Cookie("_zendesk_session=abc".into())
+            .apply(http.get("http://localhost/"))
+            .unwrap()
+            .build()
+            .unwrap();
+        assert!(req.headers()["cookie"].is_sensitive());
+
+        let err = AuthValue::Authorization("Bearer bad\nSECRET".into())
+            .apply(http.get("http://localhost/"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("authorization") && !err.contains("SECRET"));
     }
 
     #[tokio::test]

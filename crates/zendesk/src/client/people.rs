@@ -193,6 +193,9 @@ impl ZendeskClient {
     /// Fetches in chunks of 100 ids, the `show_many` limit.
     pub async fn get_users_bulk(&self, user_ids: &[u64]) -> Result<Value> {
         async {
+            if user_ids.len() > 1000 {
+                bail!("Give at most 1000 ids per call");
+            }
             let mut users = Vec::new();
             for chunk in user_ids.chunks(100) {
                 let ids = chunk
