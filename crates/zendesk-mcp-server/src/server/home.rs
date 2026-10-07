@@ -68,32 +68,57 @@ impl Home {
         } else {
             ""
         };
+        // Adding the server with the token in `ZENDESK_MCP_TOKEN`, for both token modes.
+        let token_clients = format!(
+            r#"<h3>Claude Code</h3>
+<pre>claude mcp add --transport http zendesk {endpoint} --header "Authorization: Bearer $ZENDESK_MCP_TOKEN"</pre>
+<h3>Codex</h3>
+<pre>codex mcp add zendesk --url {endpoint} --bearer-token-env-var ZENDESK_MCP_TOKEN</pre>
+<h3>OpenCode</h3>
+<p>In <code>opencode.json</code>:</p>
+<pre>{{"mcp": {{"zendesk": {{"type": "remote", "url": "{endpoint}", "oauth": false, "headers": {{"Authorization": "Bearer {{env:ZENDESK_MCP_TOKEN}}"}}}}}}}}</pre>
+<h3>Pi</h3>
+<pre>pi mcp add zendesk --url {endpoint} --bearer-token-env-var ZENDESK_MCP_TOKEN</pre>
+<h3>Other clients</h3>
+<p>In their MCP configuration:</p>
+<pre>{{"mcpServers": {{"zendesk": {{"url": "{endpoint}", "headers": {{"Authorization": "Bearer &lt;token&gt;"}}}}}}}}</pre>"#
+        );
         let (auth, setup) = match &self.access {
             Access::SharedToken => (
                 "A shared bearer token, sent as <code>Authorization: Bearer &lt;token&gt;</code>. Ask whoever runs this server for it. Every client acts as the Zendesk user this server was authorized with.",
                 format!(
-                    r#"<p>Claude Code:</p>
-<pre>claude mcp add --transport http zendesk {endpoint} --header "Authorization: Bearer &lt;token&gt;"</pre>
-<p>Other clients, in their MCP configuration:</p>
-<pre>{{"mcpServers": {{"zendesk": {{"url": "{endpoint}", "headers": {{"Authorization": "Bearer &lt;token&gt;"}}}}}}}}</pre>"#
+                    r#"<p>Put the token in <code>ZENDESK_MCP_TOKEN</code>. Codex, OpenCode and Pi read the variable whenever they start, so set it in your shell profile:</p>
+<pre>export ZENDESK_MCP_TOKEN=&lt;token&gt;</pre>
+{token_clients}"#
                 ),
             ),
             Access::PerUser => (
                 "Your own Zendesk token, sent as <code>Authorization: Bearer &lt;token&gt;</code>. Zendesk applies your permissions, and comments you post are authored by you.",
                 format!(
-                    r#"<p>Sign in once with the <a href="https://github.com/balcsida/zendesk-rs#install" rel="noopener noreferrer"><code>zendesk</code> CLI</a>, then add the server with the token it prints. Claude Code:</p>
-<pre>zendesk mobile-auth
-claude mcp add --transport http zendesk {endpoint} --header "Authorization: Bearer $(zendesk token --mobile)"</pre>
-<p>Other clients, in their MCP configuration:</p>
-<pre>{{"mcpServers": {{"zendesk": {{"url": "{endpoint}", "headers": {{"Authorization": "Bearer &lt;token&gt;"}}}}}}}}</pre>"#
+                    r#"<p>Sign in once with the <a href="https://github.com/balcsida/zendesk-rs#install" rel="noopener noreferrer"><code>zendesk</code> CLI</a>:</p>
+<pre>zendesk mobile-auth</pre>
+<p>Then put your token in <code>ZENDESK_MCP_TOKEN</code>. Codex, OpenCode and Pi read the variable whenever they start, so set it in your shell profile:</p>
+<pre>export ZENDESK_MCP_TOKEN=$(zendesk token --mobile)</pre>
+{token_clients}"#
                 ),
             ),
             Access::SignIn { .. } => (
                 "Sign in with your Zendesk login: add the server without a token and your MCP client opens a browser. Your own Zendesk token also works, sent as <code>Authorization: Bearer &lt;token&gt;</code>.",
                 format!(
-                    r#"<p>Claude Code:</p>
+                    r#"<h3>Claude Code</h3>
 <pre>claude mcp add --transport http zendesk {endpoint}</pre>
-<p>Other clients, in their MCP configuration:</p>
+<h3>Codex</h3>
+<pre>codex mcp add zendesk --url {endpoint}
+codex mcp login zendesk</pre>
+<h3>OpenCode</h3>
+<p>In <code>opencode.json</code>:</p>
+<pre>{{"mcp": {{"zendesk": {{"type": "remote", "url": "{endpoint}"}}}}}}</pre>
+<p>OpenCode asks you to sign in on first use, or run <code>opencode mcp auth zendesk</code>.</p>
+<h3>Pi</h3>
+<pre>pi mcp add zendesk --url {endpoint}
+pi mcp login zendesk</pre>
+<h3>Other clients</h3>
+<p>In their MCP configuration:</p>
 <pre>{{"mcpServers": {{"zendesk": {{"url": "{endpoint}"}}}}}}</pre>
 <p>For a client that cannot sign in on its own, run <code>zendesk login {endpoint}</code> on your machine and send the token it prints as <code>Authorization: Bearer &lt;token&gt;</code>.</p>"#
                 ),
@@ -184,6 +209,13 @@ mod tests {
         assert!(body.contains("acme.zendesk.com"), "{body}");
         assert!(body.contains("Authorization: Bearer"), "{body}");
         assert!(!body.contains("mobile-auth"), "{body}");
+        for client in [
+            "codex mcp add zendesk --url https://mcp.example.com/mcp --bearer-token-env-var ZENDESK_MCP_TOKEN",
+            r#""url": "https://mcp.example.com/mcp", "oauth": false, "headers": {"Authorization": "Bearer {env:ZENDESK_MCP_TOKEN}"}"#,
+            "pi mcp add zendesk --url https://mcp.example.com/mcp --bearer-token-env-var ZENDESK_MCP_TOKEN",
+        ] {
+            assert!(body.contains(client), "{client}\n{body}");
+        }
     }
 
     #[tokio::test]
@@ -198,6 +230,11 @@ mod tests {
         let body = response.text().await.unwrap();
         assert!(body.contains(&format!("http://{addr}/mcp")), "{body}");
         assert!(body.contains("zendesk mobile-auth"), "{body}");
+        assert!(
+            body.contains("export ZENDESK_MCP_TOKEN=$(zendesk token --mobile)"),
+            "{body}"
+        );
+        assert!(body.contains("codex mcp add zendesk --url"), "{body}");
         assert!(body.contains("Read-only mode"), "{body}");
     }
 
@@ -231,6 +268,16 @@ mod tests {
             "{body}"
         );
         assert!(!body.contains("other.example"), "{body}");
+        for client in [
+            "codex mcp login zendesk",
+            "opencode mcp auth zendesk",
+            r#"{"mcp": {"zendesk": {"type": "remote", "url": "https://mcp.example.com/mcp"}}}"#,
+            "pi mcp login zendesk",
+        ] {
+            assert!(body.contains(client), "{client}\n{body}");
+        }
+        // Signing in needs no token, so none of the token setups apply.
+        assert!(!body.contains("ZENDESK_MCP_TOKEN"), "{body}");
     }
 
     #[test]
