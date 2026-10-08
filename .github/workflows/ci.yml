@@ -43,3 +43,37 @@ jobs:
           docker run --rm zendesk-mcp-server:ci --version |
             grep '^zendesk-mcp-server '
           docker image inspect -f '{{.Size}} bytes' zendesk-mcp-server:ci
+
+  # Once main is green, tag a version that has no tag yet and start its
+  # release. A tag created with GITHUB_TOKEN triggers no workflow, so the
+  # release is started explicitly.
+  tag:
+    needs: [test, docker]
+    if: github.event_name == 'push'
+    # Two quick pushes must not both try to create the tag.
+    concurrency: release-tag
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write
+    steps:
+      - name: Tag the new version and start the release
+        run: |
+          tag=v$(gh api -H "Accept: application/vnd.github.raw" \
+            "repos/$GH_REPO/contents/Cargo.toml?ref=$GITHUB_SHA" |
+            python3 -c "$READ_VERSION")
+          if gh api "repos/$GH_REPO/git/ref/tags/$tag" >/dev/null 2>&1; then
+            echo "$tag is already tagged"
+            exit 0
+          fi
+          gh api "repos/$GH_REPO/git/refs" --silent \
+            -f ref="refs/tags/$tag" -f sha="$GITHUB_SHA"
+          gh workflow run release.yml --ref "$tag"
+          echo "Tagged $GITHUB_SHA as $tag and started the release"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          READ_VERSION: |
+            import sys, tomllib
+            cargo = tomllib.load(sys.stdin.buffer)
+            print(cargo["workspace"]["package"]["version"])

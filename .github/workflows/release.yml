@@ -3,6 +3,9 @@ name: release
 on:
   push:
     tags: ["v*"]
+  # CI's tag job starts the release this way, since the tags it creates
+  # trigger no push event.
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -117,6 +120,8 @@ jobs:
           GH_REPO: ${{ github.repository }}
 
   image:
+    # The release job checks that the tagged commit is on main.
+    needs: release
     strategy:
       fail-fast: false
       matrix:
