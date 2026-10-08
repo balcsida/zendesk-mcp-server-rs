@@ -1,6 +1,6 @@
 [package]
 name = "zendesk-cli"
-description = "Command-line client for Zendesk"
+description = "Unofficial command-line client for the Zendesk API"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
