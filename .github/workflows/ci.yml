@@ -50,6 +50,8 @@ jobs:
   tag:
     needs: [test, docker]
     if: github.event_name == 'push'
+    # Two quick pushes must not both try to create the tag.
+    concurrency: release-tag
     runs-on: ubuntu-latest
     permissions:
       contents: write

@@ -666,10 +666,10 @@ The tests use mocked HTTP and never contact Zendesk.
 
 ### Releasing
 
-Bump `version` in `Cargo.toml`, commit it together with the updated `Cargo.lock` (the release builds with `--locked`), and merge it to `main`. Once CI passes on `main`, it tags the commit `vX.Y.Z` and starts the release workflow. A tag pushed by hand starts it too, but the tagged commit must be on `main`; the release workflow fails otherwise. The release
+Bump `version` in `Cargo.toml`, commit it together with the updated `Cargo.lock` (the release builds with `--locked`), and merge it to `main`. Once CI passes on `main`, it tags the commit `vX.Y.Z` and starts the release workflow. If it tagged the commit but the release did not start, start it with `gh workflow run release.yml --ref vX.Y.Z`. A tag pushed by hand starts it too, but the tagged commit must be on `main`; the release workflow fails otherwise. The release
 workflow builds both binaries (`zendesk-mcp-server` and `zendesk`) for five targets and the
 two-arch `ghcr.io/balcsida/zendesk-mcp-server` image, then publishes the draft
-release once everything has succeeded. The binaries and the image carry build provenance attestations. The Homebrew formulae in [balcsida/homebrew-tap](https://github.com/balcsida/homebrew-tap) pick up a new release within the hour.
+release once everything has succeeded. The binaries and the image carry build provenance attestations. The Homebrew formulae in [balcsida/homebrew-tap](https://github.com/balcsida/homebrew-tap) pick up a new release within about an hour.
 
 ## Troubleshooting
 
