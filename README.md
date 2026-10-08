@@ -11,8 +11,9 @@ This is a Rust rewrite of [reminia/zendesk-mcp-server](https://github.com/remini
 ## What is in the repository
 
 - `zendesk-mcp-server`: the MCP server. Tools for tickets, comments and attachments; search and counts; users, organizations, groups and brands; views, macros and triggers; custom objects; Help Center reading and writing; SLA and satisfaction data. Four catalog tools that search, describe and call any other Zendesk API operation, so the server reaches the full API. Prompts for ticket analysis and response drafting. The Help Center articles as a knowledge base resource. Speaks stdio or streamable HTTP.
-- `zendesk`: the CLI for scripted use: a command for every Zendesk API operation (`zendesk <group> <operation>`), plus `api`, `token`, `auth`, `mobile-auth` and `login`.
+- `zendesk`: the CLI for scripted use: a command for every Zendesk API operation (`zendesk <group> <operation>`), plus `api`, `token`, `auth`, `mobile-auth`, `login` and `skills`.
 - `crates/zendesk`: the shared client library.
+- `skills/`: the agent skills, embedded in both binaries.
 
 Both binaries are single files with no runtime dependencies.
 
@@ -360,6 +361,29 @@ The MCP server does not read this file. Pass the token to it as a fixed bearer t
 ZENDESK_OAUTH_TOKEN=$(zendesk token --mobile) zendesk-mcp-server
 ```
 
+## Agent skills
+
+The repository ships [agent skills](skills/README.md): SKILL.md bundles in the open [Agent Skills](https://agentskills.io/specification) format. They teach AI coding agents to use Zendesk through the `zendesk` CLI or the MCP tools: when to use each, how to find the right command, and which writes to confirm first. Both binaries embed them, so either one installs them:
+
+```bash
+zendesk skills install
+zendesk-mcp-server skills install
+zendesk skills list
+```
+
+By default the skills go under your home directory. `--project` installs under the current directory instead, `--agent claude` (or `kiro`) also copies them into that agent's own directory even if it is not detected, and `--dir <DIR>` installs into one directory only.
+
+| Path | Content |
+| --- | --- |
+| `.agents/skills/zendesk/SKILL.md` | Root operating rules, setup guard and command discovery |
+| `.agents/skills/zendesk-tickets/` | Finding, reading and changing tickets |
+| `.agents/skills/zendesk-help-center/` | Categories, sections and articles |
+| `.agents/skills/zendesk-admin/` | Users, organizations, views, macros, triggers, custom objects, SLAs |
+
+`.agents/skills` is read by Codex, Cursor, Gemini CLI, GitHub Copilot, OpenCode, Amp and Pi. Claude Code does not read it, so it gets a copy under `.claude/skills` when `.claude` exists (Kiro likewise with `.kiro`). Restart the agent afterwards.
+
+Without a binary, `npx skills add balcsida/zendesk-rs` or `gh skill install balcsida/zendesk-rs` installs the same files. The agent loads a skill when a task matches its description.
+
 ## Docker
 
 The image contains the MCP server only, not the `zendesk` CLI.
@@ -626,6 +650,7 @@ The repository is a Cargo workspace with three crates:
 - `crates/zendesk`: the client library (API client, credentials, OAuth).
 - `crates/zendesk-mcp-server`: the `zendesk-mcp-server` binary.
 - `crates/zendesk-cli`: the `zendesk` binary.
+- `skills/`: the agent skills (SKILL.md bundles) embedded in both binaries.
 
 ```bash
 cargo test --workspace
