@@ -1,6 +1,6 @@
 [package]
 name = "zendesk-mcp-server"
-description = "Model Context Protocol server for Zendesk"
+description = "Unofficial Model Context Protocol server for the Zendesk API"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

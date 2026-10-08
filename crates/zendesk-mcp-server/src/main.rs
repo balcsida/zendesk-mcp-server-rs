@@ -6,7 +6,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
-/// Model Context Protocol server for Zendesk.
+/// Unofficial Model Context Protocol server for the Zendesk API. Not affiliated with Zendesk, Inc.
 ///
 /// Without a subcommand it serves over stdio. Configuration comes from the environment
 /// and a .env file in the working directory.

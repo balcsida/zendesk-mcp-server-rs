@@ -4,6 +4,8 @@
 
 A Zendesk MCP server and a Zendesk CLI, sharing one Rust client library.
 
+> **Not an official Zendesk product.** This is an independent, community-maintained project. It is not affiliated with, endorsed by or supported by Zendesk, Inc. Zendesk is a trademark of Zendesk, Inc., used here only to describe the service the software talks to.
+
 This is a Rust rewrite of [reminia/zendesk-mcp-server](https://github.com/reminia/zendesk-mcp-server). It is licensed under Apache-2.0.
 
 ## What is in the repository

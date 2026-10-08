@@ -13,7 +13,7 @@ use zendesk::ZendeskClient;
 use zendesk::auth::Auth;
 use zendesk::config;
 
-/// Command-line client for Zendesk.
+/// Unofficial command-line client for the Zendesk API. Not affiliated with Zendesk, Inc.
 ///
 /// Configuration comes from the environment and a .env file in the working directory. With
 /// nothing configured, not even ZENDESK_SUBDOMAIN, commands use the token saved by

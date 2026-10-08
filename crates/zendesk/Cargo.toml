@@ -1,6 +1,6 @@
 [package]
 name = "zendesk"
-description = "Zendesk API client and credentials shared by the MCP server and the CLI"
+description = "Unofficial Zendesk API client and credentials shared by the MCP server and the CLI"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
