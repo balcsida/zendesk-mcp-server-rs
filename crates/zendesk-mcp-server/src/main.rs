@@ -29,6 +29,11 @@ enum Command {
         #[arg(long)]
         manual: bool,
     },
+    /// Install or list the bundled agent skills that teach AI coding agents to use this server and the CLI.
+    Skills {
+        #[command(subcommand)]
+        command: zendesk::skills::Command,
+    },
 }
 
 #[tokio::main]
@@ -53,6 +58,7 @@ async fn main() -> Result<()> {
     match cli.command.unwrap_or(Command::Stdio) {
         Command::Stdio => server::run(server::Transport::Stdio, http).await,
         Command::Http(args) => server::run(server::Transport::Http(args), http).await,
+        Command::Skills { command } => zendesk::skills::run(command),
         Command::Auth { manual } => {
             let code = zendesk::authorize::run(http, manual).await?;
             std::process::exit(code);

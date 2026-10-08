@@ -348,6 +348,58 @@ mod tests {
     }
 
     #[test]
+    fn non_catalog_commands_are_not_selected_for_skills() {
+        for args in [
+            &["skills", "list"][..],
+            &["skills", "install", "--dir", "/tmp/x"],
+        ] {
+            assert!(selected(&parse(args).unwrap()).is_none(), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn skills_name_only_real_commands() {
+        const NOT_CATALOG: [&str; 6] = ["api", "auth", "mobile-auth", "token", "login", "skills"];
+        let mut checked = 0;
+        for skill in zendesk::skills::SKILLS {
+            for line in skill.content.lines() {
+                let mut rest = line;
+                while let Some(at) = rest.find("zendesk ") {
+                    let after = &rest[at + "zendesk ".len()..];
+                    rest = after;
+                    let mut words = after.split(|c: char| c.is_whitespace() || c == '`');
+                    let (Some(group), Some(op)) = (words.next(), words.next()) else {
+                        continue;
+                    };
+                    let word = |w: &str| {
+                        !w.is_empty() && w.chars().all(|c| c.is_ascii_lowercase() || c == '-')
+                    };
+                    // Prose such as "zendesk skills" or a path like zendesk/SKILL.md is skipped.
+                    let before = &line[..line.len() - after.len() - "zendesk ".len()];
+                    let starts_command = before.trim_end_matches(['`', ' ', '|']).is_empty()
+                        || before.ends_with('`')
+                        || before.ends_with("$(");
+                    if !starts_command || !word(group) || !word(op) || NOT_CATALOG.contains(&group)
+                    {
+                        continue;
+                    }
+                    let err = tree()
+                        .try_get_matches_from(["zendesk", group, op, "--help"])
+                        .expect_err("--help exits");
+                    assert_eq!(
+                        err.kind(),
+                        clap::error::ErrorKind::DisplayHelp,
+                        "skill {} names unknown command `zendesk {group} {op}`",
+                        skill.name
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 40, "only {checked} commands were checked");
+    }
+
+    #[test]
     fn the_whole_tree_is_valid_and_names_are_unique() {
         tree().debug_assert();
 

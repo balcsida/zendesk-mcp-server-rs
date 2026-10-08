@@ -15,6 +15,7 @@ RUN cargo chef cook --release --locked --bin zendesk-mcp-server --recipe-path re
 
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
+COPY skills ./skills
 RUN cargo build --release --locked --bin zendesk-mcp-server \
     && mkdir -m 700 /tokens
 

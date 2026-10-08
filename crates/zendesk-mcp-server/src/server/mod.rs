@@ -1052,6 +1052,29 @@ mod tests {
     }
 
     #[test]
+    fn skills_name_only_real_tools() {
+        const VERBS: [&str; 17] = [
+            "get_", "list_", "search_", "create_", "update_", "delete_", "apply_", "execute_",
+            "merge_", "mark_", "make_", "redact_", "restore_", "recover_", "upload_", "count_",
+            "call_",
+        ];
+        for skill in zendesk::skills::SKILLS {
+            for token in skill
+                .content
+                .split(|c: char| !(c.is_ascii_lowercase() || c == '_'))
+            {
+                if token.contains('_') && VERBS.iter().any(|v| token.starts_with(v)) {
+                    assert!(
+                        TOOLS.contains(&token),
+                        "skill {} names unknown tool {token}",
+                        skill.name
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn ticket_enums_are_closed_sets_in_the_schemas() {
         let tools = server().tool_router.list_all();
         let schema = |name: &str| {

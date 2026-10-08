@@ -6,6 +6,7 @@ pub mod catalog;
 pub mod client;
 pub mod config;
 pub mod oauth;
+pub mod skills;
 pub mod tokens;
 
 pub use client::{ArticleSearch, CreateTicket, ZendeskClient, redirect_policy};

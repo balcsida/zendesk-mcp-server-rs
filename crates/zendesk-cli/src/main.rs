@@ -47,6 +47,11 @@ enum Command {
         /// The server's address, like https://zendesk-mcp.example.com/mcp.
         url: String,
     },
+    /// Install or list the bundled agent skills that teach AI coding agents to use this CLI and the MCP server.
+    Skills {
+        #[command(subcommand)]
+        command: zendesk::skills::Command,
+    },
     /// Call the Zendesk API and print the JSON response.
     Api {
         /// Path under /api/v2/ (e.g. tickets/1.json), or an absolute URL on this account.
@@ -113,6 +118,7 @@ async fn run(cli: Cli) -> Result<i32> {
     match cli.command {
         Command::Auth { manual } => return zendesk::authorize::run(http, manual).await,
         Command::MobileAuth => mobile_auth::run_auth_cli(login_client()?).await?,
+        Command::Skills { command } => zendesk::skills::run(command)?,
         Command::Login { url } => login(&login_client()?, &url).await?,
         Command::Token { mobile } => {
             let (_, auth) = resolve_auth(&http, mobile).await?;
