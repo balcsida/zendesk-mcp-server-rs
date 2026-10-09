@@ -223,7 +223,9 @@ such as macros, triggers, webhooks and Talk. Writing to them needs the broad
 `write` scope, or the family's own scope where Zendesk documents one. The server's
 catalog tools hide and refuse the operations that return or change credentials, and
 the account-administration writes (see [API catalog](#api-catalog)); the CLI runs them.
-`MCP_READ_ONLY=true` makes the server list and run only its read-only tools.
+`--read-only` (or `MCP_READ_ONLY=true`) makes the server list and run only its read-only tools.
+The variable accepts `1`, `true`, `yes`, `on` and `y`, or `0`, `false`, `no`, `off` and `n`,
+in any case; any other value stops the server at startup.
 
 `read` alone is the read-only configuration. Zendesk gives search, job statuses
 and ticket audits no narrow read scope (`tickets:read` is not enough for audits),
@@ -614,6 +616,10 @@ token expires.
   directory signs that user out.
 - The volume holds every signed-in user's Zendesk refresh token. Protect it like a
   password store.
+- Starting a sign-in (`GET /authorize`, `POST /cli/login`) needs no credentials. The
+  server keeps up to 10,000 sign-ins in progress and drops the oldest when a new one
+  arrives, so a flood of requests can still push real sign-ins out. For an
+  internet-facing server, rate-limit `/authorize` and `/cli/login` at the reverse proxy.
 - Run one server process only. Logins are renewed and removed on local disk, and
   sign-ins in progress live in memory.
 - Raw Zendesk tokens are still passed through, as in per-user mode above.
@@ -636,7 +642,7 @@ Both binaries read these from the environment or from a `.env` file in the worki
 | `ZENDESK_SESSION_COOKIE` | none | `_zendesk_session` cookie of a signed-in browser. |
 | `MCP_HTTP_ADDR` | `127.0.0.1:8080` (`0.0.0.0:8080` in Docker) | Listen address for the `http` subcommand. Same as `--bind`. |
 | `MCP_BEARER_TOKEN` | none | Bearer token clients must present to the `http` transport, unless `MCP_PER_USER_AUTH` is set. At least 16 characters; prefer the variable over `--bearer-token`, whose value shows in `ps`. |
-| `MCP_READ_ONLY` | `false` | `true` (or `1`) lists and runs only the read-only tools. |
+| `MCP_READ_ONLY` | `false` | `true`, `yes`, `on` or `1` (any case; `false`, `no`, `off`, `0` turn it off) lists and runs only the read-only tools. Any other value stops the server at startup. Same as `--read-only`. |
 | `MCP_PER_USER_AUTH` | `false` | `true` has every `http` client act with its own Zendesk token, see [Per-user mode](#per-user-mode). Same as `--per-user-auth`. |
 | `MCP_PUBLIC_URL` | none | Public origin of the server, like `https://zendesk-mcp.example.com`. With `MCP_PER_USER_AUTH`, MCP clients sign in through the server; see [Sign-in through the server](#sign-in-through-the-server). |
 | `RUST_LOG` | `info` (server), `warn` (CLI) | Log filter. Logs go to stderr. |

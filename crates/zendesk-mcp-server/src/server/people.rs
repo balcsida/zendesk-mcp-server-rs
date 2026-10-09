@@ -1,3 +1,5 @@
+//! User, organization and group tools.
+
 use super::*;
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -113,15 +115,6 @@ struct UpdateOrganizationParams {
     shared_tickets: Option<bool>,
     /// End users can comment on each other's tickets
     shared_comments: Option<bool>,
-}
-
-/// The request body fields that were set; unset (null) values are skipped.
-fn set_fields<const N: usize>(pairs: [(&str, Value); N]) -> serde_json::Map<String, Value> {
-    pairs
-        .into_iter()
-        .filter(|(_, v)| !v.is_null())
-        .map(|(k, v)| (k.to_string(), v))
-        .collect()
 }
 
 #[tool_router(router = people_router, vis = "pub(super)")]
@@ -242,7 +235,7 @@ impl ZendeskServer {
                 ("time_zone", json!(p.time_zone)),
             ]);
             let user = c.create_or_update_user(fields).await?;
-            Ok(wrapped("User created or updated", "user", user))
+            Ok(wrapped("User created or updated", "user", &user))
         })
         .await
     }
@@ -268,7 +261,7 @@ impl ZendeskServer {
                 ("alias", json!(p.alias)),
             ]);
             let user = c.update_user(p.user_id, fields).await?;
-            Ok(wrapped("User updated", "user", user))
+            Ok(wrapped("User updated", "user", &user))
         })
         .await
     }
@@ -313,7 +306,7 @@ impl ZendeskServer {
             Ok(wrapped(
                 "Organization updated",
                 "organization",
-                organization,
+                &organization,
             ))
         })
         .await
@@ -344,5 +337,92 @@ impl ZendeskServer {
     async fn get_account_settings(&self) -> CallToolResult {
         self.call_json(|c| async move { c.get_account_settings().await })
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::tests::{args, assert_tool_ok, sent, server_on};
+    use super::*;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn update_user_sends_only_the_given_fields() {
+        let mock = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/api/v2/users/4.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "user": { "id": 4 } })))
+            .mount(&mock)
+            .await;
+        let result = server_on(&mock)
+            .update_user(args(json!({
+                "user_id": 4,
+                "name": "Alice",
+                "organization_id": 9,
+                "tags": ["vip"],
+                "user_fields": { "plan": "pro" },
+                "time_zone": "Europe/London",
+            })))
+            .await;
+        assert_tool_ok(&result);
+        assert_eq!(
+            sent(&mock).await,
+            [(
+                "PUT".to_string(),
+                "/api/v2/users/4.json".to_string(),
+                json!({ "user": {
+                    "name": "Alice",
+                    "organization_id": 9,
+                    "tags": ["vip"],
+                    "user_fields": { "plan": "pro" },
+                    "time_zone": "Europe/London",
+                } })
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn update_organization_keeps_false_values() {
+        let mock = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/api/v2/organizations/7.json"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({ "organization": { "id": 7 } })),
+            )
+            .mount(&mock)
+            .await;
+        let result = server_on(&mock)
+            .update_organization(args(json!({
+                "organization_id": 7,
+                "domain_names": ["a.com"],
+                "shared_tickets": false,
+            })))
+            .await;
+        assert_tool_ok(&result);
+        assert_eq!(
+            sent(&mock).await[0].2,
+            json!({ "organization": { "domain_names": ["a.com"], "shared_tickets": false } })
+        );
+    }
+
+    #[tokio::test]
+    async fn create_or_update_user_posts_the_given_fields() {
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v2/users/create_or_update.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "user": { "id": 4 } })))
+            .mount(&mock)
+            .await;
+        let result = server_on(&mock)
+            .create_or_update_user(args(
+                json!({ "name": "Alice", "email": "alice@example.com" }),
+            ))
+            .await;
+        assert_tool_ok(&result);
+        assert_eq!(
+            sent(&mock).await[0].2,
+            json!({ "user": { "name": "Alice", "email": "alice@example.com" } })
+        );
     }
 }

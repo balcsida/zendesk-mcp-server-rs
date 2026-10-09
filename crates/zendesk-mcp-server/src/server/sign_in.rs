@@ -3,9 +3,9 @@
 //! sign in.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Result, bail};
 use axum::Json;
@@ -33,14 +33,17 @@ const SERVER_TOKEN_PREFIX: &str = "zmcp_";
 /// How long a started sign-in waits for its Zendesk code.
 const PENDING_TTL: Duration = Duration::from_secs(600);
 
-/// The most sign-ins that may be in progress at once.
-const MAX_PENDING: usize = 1000;
+/// The most sign-ins that may be in progress at once; a new one evicts the oldest.
+const MAX_PENDING: usize = 10_000;
 
 /// How many failed code redemptions end a sign-in.
 const MAX_FAILURES: u8 = 3;
 
 /// How long a stored login may go unused before it is deleted.
 const GRANT_IDLE: Duration = Duration::from_secs(90 * 24 * 3600);
+
+/// How stale a login's `tokens.json` must be before using the login touches it again.
+const TOUCH_AFTER: Duration = Duration::from_secs(24 * 3600);
 
 /// How long a one-time code for `/token` stays valid.
 const CODE_TTL: Duration = Duration::from_secs(60);
@@ -54,16 +57,21 @@ struct Flows {
     codes: HashMap<String, Issued>,
 }
 
-#[derive(Clone)]
 struct Pending {
     started: Instant,
     pkce: PkcePair,
-    /// `None` for a sign-in started by the CLI rather than by an MCP client.
-    client: Option<Client>,
-    /// The PKCE challenge of a sign-in started by the CLI; `None` for an MCP client's.
-    cli_challenge: Option<String>,
+    origin: Origin,
     /// Codes Zendesk refused so far.
     failures: u8,
+}
+
+/// Who started a sign-in.
+#[derive(Clone)]
+enum Origin {
+    /// An MCP client, through `/authorize`.
+    Mcp(Client),
+    /// `zendesk login`, with the PKCE challenge it sent to `/cli/login`.
+    Cli { challenge: String },
 }
 
 /// The MCP client's side of a sign-in, as sent to `/authorize`.
@@ -126,7 +134,7 @@ impl SignIn {
         let zendesk = config::origin(&settings.subdomain);
         let sign_in = SignIn::new(public, settings, zendesk, http);
         tracing::info!("Zendesk logins are kept in {}", sign_in.grants().display());
-        sign_in.sweep_grants();
+        sweep_grants(&sign_in.grants());
         Ok(sign_in)
     }
 
@@ -199,19 +207,25 @@ impl SignIn {
         self.flows.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Begin a sign-in. Returns the Zendesk authorize URL and its state, or `None` when
-    /// too many sign-ins are in progress.
-    fn start(
-        &self,
-        client: Option<Client>,
-        cli_challenge: Option<String>,
-    ) -> Option<(String, String)> {
+    /// Begin a sign-in. Returns the Zendesk authorize URL and its state. When
+    /// [`MAX_PENDING`] sign-ins are in progress, the oldest is dropped to make room.
+    fn start(&self, origin: Origin) -> (String, String) {
         let mut flows = self.flows();
         flows
             .pending
             .retain(|_, p| p.started.elapsed() < PENDING_TTL);
         if flows.pending.len() >= MAX_PENDING {
-            return None;
+            // ponytail: O(n) scan, at most MAX_PENDING entries. A flood of starts can
+            // still push real sign-ins out; rate-limit /authorize and /cli/login at the
+            // reverse proxy for internet-facing servers.
+            let oldest = flows
+                .pending
+                .iter()
+                .min_by_key(|(_, p)| p.started)
+                .map(|(state, _)| state.clone());
+            if let Some(oldest) = oldest {
+                flows.pending.remove(&oldest);
+            }
         }
         let pkce = generate_pkce_pair();
         let state = generate_state();
@@ -221,19 +235,20 @@ impl SignIn {
             Pending {
                 started: Instant::now(),
                 pkce,
-                client,
-                cli_challenge,
+                origin,
                 failures: 0,
             },
         );
-        Some((url, state))
+        (url, state)
     }
 
-    /// The sign-in started with `state`, which stays in progress; `None` if it is unknown
-    /// or too old.
-    fn pending(&self, state: &str) -> Option<Pending> {
-        let pending = self.flows().pending.get(state)?.clone();
-        (pending.started.elapsed() < PENDING_TTL).then_some(pending)
+    /// The PKCE pair and origin of the sign-in started with `state`, which stays in
+    /// progress; `None` if it is unknown or too old.
+    fn pending(&self, state: &str) -> Option<(PkcePair, Origin)> {
+        let flows = self.flows();
+        let pending = flows.pending.get(state)?;
+        (pending.started.elapsed() < PENDING_TTL)
+            .then(|| (pending.pkce.clone(), pending.origin.clone()))
     }
 
     /// End the sign-in started with `state`. `false` means it was already gone: a
@@ -243,7 +258,8 @@ impl SignIn {
     }
 
     /// Count a code Zendesk refused for the sign-in started with `state`. `false` means
-    /// the sign-in has now ended.
+    /// the sign-in has now ended. Other failures are not the user's: see
+    /// [`Self::redeem_failed`].
     fn note_failure(&self, state: &str) -> bool {
         let mut flows = self.flows();
         let Some(pending) = flows.pending.get_mut(state) else {
@@ -277,9 +293,24 @@ impl SignIn {
         Ok(SignedIn { tokens, user })
     }
 
+    /// Handle a failed [`Self::redeem`] for the sign-in started with `state`. `Some(retry)`
+    /// means Zendesk refused the code (`retry` is whether the user may try again); `None`
+    /// means Zendesk could not be asked, which is logged and does not use up an attempt.
+    fn redeem_failed(&self, state: &str, err: &anyhow::Error) -> Option<bool> {
+        if matches!(
+            err.downcast_ref::<ReauthRequired>(),
+            Some(ReauthRequired::InvalidGrant { .. })
+        ) {
+            return Some(self.note_failure(state));
+        }
+        tracing::warn!("Could not redeem a Zendesk authorization code: {err:#}");
+        None
+    }
+
     /// Keep a sign-in on disk under a new server token, and return that token.
     fn store(&self, signed_in: &SignedIn) -> Result<String> {
-        self.sweep_grants();
+        let swept = self.grants();
+        tokio::task::spawn_blocking(move || sweep_grants(&swept));
         let token = format!("{SERVER_TOKEN_PREFIX}{}", generate_state());
         let grants = self.grants();
         let mut builder = std::fs::DirBuilder::new();
@@ -303,26 +334,6 @@ impl SignIn {
         Ok(token)
     }
 
-    /// Delete the stored logins whose `tokens.json` has not been written for
-    /// [`GRANT_IDLE`]; a login in use is rewritten whenever its access token renews.
-    fn sweep_grants(&self) {
-        let Ok(entries) = std::fs::read_dir(self.grants()) else {
-            return;
-        };
-        let removed = entries
-            .flatten()
-            .filter(|entry| {
-                std::fs::metadata(entry.path().join("tokens.json"))
-                    .and_then(|m| m.modified())
-                    .is_ok_and(|modified| modified.elapsed().is_ok_and(|age| age > GRANT_IDLE))
-            })
-            .filter(|entry| std::fs::remove_dir_all(entry.path()).is_ok())
-            .count();
-        if removed > 0 {
-            tracing::info!("Removed {removed} Zendesk logins unused for 90 days");
-        }
-    }
-
     /// Where all stored logins live, next to the operator's own token file.
     fn grants(&self) -> PathBuf {
         let token_file = &self.settings.token_file;
@@ -339,9 +350,6 @@ impl SignIn {
     async fn caller(&self, token: &str) -> Result<Option<Auth>> {
         let dir = self.grant_dir(token);
         let tokens_file = dir.join("tokens.json");
-        if !tokens_file.exists() {
-            return Ok(None);
-        }
         let settings = OAuthSettings {
             token_file: tokens_file.clone(),
             ..self.settings.clone()
@@ -349,24 +357,28 @@ impl SignIn {
         let provider = OAuthProvider::new(settings, self.http.clone())
             .with_token_endpoint(&format!("{}/oauth/tokens", self.zendesk));
         match provider.access_token().await {
-            Ok(_) => Ok(Some(Auth::OAuth(Arc::new(provider)))),
-            Err(err) if err.is::<ReauthRequired>() => {
-                match std::fs::remove_dir_all(&dir) {
-                    Err(err) if err.kind() != std::io::ErrorKind::NotFound => {
-                        return Err(err.into());
-                    }
-                    _ => {}
+            Ok(_) => {
+                tokio::task::spawn_blocking(move || mark_used(&tokens_file));
+                Ok(Some(Auth::OAuth(Arc::new(provider))))
+            }
+            Err(err) => match err.downcast_ref::<ReauthRequired>() {
+                Some(ReauthRequired::NoTokens { .. }) => {
+                    // No login, or a concurrent request removed it; waiting on its lock made
+                    // the directory again.
+                    let _ = std::fs::remove_dir_all(&dir);
+                    Ok(None)
                 }
-                tracing::info!("Removed a Zendesk login that can no longer be renewed");
-                Ok(None)
-            }
-            Err(_) if !tokens_file.exists() => {
-                // A concurrent request removed the login; waiting on its lock made the
-                // directory again.
-                let _ = std::fs::remove_dir_all(&dir);
-                Ok(None)
-            }
-            Err(err) => Err(err),
+                Some(_) => {
+                    if let Err(e) = std::fs::remove_dir_all(&dir)
+                        && e.kind() != std::io::ErrorKind::NotFound
+                    {
+                        return Err(e.into());
+                    }
+                    tracing::info!("Removed a Zendesk login that can no longer be renewed");
+                    Ok(None)
+                }
+                None => Err(err),
+            },
         }
     }
 
@@ -382,6 +394,49 @@ impl SignIn {
             [(header::WWW_AUTHENTICATE, value)],
         )
             .into_response()
+    }
+}
+
+/// Delete the stored logins in `grants` whose `tokens.json` has not been written for
+/// [`GRANT_IDLE`]. Using a login touches the file (see [`mark_used`]), so one in use is
+/// never idle.
+fn sweep_grants(grants: &Path) {
+    let Ok(entries) = std::fs::read_dir(grants) else {
+        return;
+    };
+    let removed = entries
+        .flatten()
+        .filter(|entry| {
+            std::fs::metadata(entry.path().join("tokens.json"))
+                .and_then(|m| m.modified())
+                .is_ok_and(|modified| modified.elapsed().is_ok_and(|age| age > GRANT_IDLE))
+        })
+        .filter(|entry| std::fs::remove_dir_all(entry.path()).is_ok())
+        .count();
+    if removed > 0 {
+        tracing::info!(
+            "Removed {removed} Zendesk logins unused for {} days",
+            GRANT_IDLE.as_secs() / 86400
+        );
+    }
+}
+
+/// Set the mtime of `tokens_file` to now if it is older than [`TOUCH_AFTER`]. Tokens
+/// issued without an expiry are never rewritten, so use is what keeps the login out of
+/// [`sweep_grants`]. Best effort.
+fn mark_used(tokens_file: &Path) {
+    let stale = std::fs::metadata(tokens_file)
+        .and_then(|m| m.modified())
+        .is_ok_and(|modified| modified.elapsed().is_ok_and(|age| age > TOUCH_AFTER));
+    if !stale {
+        return;
+    }
+    let touched = std::fs::File::options()
+        .write(true)
+        .open(tokens_file)
+        .and_then(|file| file.set_modified(SystemTime::now()));
+    if let Err(err) = touched {
+        tracing::debug!("Could not mark {} as used: {err}", tokens_file.display());
     }
 }
 
@@ -466,7 +521,7 @@ fn error_page(status: StatusCode, message: &str) -> Response {
     )
 }
 
-/// An OAuth error answer: status 400 with `error` and `error_description`, uncached.
+/// An OAuth error answer: `status` with `error` and `error_description`, uncached.
 fn oauth_error(status: StatusCode, error: &str, description: &str) -> Response {
     (
         status,
@@ -510,6 +565,12 @@ async fn register(body: Bytes) -> Response {
     metadata.insert("token_endpoint_auth_method".into(), "none".into());
     (StatusCode::CREATED, Json(Value::Object(metadata))).into_response()
 }
+
+const CODE_REFUSED: &str =
+    "Zendesk did not accept the code: it expired (codes last 2 minutes) or was already used.";
+
+const ZENDESK_UNAVAILABLE: &str =
+    "Could not complete the sign-in with Zendesk. This attempt was not counted.";
 
 /// `GET /authorize`: the page that sends the user to Zendesk and takes the pasted result.
 async fn authorize_page(
@@ -555,12 +616,7 @@ async fn authorize_page(
         code_challenge: params["code_challenge"].clone(),
         state: params.get("state").cloned(),
     };
-    let Some((zendesk_url, state)) = sign_in.start(Some(client), None) else {
-        return error_page(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Too many sign-ins are in progress. Try again in a few minutes.",
-        );
-    };
+    let (zendesk_url, state) = sign_in.start(Origin::Mcp(client));
     html(
         StatusCode::OK,
         format!(
@@ -598,10 +654,7 @@ async fn authorize_paste(
     let session = field("session");
     const EXPIRED: &str =
         "This sign-in expired or was already used. Start the sign-in again from your MCP client.";
-    let Some((pending, client)) = sign_in
-        .pending(session)
-        .and_then(|p| p.client.clone().map(|client| (p, client)))
-    else {
+    let Some((pkce, Origin::Mcp(client))) = sign_in.pending(session) else {
         return error_page(StatusCode::BAD_REQUEST, EXPIRED);
     };
     let Ok(mut redirect) = reqwest::Url::parse(&client.redirect_uri) else {
@@ -621,20 +674,25 @@ async fn authorize_paste(
             );
         }
     };
-    let signed_in = match sign_in.redeem(&pending.pkce, &code).await {
+    let signed_in = match sign_in.redeem(&pkce, &code).await {
         Ok(signed_in) => signed_in,
         Err(err) => {
-            let next = if sign_in.note_failure(session) {
-                "Go back and try again."
-            } else {
-                "This sign-in has ended after too many failed attempts. Start the sign-in again from your MCP client."
+            return match sign_in.redeem_failed(session, &err) {
+                Some(true) => error_page(
+                    StatusCode::BAD_REQUEST,
+                    &format!("{CODE_REFUSED} Go back and try again."),
+                ),
+                Some(false) => error_page(
+                    StatusCode::BAD_REQUEST,
+                    &format!(
+                        "{CODE_REFUSED} This sign-in has ended after too many failed attempts. Start the sign-in again from your MCP client."
+                    ),
+                ),
+                None => error_page(
+                    StatusCode::BAD_GATEWAY,
+                    &format!("{ZENDESK_UNAVAILABLE} Go back and try again."),
+                ),
             };
-            let reason = if err.is::<ReauthRequired>() {
-                "Zendesk did not accept the code: it expired (codes last 2 minutes) or was already used.".to_string()
-            } else {
-                format!("Signing in to Zendesk failed: {err:#}.")
-            };
-            return error_page(StatusCode::BAD_REQUEST, &format!("{reason} {next}"));
         }
     };
     if !sign_in.finish(session) {
@@ -734,13 +792,9 @@ async fn cli_login(State(sign_in): State<Arc<SignIn>>, body: Bytes) -> Response 
             "Send a code_challenge (at most 256 bytes) with code_challenge_method S256.",
         );
     };
-    let Some((authorize_url, state)) = sign_in.start(None, Some(challenge.clone())) else {
-        return oauth_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "temporarily_unavailable",
-            "Too many sign-ins are in progress. Try again in a few minutes.",
-        );
-    };
+    let (authorize_url, state) = sign_in.start(Origin::Cli {
+        challenge: challenge.clone(),
+    });
     (
         [(header::CACHE_CONTROL, "no-store")],
         Json(json!({
@@ -759,10 +813,7 @@ async fn cli_login_finish(
 ) -> Response {
     let field = |name: &str| body.get(name).map(String::as_str).unwrap_or_default();
     let state = field("state");
-    let Some((pending, challenge)) = sign_in
-        .pending(state)
-        .and_then(|p| p.cli_challenge.clone().map(|challenge| (p, challenge)))
-    else {
+    let Some((pkce, Origin::Cli { challenge })) = sign_in.pending(state) else {
         return bad_request(
             "invalid_grant",
             "This sign-in expired or was already used. Run zendesk login again.",
@@ -775,20 +826,26 @@ async fn cli_login_finish(
             "PKCE verification failed. Run zendesk login again.",
         );
     }
-    let signed_in = match sign_in.redeem(&pending.pkce, field("code")).await {
+    let signed_in = match sign_in.redeem(&pkce, field("code")).await {
         Ok(signed_in) => signed_in,
         Err(err) => {
-            let next = if sign_in.note_failure(state) {
-                "Run zendesk login again."
-            } else {
-                "This sign-in has ended after too many failed attempts. Run zendesk login again."
+            return match sign_in.redeem_failed(state, &err) {
+                Some(true) => bad_request(
+                    "invalid_grant",
+                    &format!("{CODE_REFUSED} Run zendesk login again."),
+                ),
+                Some(false) => bad_request(
+                    "invalid_grant",
+                    &format!(
+                        "{CODE_REFUSED} This sign-in has ended after too many failed attempts. Run zendesk login again."
+                    ),
+                ),
+                None => oauth_error(
+                    StatusCode::BAD_GATEWAY,
+                    "temporarily_unavailable",
+                    &format!("{ZENDESK_UNAVAILABLE} Run zendesk login again."),
+                ),
             };
-            let reason = if err.is::<ReauthRequired>() {
-                "Zendesk did not accept the code: it expired (codes last 2 minutes) or was already used.".to_string()
-            } else {
-                format!("Signing in to Zendesk failed: {err:#}.")
-            };
-            return bad_request("invalid_grant", &format!("{reason} {next}"));
         }
     };
     if !sign_in.finish(state) {
@@ -899,7 +956,7 @@ mod tests {
             server,
             None,
             Some(sign_in.clone()),
-            CancellationToken::new(),
+            &CancellationToken::new(),
         );
         tokio::spawn(async move { axum::serve(listener, router).await });
         Harness {
@@ -1682,12 +1739,122 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sign_ins_in_progress_are_capped() {
+    async fn full_sign_in_table_evicts_the_oldest() {
         let h = harness().await;
-        for _ in 0..1000 {
-            assert!(h.sign_in.start(None, None).is_some());
+        let cli = || Origin::Cli {
+            challenge: "c".into(),
+        };
+        let (_, oldest) = h.sign_in.start(cli());
+        for _ in 1..MAX_PENDING {
+            h.sign_in.start(cli());
         }
-        assert!(h.sign_in.start(None, None).is_none());
+        assert!(h.sign_in.pending(&oldest).is_some());
+        let (_, newest) = h.sign_in.start(cli());
+        assert!(h.sign_in.pending(&oldest).is_none());
+        assert!(h.sign_in.pending(&newest).is_some());
+        assert_eq!(h.sign_in.flows().pending.len(), MAX_PENDING);
+    }
+
+    #[tokio::test]
+    async fn zendesk_outage_during_paste_is_not_counted() {
+        let h = harness().await;
+        Mock::given(method("POST"))
+            .and(path("/oauth/tokens"))
+            .and(body_string_contains("code=down"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&h.zendesk)
+            .await;
+        mock_zendesk_sign_in(&h.zendesk).await;
+        let session = open_page(&h, &"v".repeat(43)).await;
+        for _ in 0..MAX_FAILURES + 1 {
+            assert_eq!(paste(&h, &session, "down").await.status(), 502);
+        }
+        assert_eq!(paste(&h, &session, "zcode").await.status(), 303);
+    }
+
+    #[tokio::test]
+    async fn refused_code_during_paste_is_counted() {
+        let h = harness().await;
+        Mock::given(method("POST"))
+            .and(path("/oauth/tokens"))
+            .and(body_string_contains("code=late"))
+            .respond_with(
+                ResponseTemplate::new(400).set_body_json(json!({ "error": "invalid_grant" })),
+            )
+            .mount(&h.zendesk)
+            .await;
+        let session = open_page(&h, &"v".repeat(43)).await;
+        for _ in 0..MAX_FAILURES {
+            assert_eq!(paste(&h, &session, "late").await.status(), 400);
+        }
+        assert!(h.sign_in.pending(&session).is_none());
+    }
+
+    #[tokio::test]
+    async fn zendesk_outage_during_cli_login_is_not_counted() {
+        let h = harness().await;
+        Mock::given(method("POST"))
+            .and(path("/oauth/tokens"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&h.zendesk)
+            .await;
+        let verifier = "v".repeat(43);
+        let started = cli_start(&h, &challenge_for(&verifier))
+            .await
+            .json::<Value>()
+            .await
+            .unwrap();
+        for _ in 0..MAX_FAILURES + 1 {
+            let response = cli_finish(&h, &started["state"], "zcode", &verifier).await;
+            assert_eq!(response.status(), 502);
+            assert_eq!(
+                response.json::<Value>().await.unwrap()["error"],
+                "temporarily_unavailable"
+            );
+        }
+        let state = started["state"].as_str().unwrap();
+        assert!(h.sign_in.pending(state).is_some());
+    }
+
+    #[tokio::test]
+    async fn refused_code_during_cli_login_is_counted() {
+        let h = harness().await;
+        Mock::given(method("POST"))
+            .and(path("/oauth/tokens"))
+            .respond_with(
+                ResponseTemplate::new(400).set_body_json(json!({ "error": "invalid_grant" })),
+            )
+            .mount(&h.zendesk)
+            .await;
+        let verifier = "v".repeat(43);
+        let started = cli_start(&h, &challenge_for(&verifier))
+            .await
+            .json::<Value>()
+            .await
+            .unwrap();
+        for _ in 0..MAX_FAILURES {
+            let response = cli_finish(&h, &started["state"], "late", &verifier).await;
+            assert_eq!(response.status(), 400);
+        }
+        assert!(
+            h.sign_in
+                .pending(started["state"].as_str().unwrap())
+                .is_none()
+        );
+    }
+
+    async fn cli_finish(
+        h: &Harness,
+        state: &Value,
+        code: &str,
+        verifier: &str,
+    ) -> reqwest::Response {
+        h.http
+            .post(format!("{}/cli/login/finish", h.url))
+            .json(&json!({ "state": state, "code": code, "code_verifier": verifier }))
+            .send()
+            .await
+            .unwrap()
     }
 
     #[tokio::test]
@@ -1870,10 +2037,60 @@ mod tests {
             .set_modified(stale)
             .unwrap();
         mock_me(&h, "zd-ok").await;
-        h.sign_in.sweep_grants();
+        sweep_grants(&h.sign_in.grants());
         assert!(!h.sign_in.grant_dir("zmcp_old").exists());
         assert!(h.sign_in.grant_dir("zmcp_fresh").exists());
         assert!(call_current_user(&h, "zmcp_fresh").await.contains("Alice"));
+    }
+
+    fn backdate(path: &Path, age: Duration) {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(SystemTime::now() - age)
+            .unwrap();
+    }
+
+    fn modified_ago(path: &Path) -> Duration {
+        std::fs::metadata(path)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .elapsed()
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn using_a_login_refreshes_its_mtime_once_a_day() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("tokens.json");
+        std::fs::write(&file, "{}").unwrap();
+        backdate(&file, Duration::from_secs(30 * 24 * 3600));
+        mark_used(&file);
+        assert!(modified_ago(&file) < Duration::from_secs(60));
+
+        let recent = Duration::from_secs(3600);
+        backdate(&file, recent);
+        mark_used(&file);
+        assert!(modified_ago(&file) >= recent);
+    }
+
+    #[tokio::test]
+    async fn requests_mark_the_login_as_used() {
+        let h = harness().await;
+        seed(&h, TOKEN, &zd_tokens("zd-ok", "r1", 3600));
+        let file = h.sign_in.grant_dir(TOKEN).join("tokens.json");
+        backdate(&file, Duration::from_secs(30 * 24 * 3600));
+        mock_me(&h, "zd-ok").await;
+        assert!(call_current_user(&h, TOKEN).await.contains("Alice"));
+        for _ in 0..50 {
+            if modified_ago(&file) < Duration::from_secs(3600) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("tokens.json was not touched");
     }
 
     #[test]

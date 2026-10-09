@@ -1,3 +1,5 @@
+//! Custom object tools: object definitions and record search.
+
 use super::*;
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -86,5 +88,74 @@ impl ZendeskServer {
     ) -> CallToolResult {
         self.call_json(|c| async move { c.get_custom_object_record(&p.key, &p.record_id).await })
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::tests::{args, assert_tool_ok, sent, server_on};
+    use super::*;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn filtered_record_search_posts_the_filter_with_paging_in_the_query() {
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v2/custom_objects/orders/records/search.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "custom_object_records": [],
+                "meta": { "has_more": false },
+            })))
+            .mount(&mock)
+            .await;
+        let result = server_on(&mock)
+            .search_custom_object_records(args(json!({
+                "key": "orders",
+                "filter": { "custom_object_fields.status": { "$eq": "open" } },
+                "sort": "-updated_at",
+                "page_size": 500,
+                "after_cursor": "abc",
+            })))
+            .await;
+        assert_tool_ok(&result);
+        let requests = mock.received_requests().await.unwrap();
+        let query: Vec<(String, String)> = requests[0]
+            .url
+            .query_pairs()
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+        for pair in [
+            ("sort", "-updated_at"),
+            ("page[size]", "100"),
+            ("page[after]", "abc"),
+        ] {
+            assert!(
+                query.contains(&(pair.0.to_string(), pair.1.to_string())),
+                "{query:?}"
+            );
+        }
+        assert_eq!(
+            sent(&mock).await[0].2,
+            json!({ "filter": { "custom_object_fields.status": { "$eq": "open" } } })
+        );
+    }
+
+    #[tokio::test]
+    async fn unfiltered_record_search_lists_with_a_get() {
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/custom_objects/orders/records.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "custom_object_records": [],
+                "meta": { "has_more": false },
+            })))
+            .mount(&mock)
+            .await;
+        let result = server_on(&mock)
+            .search_custom_object_records(args(json!({ "key": "orders" })))
+            .await;
+        assert_tool_ok(&result);
+        assert_eq!(sent(&mock).await[0].0, "GET");
     }
 }

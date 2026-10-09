@@ -1,3 +1,5 @@
+//! The API catalog tools: search, describe and call any Zendesk API operation.
+
 use zendesk::catalog::{self, Operation};
 
 use super::*;
@@ -170,7 +172,7 @@ impl ZendeskServer {
     }
 }
 
-fn refusal(message: String) -> CallToolResult {
+fn refusal(message: &str) -> CallToolResult {
     CallToolResult::error(vec![ContentBlock::text(format!("Error: {message}"))])
 }
 
@@ -226,8 +228,8 @@ impl ZendeskServer {
     async fn call_api_read(&self, Parameters(p): Parameters<CallReadParams>) -> CallToolResult {
         let op = match operation(&p.operation_id) {
             Ok(op) if op.is_read() => op,
-            Ok(op) => return refusal(format!("{} is not a read; use call_api_write.", op.id)),
-            Err(e) => return refusal(format!("{e:#}")),
+            Ok(op) => return refusal(&format!("{} is not a read; use call_api_write.", op.id)),
+            Err(e) => return refusal(&format!("{e:#}")),
         };
         self.call_operation(op, p.params, None, p.fields).await
     }
@@ -239,8 +241,8 @@ impl ZendeskServer {
     async fn call_api_write(&self, Parameters(p): Parameters<CallWriteParams>) -> CallToolResult {
         let op = match operation(&p.operation_id) {
             Ok(op) if !op.is_read() => op,
-            Ok(op) => return refusal(format!("{} is a read; use call_api_read.", op.id)),
-            Err(e) => return refusal(format!("{e:#}")),
+            Ok(op) => return refusal(&format!("{} is a read; use call_api_read.", op.id)),
+            Err(e) => return refusal(&format!("{e:#}")),
         };
         self.call_operation(op, p.params, p.body, None).await
     }
@@ -278,7 +280,9 @@ mod tests {
     }
 
     fn read(id: &str, params: Value) -> Parameters<CallReadParams> {
-        Parameters(serde_json::from_value(json!({ "operation_id": id, "params": params })).unwrap())
+        let mut args = json!({ "operation_id": id });
+        args["params"] = params;
+        Parameters(serde_json::from_value(args).unwrap())
     }
 
     #[tokio::test]
@@ -465,18 +469,18 @@ mod tests {
         );
     }
 
+    const ADMIN_WRITE_IDS: [&str; 6] = [
+        "CreateOrCloneWebhook",
+        "UpdateAccountSettings",
+        "BulkPermanentlyDeleteTickets",
+        "CreateUser",
+        "DeleteUser",
+        "DestroyManyUsers",
+    ];
+
     #[tokio::test]
-    async fn admin_writes_are_hidden_and_refused() {
-        let mock = MockServer::start().await;
-        let server = server(&mock);
-        let ids = [
-            "CreateOrCloneWebhook",
-            "UpdateAccountSettings",
-            "BulkPermanentlyDeleteTickets",
-            "CreateUser",
-            "DeleteUser",
-            "DestroyManyUsers",
-        ];
+    async fn admin_writes_are_hidden_from_search() {
+        let server = server(&MockServer::start().await);
         for query in ["webhook", "account settings", "permanently delete", "user"] {
             let p = SearchOperationsParams {
                 query: query.into(),
@@ -486,10 +490,19 @@ mod tests {
             let ops = found["operations"].as_array().unwrap();
             assert!(!ops.is_empty(), "{query}");
             for op in ops {
-                assert!(!ids.contains(&op["id"].as_str().unwrap()), "{found}");
+                assert!(
+                    !ADMIN_WRITE_IDS.contains(&op["id"].as_str().unwrap()),
+                    "{found}"
+                );
             }
         }
-        for id in ids {
+    }
+
+    #[tokio::test]
+    async fn admin_writes_are_refused_by_call_api_write() {
+        let mock = MockServer::start().await;
+        let server = server(&mock);
+        for id in ADMIN_WRITE_IDS {
             let write = CallWriteParams {
                 operation_id: id.into(),
                 params: None,
@@ -502,6 +515,14 @@ mod tests {
                     && message.contains("zendesk CLI"),
                 "{id}: {message}"
             );
+        }
+        assert!(mock.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn admin_writes_are_refused_by_get_api_operation() {
+        let server = server(&MockServer::start().await);
+        for id in ADMIN_WRITE_IDS {
             let get = GetOperationParams {
                 operation_id: id.into(),
             };
@@ -512,9 +533,11 @@ mod tests {
                 "{id}: {message}"
             );
         }
-        assert!(mock.received_requests().await.unwrap().is_empty());
+    }
 
-        // Every guard still names something, so a renamed group or path cannot slip through.
+    /// Every guard still names something, so a renamed group or path cannot slip through.
+    #[test]
+    fn admin_write_guards_name_real_operations() {
         for group in ADMIN_WRITE_GROUPS {
             assert!(
                 catalog::operations().iter().any(|op| op.group == group),

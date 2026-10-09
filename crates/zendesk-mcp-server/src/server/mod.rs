@@ -379,8 +379,17 @@ fn json_block(value: &Value) -> Result<ContentBlock> {
     Ok(ContentBlock::text(serde_json::to_string_pretty(value)?))
 }
 
-pub(super) fn wrapped(message: &str, key: &str, value: Value) -> Value {
+pub(super) fn wrapped(message: &str, key: &str, value: &Value) -> Value {
     json!({ "message": message, key: value })
+}
+
+/// The request body fields that were set; unset (null) values are skipped.
+pub(super) fn set_fields<const N: usize>(pairs: [(&str, Value); N]) -> Map<String, Value> {
+    pairs
+        .into_iter()
+        .filter(|(_, v)| !v.is_null())
+        .map(|(k, v)| (k.to_string(), v))
+        .collect()
 }
 
 /// The result message for a job summary: what `subject` is doing while pending, how it
@@ -623,7 +632,7 @@ fn http_router(
     server: ZendeskServer,
     shared_token: Option<&str>,
     sign_in: Option<Arc<sign_in::SignIn>>,
-    ct: CancellationToken,
+    ct: &CancellationToken,
 ) -> axum::Router {
     // Taken from the server, not from `shared_token`, so a server acting with its own
     // Zendesk login can never be opened to any token.
@@ -664,7 +673,10 @@ fn http_router(
             sign_in::require_caller,
         )),
         None => mcp.layer(ValidateRequestHeaderLayer::custom(
-            #[allow(clippy::result_large_err)]
+            #[expect(
+                clippy::result_large_err,
+                reason = "tower-http fixes the error type to a full response"
+            )]
             move |req: &mut axum::http::Request<axum::body::Body>| {
                 let allowed = match (bearer_token(req.headers()), &expected) {
                     (Some(_), _) if per_user => true,
@@ -697,9 +709,7 @@ fn http_router(
 }
 
 /// Serve over the chosen transport.
-pub async fn run(transport: Transport, http: reqwest::Client) -> Result<()> {
-    let read_only = std::env::var("MCP_READ_ONLY")
-        .is_ok_and(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "True"));
+pub async fn run(transport: Transport, http: reqwest::Client, read_only: bool) -> Result<()> {
     if read_only {
         tracing::info!("Read-only mode: only read tools are listed");
     }
@@ -751,7 +761,7 @@ pub async fn run(transport: Transport, http: reqwest::Client) -> Result<()> {
         }
         None => None,
     };
-    let router = http_router(server, shared_token.as_deref(), sign_in, ct.clone());
+    let router = http_router(server, shared_token.as_deref(), sign_in, &ct);
     let listener = tokio::net::TcpListener::bind(args.bind).await?;
     tracing::info!(
         "Serving MCP over HTTP at http://{}/mcp",
@@ -789,7 +799,10 @@ fn signed_in_server(http: reqwest::Client) -> Result<ZendeskServer> {
 /// Ctrl-C, or SIGTERM (what `docker stop` sends to PID 1).
 async fn shutdown_signal() {
     let ctrl_c = async {
-        let _ = tokio::signal::ctrl_c().await;
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            tracing::error!("Could not listen for Ctrl-C: {e}");
+            std::future::pending::<()>().await;
+        }
     };
     #[cfg(unix)]
     let terminate = async {
@@ -984,6 +997,44 @@ mod tests {
             },
             reqwest::Client::new(),
         )
+    }
+
+    /// A server acting with a shared login on the mock Zendesk.
+    pub(super) fn server_on(mock: &wiremock::MockServer) -> ZendeskServer {
+        let client = ZendeskClient::with_base_url(
+            "acme",
+            Auth::bearer("t"),
+            reqwest::Client::new(),
+            format!("{}/api/v2", mock.uri()),
+        );
+        ZendeskServer::with_login(Login::Shared(Arc::new(client)), reqwest::Client::new())
+    }
+
+    /// Tool arguments as a client would send them.
+    pub(super) fn args<T: serde::de::DeserializeOwned>(arguments: Value) -> Parameters<T> {
+        Parameters(serde_json::from_value(arguments).unwrap())
+    }
+
+    /// Panic with the tool's error text unless the call succeeded.
+    pub(super) fn assert_tool_ok(result: &CallToolResult) {
+        assert_ne!(result.is_error, Some(true), "{result:?}");
+    }
+
+    /// What the mock received, in order: method, path with query, and the JSON body
+    /// (`null` when there is none).
+    pub(super) async fn sent(mock: &wiremock::MockServer) -> Vec<(String, String, Value)> {
+        let requests = mock.received_requests().await.unwrap();
+        requests
+            .iter()
+            .map(|r| {
+                let target = match r.url.query() {
+                    Some(query) => format!("{}?{query}", r.url.path()),
+                    None => r.url.path().to_string(),
+                };
+                let body = serde_json::from_slice(&r.body).unwrap_or(Value::Null);
+                (r.method.to_string(), target, body)
+            })
+            .collect()
     }
 
     #[test]
@@ -1201,7 +1252,7 @@ mod tests {
             reqwest::Client::new(),
         )
         .read_only(true);
-        let router = http_router(server, None, None, CancellationToken::new());
+        let router = http_router(server, None, None, &CancellationToken::new());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/mcp", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, router).await });
@@ -1273,17 +1324,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn http_router_requires_bearer_on_mcp_only() {
+    async fn healthz_is_open() {
         let router = http_router(
             server(),
             Some("right-token"),
             None,
-            CancellationToken::new(),
+            &CancellationToken::new(),
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, router).await });
-
         let http = reqwest::Client::new();
         let health = http
             .get(format!("http://{addr}/healthz"))
@@ -1292,9 +1342,26 @@ mod tests {
             .unwrap();
         assert_eq!(health.status(), 200);
         assert_eq!(health.text().await.unwrap(), "ok");
+    }
 
-        let url = format!("http://{addr}/mcp");
-        let anonymous = http.post(&url).body("{}").send().await.unwrap();
+    #[tokio::test]
+    async fn mcp_without_a_bearer_is_challenged() {
+        let router = http_router(
+            server(),
+            Some("right-token"),
+            None,
+            &CancellationToken::new(),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await });
+        let http = reqwest::Client::new();
+        let anonymous = http
+            .post(format!("http://{addr}/mcp"))
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
         assert_eq!(anonymous.status(), 401);
         assert_eq!(
             anonymous
@@ -1303,29 +1370,68 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("Bearer")
         );
+    }
 
+    #[tokio::test]
+    async fn mcp_with_the_wrong_bearer_is_refused() {
+        let router = http_router(
+            server(),
+            Some("right-token"),
+            None,
+            &CancellationToken::new(),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await });
+        let http = reqwest::Client::new();
         let wrong = http
-            .post(&url)
+            .post(format!("http://{addr}/mcp"))
             .bearer_auth("wrong")
             .body("{}")
             .send()
             .await
             .unwrap();
         assert_eq!(wrong.status(), 401);
+    }
 
-        // The scheme is case-insensitive (RFC 7235).
+    #[tokio::test]
+    async fn bearer_scheme_is_case_insensitive() {
+        let router = http_router(
+            server(),
+            Some("right-token"),
+            None,
+            &CancellationToken::new(),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await });
+        let http = reqwest::Client::new();
+        // RFC 7235.
         let lowercase_scheme = http
-            .post(&url)
+            .post(format!("http://{addr}/mcp"))
             .header("authorization", "bearer right-token")
             .body("{}")
             .send()
             .await
             .unwrap();
         assert_ne!(lowercase_scheme.status(), 401);
+    }
 
+    #[tokio::test]
+    async fn mcp_accepts_any_host_header() {
+        let router = http_router(
+            server(),
+            Some("right-token"),
+            None,
+            &CancellationToken::new(),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await });
+        let http = reqwest::Client::new();
         // Remote deployments reach the server by name, which rmcp rejects by default.
         let by_name = http
-            .post(&url)
+            .post(format!("http://{addr}/mcp"))
             .bearer_auth("right-token")
             .header("host", "mcp.example.com")
             .header("content-type", "application/json")
@@ -1336,9 +1442,22 @@ mod tests {
             .unwrap();
         assert_ne!(by_name.status(), 403);
         assert_ne!(by_name.status(), 401);
+    }
 
+    #[tokio::test]
+    async fn mcp_with_the_right_bearer_is_authorized() {
+        let router = http_router(
+            server(),
+            Some("right-token"),
+            None,
+            &CancellationToken::new(),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await });
+        let http = reqwest::Client::new();
         let authorized = http
-            .post(&url)
+            .post(format!("http://{addr}/mcp"))
             .bearer_auth("right-token")
             .header("content-type", "application/json")
             .header("accept", "application/json, text/event-stream")
@@ -1369,7 +1488,7 @@ mod tests {
             server(),
             Some("right-token"),
             Some(sign_in),
-            CancellationToken::new(),
+            &CancellationToken::new(),
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1440,7 +1559,7 @@ mod tests {
             },
             reqwest::Client::new(),
         );
-        let router = http_router(server, None, None, CancellationToken::new());
+        let router = http_router(server, None, None, &CancellationToken::new());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/mcp", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, router).await });
