@@ -365,7 +365,11 @@ impl SignIn {
                 Some(ReauthRequired::NoTokens { .. }) => {
                     // No login, or a concurrent request removed it; waiting on its lock made
                     // the directory again.
-                    let _ = std::fs::remove_dir_all(&dir);
+                    if let Err(e) = std::fs::remove_dir_all(&dir)
+                        && e.kind() != std::io::ErrorKind::NotFound
+                    {
+                        tracing::debug!("Could not remove {}: {e}", dir.display());
+                    }
                     Ok(None)
                 }
                 Some(_) => {
@@ -690,7 +694,9 @@ async fn authorize_paste(
                 ),
                 None => error_page(
                     StatusCode::BAD_GATEWAY,
-                    &format!("{ZENDESK_UNAVAILABLE} Go back and try again."),
+                    &format!(
+                        "{ZENDESK_UNAVAILABLE} Go back, sign in to Zendesk again and paste the new address."
+                    ),
                 ),
             };
         }
@@ -1744,13 +1750,24 @@ mod tests {
         let cli = || Origin::Cli {
             challenge: "c".into(),
         };
-        let (_, oldest) = h.sign_in.start(cli());
-        for _ in 1..MAX_PENDING {
-            h.sign_in.start(cli());
+        let pkce = generate_pkce_pair();
+        let pending = |started| Pending {
+            started,
+            pkce: pkce.clone(),
+            origin: cli(),
+            failures: 0,
+        };
+        let now = Instant::now();
+        {
+            let mut flows = h.sign_in.flows();
+            let older = now.checked_sub(Duration::from_secs(60)).unwrap();
+            flows.pending.insert("oldest".into(), pending(older));
+            for i in 1..MAX_PENDING {
+                flows.pending.insert(format!("state-{i}"), pending(now));
+            }
         }
-        assert!(h.sign_in.pending(&oldest).is_some());
         let (_, newest) = h.sign_in.start(cli());
-        assert!(h.sign_in.pending(&oldest).is_none());
+        assert!(h.sign_in.pending("oldest").is_none());
         assert!(h.sign_in.pending(&newest).is_some());
         assert_eq!(h.sign_in.flows().pending.len(), MAX_PENDING);
     }

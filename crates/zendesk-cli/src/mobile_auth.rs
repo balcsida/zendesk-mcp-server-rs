@@ -221,7 +221,8 @@ fn token_path_from(get: impl Fn(&str) -> Option<String>) -> PathBuf {
     }
 }
 
-/// Saved token: `None` if there is no file, an error if it cannot be read or is incomplete.
+/// Saved token: `None` if there is no file, an error if it cannot be read, is incomplete or
+/// names something other than a Zendesk subdomain.
 pub fn load_token() -> Result<Option<MobileToken>> {
     load_token_from(&token_path())
 }
@@ -232,13 +233,13 @@ fn load_token_from(path: &Path) -> Result<Option<MobileToken>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(unusable_token_file(path, &e)),
     };
-    let token: MobileToken =
+    let mut token: MobileToken =
         serde_json::from_str(&text).map_err(|e| unusable_token_file(path, &e))?;
-    if token.subdomain.is_empty() || token.access_token.is_empty() {
-        return Err(unusable_token_file(
-            path,
-            &"subdomain or access_token is empty",
-        ));
+    // A file naming a host instead of a subdomain must not send the token there.
+    token.subdomain = zendesk::config::validate_subdomain(&token.subdomain)
+        .map_err(|_| unusable_token_file(path, &"its subdomain is not a Zendesk subdomain"))?;
+    if token.access_token.is_empty() {
+        return Err(unusable_token_file(path, &"access_token is empty"));
     }
     Ok(Some(token))
 }
@@ -1085,9 +1086,7 @@ async fn ensure_auth_from(
         .map(zendesk::config::validate_subdomain)
         .transpose()?;
     let subdomain = subdomain.as_deref();
-    // A token file naming a host rather than a subdomain is not sent anywhere.
-    let saved = load_token_from(path)?
-        .filter(|t| zendesk::config::validate_subdomain(&t.subdomain).is_ok());
+    let saved = load_token_from(path)?;
     if let Some(token) = &saved {
         if subdomain.is_none_or(|s| s == token.subdomain) {
             if verify_token(http, &token.subdomain, &token.access_token)
@@ -1494,6 +1493,19 @@ mod tests {
             assert_eq!(mode(&file), 0o600);
             assert_eq!(mode(file.parent().unwrap()), 0o700);
         }
+    }
+
+    #[test]
+    fn load_token_rejects_a_host_as_subdomain() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("token.json");
+        std::fs::write(
+            &file,
+            r#"{"subdomain": "evil.example/#", "access_token": "t"}"#,
+        )
+        .unwrap();
+        let err = format!("{:#}", load_token_from(&file).unwrap_err());
+        assert!(err.contains("not a Zendesk subdomain"), "{err}");
     }
 
     #[test]

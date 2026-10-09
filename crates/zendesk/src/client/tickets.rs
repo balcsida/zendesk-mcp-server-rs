@@ -911,7 +911,7 @@ impl ZendeskClient {
                         if add.is_empty() {
                             e
                         } else {
-                            anyhow!("tags added but removing failed: {e:#}")
+                            e.context("tags added but removing failed")
                         }
                     })?;
             }
@@ -1629,6 +1629,7 @@ mod tests {
             .update_ticket_tags(3, &["a".into()], &["b".into()])
             .await
             .unwrap_err();
+        assert!(err.downcast_ref::<ApiError>().is_some(), "{err:#}");
         let err = format!("{err:#}");
         assert!(err.contains("tags added but removing failed"), "{err}");
         let err = c

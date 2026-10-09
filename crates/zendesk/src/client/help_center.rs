@@ -413,8 +413,8 @@ impl ZendeskClient {
     /// # Errors
     ///
     /// Fails without a request when both maps are empty or `locale` is missing while
-    /// `translation` is set. If the translation is saved but the article update then
-    /// fails, the error says so.
+    /// `translation` is set. The error says so when the translation was saved but the
+    /// article update failed, or when everything was saved but reading it back failed.
     pub async fn update_article(
         &self,
         article_id: u64,
@@ -422,13 +422,13 @@ impl ZendeskClient {
         mut translation: Map<String, Value>,
         mut article: Map<String, Value>,
     ) -> Result<Value> {
+        let locale = locale.filter(|l| !l.is_empty());
         async {
             translation.retain(|_, v| !v.is_null());
             article.retain(|_, v| !v.is_null());
             if translation.is_empty() && article.is_empty() {
                 bail!("Nothing to update: give at least one field to change");
             }
-            let locale = locale.filter(|l| !l.is_empty());
             if !translation.is_empty() && locale.is_none() {
                 bail!("locale is required to change title, body or draft");
             }
@@ -461,10 +461,13 @@ impl ZendeskClient {
                     }
                 })?;
             }
-            self.get_article(article_id, locale).await
+            anyhow::Ok(())
         }
         .await
-        .with_context(|| format!("Failed to update article {article_id}"))
+        .with_context(|| format!("Failed to update article {article_id}"))?;
+        self.get_article(article_id, locale)
+            .await
+            .context("The article was updated, but reading it back failed")
     }
 }
 
@@ -751,12 +754,23 @@ mod tests {
             json!({"translation": {"title": "New", "draft": false}})
         );
         assert_eq!(bodies[1], json!({"article": {"promoted": true}}));
-        let err = c
+    }
+
+    #[tokio::test]
+    async fn update_article_needs_a_locale_for_translation_fields() {
+        let server = MockServer::start().await;
+        let map = |v: Value| v.as_object().unwrap().clone();
+        let err = client(&server)
             .update_article(9, None, map(json!({"title": "x"})), Map::new())
             .await
             .unwrap_err();
         assert!(format!("{err:#}").contains("locale is required"), "{err}");
-        let err = c
+    }
+
+    #[tokio::test]
+    async fn update_article_needs_something_to_update() {
+        let server = MockServer::start().await;
+        let err = client(&server)
             .update_article(9, Some("fr"), Map::new(), Map::new())
             .await
             .unwrap_err();
@@ -792,6 +806,30 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("HTTP 500"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn update_article_says_when_only_reading_it_back_failed() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/api/v2/help_center/articles/9.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"article": {}})))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+        let map = |v: Value| v.as_object().unwrap().clone();
+        let err = client(&server)
+            .update_article(9, None, Map::new(), map(json!({"promoted": true})))
+            .await
+            .unwrap_err();
+        let text = format!("{err:#}");
+        assert!(
+            text.starts_with("The article was updated, but reading it back failed"),
+            "{text}"
+        );
     }
 
     #[tokio::test]

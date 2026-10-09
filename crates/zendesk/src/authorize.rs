@@ -72,7 +72,7 @@ pub async fn run(http: reqwest::Client, manual: bool) -> Result<i32> {
             return Ok(2);
         }
         Err(err) => {
-            eprintln!("error: {err}");
+            eprintln!("error: {err:#}");
             return Ok(2);
         }
     };
@@ -104,7 +104,7 @@ pub async fn run(http: reqwest::Client, manual: bool) -> Result<i32> {
             Ok(0)
         }
         Err(err) => {
-            eprintln!("\nerror: {err}");
+            eprintln!("\nerror: {err:#}");
             Ok(1)
         }
     }
