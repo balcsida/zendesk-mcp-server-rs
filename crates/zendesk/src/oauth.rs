@@ -116,7 +116,10 @@ pub enum ReauthRequired {
         "{message}\nThe authorization code or refresh token is expired, revoked or already used. {hint}",
         hint = REAUTH_HINT
     )]
-    InvalidGrant { message: String },
+    InvalidGrant {
+        /// What Zendesk answered, without credentials.
+        message: String,
+    },
     /// The stored tokens were issued for another subdomain or client than the configured ones.
     #[error(
         "The stored Zendesk tokens were issued for subdomain {stored_subdomain} and client \
@@ -125,24 +128,39 @@ pub enum ReauthRequired {
         hint = REAUTH_HINT
     )]
     WrongAccount {
+        /// The subdomain the stored tokens were issued for.
         stored_subdomain: String,
+        /// The OAuth client the stored tokens were issued to.
         stored_client: String,
+        /// The configured subdomain.
         subdomain: String,
+        /// The configured OAuth client.
         client: String,
     },
     /// There is no usable refresh token, so the access token cannot be renewed.
     #[error("{reason} {hint}", hint = REAUTH_HINT)]
-    CannotRefresh { reason: String },
+    CannotRefresh {
+        /// Why the access token cannot be renewed.
+        reason: String,
+    },
     /// The token file does not exist.
     #[error("No Zendesk OAuth tokens found at {}. {hint}", .path.display(), hint = REAUTH_HINT)]
-    NoTokens { path: PathBuf },
+    NoTokens {
+        /// Where the token file was expected.
+        path: PathBuf,
+    },
     /// The token file exists but cannot be parsed.
     #[error(
         "Token store at {} is not valid JSON or is missing a field ({detail}). {hint}",
         .path.display(),
         hint = REAUTH_HINT
     )]
-    CorruptTokens { path: PathBuf, detail: String },
+    CorruptTokens {
+        /// The token file.
+        path: PathBuf,
+        /// What the JSON parser reported.
+        detail: String,
+    },
 }
 
 /// Translate an error body into an error, without echoing credentials.

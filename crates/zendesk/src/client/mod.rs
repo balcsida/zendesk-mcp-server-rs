@@ -337,7 +337,9 @@ pub fn redirect_policy() -> reqwest::redirect::Policy {
 #[derive(Debug, thiserror::Error)]
 #[error("Zendesk API error HTTP {status} for {label}: {body}")]
 pub struct ApiError {
+    /// The status Zendesk answered with.
     pub status: reqwest::StatusCode,
+    /// The request, as `METHOD /path`.
     pub label: String,
     /// The first 500 characters of the response body.
     pub body: String,
