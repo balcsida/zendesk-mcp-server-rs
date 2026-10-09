@@ -41,6 +41,15 @@ thiserror = "2"
 wiremock = "0.6"
 tempfile = "3"
 
+# Beyond clippy's defaults: lints from the Rust best-practices audit. CI denies warnings.
+[workspace.lints.clippy]
+allow_attributes_without_reason = "warn"
+manual_let_else = "warn"
+map_unwrap_or = "warn"
+needless_pass_by_value = "warn"
+or_fun_call = "warn"
+redundant_clone = "warn"
+
 [profile.release]
 strip = true
 lto = true

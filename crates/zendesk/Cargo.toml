@@ -30,3 +30,6 @@ webbrowser.workspace = true
 [dev-dependencies]
 wiremock.workspace = true
 tempfile.workspace = true
+
+[lints]
+workspace = true
