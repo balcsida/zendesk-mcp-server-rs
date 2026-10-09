@@ -1,3 +1,5 @@
+//! Command-line client for the Zendesk API, installed as `zendesk`.
+
 mod commands;
 mod mobile_auth;
 
@@ -70,7 +72,15 @@ enum Command {
 
 #[tokio::main]
 async fn main() {
-    dotenvy::from_path(".env").ok();
+    if let Err(e) = dotenvy::from_path(".env")
+        && !e.not_found()
+    {
+        eprintln!(
+            "error: {:#}",
+            anyhow::Error::new(e).context("Could not load .env")
+        );
+        std::process::exit(1);
+    }
     // A CLI must not log on every call; RUST_LOG overrides.
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -139,10 +149,12 @@ async fn run(cli: Cli) -> Result<i32> {
             let body = data
                 .map(|d| read_data(&d, &mut std::io::stdin()))
                 .transpose()?;
-            let method = method.unwrap_or(if body.is_some() {
-                reqwest::Method::POST
-            } else {
-                reqwest::Method::GET
+            let method = method.unwrap_or_else(|| {
+                if body.is_some() {
+                    reqwest::Method::POST
+                } else {
+                    reqwest::Method::GET
+                }
             });
             let (subdomain, auth) = resolve_auth(&http, false).await?;
             let client = ZendeskClient::new(&subdomain, auth, http);
@@ -451,6 +463,42 @@ mod tests {
             started["code_challenge"],
             zendesk::oauth::challenge_for(verifier)
         );
+    }
+
+    #[tokio::test]
+    async fn login_shows_the_server_error_description_for_any_failure_status() {
+        use wiremock::matchers::{method, path};
+        for status in [400, 502] {
+            let mock = wiremock::MockServer::start().await;
+            wiremock::Mock::given(method("POST"))
+                .and(path("/cli/login"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({
+                        "authorize_url": "https://acme.zendesk.com/oauth",
+                        "state": "s",
+                        "redirect_uri": "http://localhost:19186/",
+                    }),
+                ))
+                .mount(&mock)
+                .await;
+            wiremock::Mock::given(method("POST"))
+                .and(path("/cli/login/finish"))
+                .respond_with(wiremock::ResponseTemplate::new(status).set_body_json(
+                    serde_json::json!({"error": "bad", "error_description": "Zendesk said no"}),
+                ))
+                .mount(&mock)
+                .await;
+            let receive = |_, _, _| async {
+                Ok(zendesk::authorize::Captured::from([
+                    ("code".to_string(), "c".to_string()),
+                    ("state".to_string(), "s".to_string()),
+                ]))
+            };
+            let err = login_with(&reqwest::Client::new(), &mock.uri(), receive)
+                .await
+                .unwrap_err();
+            assert_eq!(err.to_string(), "Zendesk said no", "{status}");
+        }
     }
 
     #[tokio::test]
