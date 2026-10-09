@@ -1,3 +1,5 @@
+//! Deleted and suspended tickets, comment privacy and redaction, spam and bulk updates.
+
 use anyhow::{Context, Result, bail};
 use serde_json::{Map, Value, json};
 
@@ -6,7 +8,7 @@ use super::*;
 impl ZendeskClient {
     pub async fn list_deleted_tickets(&self, page: u64, per_page: u64) -> Result<Value> {
         async {
-            let per_page = per_page.min(100);
+            let per_page = per_page.min(MAX_PAGE_SIZE);
             let data = self
                 .api_get(
                     "deleted_tickets.json",
@@ -128,6 +130,10 @@ impl ZendeskClient {
     }
 
     /// Permanently replaces every occurrence of `text` in the comment with block characters.
+    ///
+    /// # Errors
+    ///
+    /// Fails without a request when `text` is blank.
     pub async fn redact_comment_text(
         &self,
         ticket_id: u64,
@@ -174,6 +180,11 @@ impl ZendeskClient {
     /// Applies `fields` (the ticket attributes to set) to 1 to 100 tickets and waits up to
     /// 30 seconds for Zendesk's background job; returns its trimmed status (`pending` is
     /// true if it is still running).
+    ///
+    /// # Errors
+    ///
+    /// Fails without a request when `ticket_ids` is empty or has more than 100 entries, or
+    /// `fields` is empty.
     pub async fn update_tickets_bulk(
         &self,
         ticket_ids: &[u64],

@@ -1,3 +1,5 @@
+//! Users, organizations, groups, brands and account settings.
+
 use anyhow::{Context, Result, bail};
 use serde_json::{Map, Value, json};
 
@@ -179,12 +181,7 @@ impl ZendeskClient {
     pub async fn list_groups(&self) -> Result<Value> {
         async {
             let groups = self.get_paged("groups/assignable.json", "groups").await?;
-            anyhow::Ok(pick_all(
-                &json!({ "groups": groups }),
-                "groups",
-                &["id", "name", "description"],
-                &[],
-            ))
+            anyhow::Ok(pick_each(&groups, &["id", "name", "description"], &[]))
         }
         .await
         .context("Failed to list groups")
@@ -318,7 +315,7 @@ impl ZendeskClient {
         per_page: u64,
     ) -> Result<Value> {
         async {
-            let per_page = per_page.min(100);
+            let per_page = per_page.min(MAX_PAGE_SIZE);
             let data = self
                 .api_get(
                     &format!("organizations/{organization_id}/users.json"),
@@ -378,9 +375,8 @@ impl ZendeskClient {
             let items = self
                 .get_paged(&format!("groups/{group_id}/users.json"), "users")
                 .await?;
-            let users = pick_all(
-                &json!({ "users": items }),
-                "users",
+            let users = pick_each(
+                &items,
                 &["id", "name", "email", "role", "active", "suspended"],
                 &[],
             );
@@ -396,9 +392,8 @@ impl ZendeskClient {
             let brands = self
                 .get_cursor_paged("brands.json", &[], "brands", 1000)
                 .await?;
-            anyhow::Ok(pick_all(
-                &json!({ "brands": brands }),
-                "brands",
+            anyhow::Ok(pick_each(
+                &brands,
                 &[
                     "id",
                     "name",
@@ -625,7 +620,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_user_puts_the_body_and_rejects_empty_updates() {
+    async fn update_user_puts_the_body() {
         let server = MockServer::start().await;
         Mock::given(method("PUT"))
             .and(path("/api/v2/users/4.json"))
@@ -640,8 +635,13 @@ mod tests {
         let requests = server.received_requests().await.unwrap();
         let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
         assert_eq!(body, json!({"user": {"notes": "n"}}));
-        assert!(c.update_user(4, Map::new()).await.is_err());
-        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn update_user_rejects_empty_updates_without_a_request() {
+        let server = MockServer::start().await;
+        assert!(client(&server).update_user(4, Map::new()).await.is_err());
+        assert!(server.received_requests().await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -669,7 +669,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_organization_puts_the_body_and_rejects_empty_updates() {
+    async fn update_organization_puts_the_body() {
         let server = MockServer::start().await;
         Mock::given(method("PUT"))
             .and(path("/api/v2/organizations/7.json"))
@@ -692,8 +692,18 @@ mod tests {
             body,
             json!({"organization": {"domain_names": ["a.com"], "shared_tickets": true}})
         );
-        assert!(c.update_organization(7, Map::new()).await.is_err());
-        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn update_organization_rejects_empty_updates_without_a_request() {
+        let server = MockServer::start().await;
+        assert!(
+            client(&server)
+                .update_organization(7, Map::new())
+                .await
+                .is_err()
+        );
+        assert!(server.received_requests().await.unwrap().is_empty());
     }
 
     #[tokio::test]

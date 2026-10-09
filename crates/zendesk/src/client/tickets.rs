@@ -1,3 +1,5 @@
+//! Tickets: reading, searching, creating and updating, comments and attachments.
+
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Map, Value, json};
 
@@ -147,6 +149,13 @@ impl ZendeskClient {
         .with_context(|| format!("Failed to get comments for ticket {ticket_id}"))
     }
 
+    /// Fetches an attachment as an allowed image type, at most [`MAX_ATTACHMENT_BYTES`].
+    ///
+    /// # Errors
+    ///
+    /// Fails when `content_url` is not an https URL without credentials on the account's
+    /// `/attachments/` route or a `*.zdusercontent.com` host, or the response is not an
+    /// allowed image type or exceeds the size cap.
     pub async fn get_ticket_attachment(&self, content_url: &str) -> Result<Attachment> {
         let (url, send_credentials) = self.validate_attachment_url(content_url)?;
         self.fetch_attachment(url, send_credentials).await
@@ -183,9 +192,10 @@ impl ZendeskClient {
     }
 
     async fn fetch_attachment(&self, url: url::Url, send_credentials: bool) -> Result<Attachment> {
-        // Zendesk attachment URLs redirect to the zdusercontent.com CDN. reqwest follows
-        // redirects by default and strips Authorization and Cookie when the host changes,
-        // which the CDN requires (it answers 403 to a request carrying credentials).
+        // Zendesk attachment URLs redirect to the zdusercontent.com CDN. `redirect_policy`
+        // follows redirects only over https to Zendesk hosts, and reqwest strips
+        // Authorization and Cookie when the host changes, which the CDN requires (it
+        // answers 403 to a request carrying credentials).
         let mut resp = if send_credentials {
             self.send(|| self.http.get(url.clone())).await?
         } else {
@@ -277,6 +287,11 @@ impl ZendeskClient {
 
     /// Uploads a file for attaching to a comment; returns the token (valid for 60 minutes)
     /// to pass as `upload_tokens`.
+    ///
+    /// # Errors
+    ///
+    /// Fails without a request when `filename` or `content_type` is empty, or the data is
+    /// not valid base64, is empty, or exceeds [`MAX_ATTACHMENT_BYTES`] once decoded.
     pub async fn upload_attachment(
         &self,
         filename: &str,
@@ -335,7 +350,7 @@ impl ZendeskClient {
         sort_order: &str,
     ) -> Result<Value> {
         async {
-            let per_page = per_page.min(100);
+            let per_page = per_page.min(MAX_PAGE_SIZE);
             let data = self
                 .api_get(
                     "tickets.json",
@@ -367,6 +382,11 @@ impl ZendeskClient {
         .context("Failed to get latest tickets")
     }
 
+    /// Creates a ticket and returns it in the shape `update_ticket` uses.
+    ///
+    /// # Errors
+    ///
+    /// Fails without a request when both `requester` and `requester_id` are given.
     pub async fn create_ticket(&self, ticket: CreateTicket) -> Result<Value> {
         async {
             if ticket.requester.is_some() && ticket.requester_id.is_some() {
@@ -427,6 +447,11 @@ impl ZendeskClient {
     /// `fields` are the ticket attributes to set (subject, status, priority, type,
     /// assignee_id, requester_id, tags, custom_fields, due_at, ...). Null values are skipped.
     /// `safe_update: true` requires `updated_stamp`; Zendesk answers 409 on a collision.
+    ///
+    /// # Errors
+    ///
+    /// Fails without a request when no non-null field is given, an `email_ccs` entry has
+    /// neither `user_id` nor `user_email`, or `safe_update` is set without `updated_stamp`.
     pub async fn update_ticket(&self, ticket_id: u64, fields: Map<String, Value>) -> Result<Value> {
         async {
             let fields: Map<String, Value> =
@@ -467,7 +492,7 @@ impl ZendeskClient {
         sort_order: &str,
     ) -> Result<Value> {
         async {
-            let per_page = per_page.min(100);
+            let per_page = per_page.min(MAX_PAGE_SIZE);
             let mut params: Vec<(&str, &(dyn Display + Sync))> = vec![
                 ("query", &query),
                 ("page", &page),
@@ -481,10 +506,9 @@ impl ZendeskClient {
             }
             let data = self.api_get("search.json", &params).await?;
             let names = side_loaded_user_names(&data);
-            let results = data
-                .get("results")
-                .and_then(Value::as_array)
-                .map(|results| {
+            let results = data.get("results").and_then(Value::as_array).map_or_else(
+                || json!([]),
+                |results| {
                     results
                         .iter()
                         .map(|r| match r.get("result_type").and_then(Value::as_str) {
@@ -492,11 +516,11 @@ impl ZendeskClient {
                             _ => r.clone(),
                         })
                         .collect()
-                })
-                .unwrap_or_else(|| json!([]));
+                },
+            );
             anyhow::Ok(json!({
                 "results": results,
-                "count": data.get("count").cloned().unwrap_or(json!(0)),
+                "count": data.get("count").cloned().unwrap_or_else(|| json!(0)),
                 "page": page,
                 "per_page": per_page,
                 "has_more": !data["next_page"].is_null(),
@@ -526,7 +550,7 @@ impl ZendeskClient {
                         &[
                             ("query", &query),
                             ("page", &page),
-                            ("per_page", &100u64),
+                            ("per_page", &MAX_PAGE_SIZE),
                             ("sort_by", &sort_by),
                             ("sort_order", &sort_order),
                             ("include", &"tickets(users)"),
@@ -583,6 +607,11 @@ impl ZendeskClient {
 
     /// Merges and waits up to 20 seconds for Zendesk's background job; returns its
     /// trimmed status (`pending` is true if the merge is still running).
+    ///
+    /// # Errors
+    ///
+    /// Fails without a request when `source_ids` is empty, has more than 100 entries or a
+    /// duplicate, or contains `target_id`.
     pub async fn merge_tickets(
         &self,
         target_id: u64,
@@ -639,7 +668,7 @@ impl ZendeskClient {
                     "Invalid role '{role}'. Allowed: [\"assigned\", \"ccd\", \"followed\", \"requested\"]"
                 );
             }
-            let per_page = per_page.min(100);
+            let per_page = per_page.min(MAX_PAGE_SIZE);
             let data = self
                 .api_get(
                     &format!("users/{user_id}/tickets/{role}.json"),
@@ -807,7 +836,7 @@ impl ZendeskClient {
                         .await?
                 }
                 None => {
-                    self.api_get("problems.json", &[("per_page", &100u64)])
+                    self.api_get("problems.json", &[("per_page", &MAX_PAGE_SIZE)])
                         .await?
                 }
             };
@@ -827,7 +856,7 @@ impl ZendeskClient {
         per_page: u64,
     ) -> Result<Value> {
         async {
-            let per_page = per_page.min(100);
+            let per_page = per_page.min(MAX_PAGE_SIZE);
             let data = self
                 .api_get(
                     &format!("organizations/{organization_id}/tickets.json"),
@@ -852,6 +881,10 @@ impl ZendeskClient {
     }
 
     /// Adds then removes specific tags; returns the ticket's tags after the last call.
+    ///
+    /// # Errors
+    ///
+    /// Fails without a request when both lists are empty or a tag to remove contains a comma.
     pub async fn update_ticket_tags(
         &self,
         ticket_id: u64,
@@ -1292,7 +1325,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_ticket_comments_adds_author_names_and_rejects_bad_sort_order() {
+    async fn get_ticket_comments_adds_author_names() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/v2/tickets/5/comments.json"))
@@ -1307,11 +1340,20 @@ mod tests {
         let out = c.get_ticket_comments(5, "asc").await.unwrap();
         assert_eq!(out[0]["author_name"], "Ann");
         assert!(out[1].get("author_name").is_none());
-        let err = c.get_ticket_comments(5, "up").await.unwrap_err();
+    }
+
+    #[tokio::test]
+    async fn get_ticket_comments_rejects_a_bad_sort_order_without_a_request() {
+        let server = MockServer::start().await;
+        let err = client(&server)
+            .get_ticket_comments(5, "up")
+            .await
+            .unwrap_err();
         assert!(
             format!("{err:#}").contains("Invalid sort_order 'up'"),
             "{err}"
         );
+        assert!(server.received_requests().await.unwrap().is_empty());
     }
 
     #[tokio::test]

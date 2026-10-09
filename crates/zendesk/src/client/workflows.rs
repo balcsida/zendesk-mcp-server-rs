@@ -1,3 +1,5 @@
+//! Views, macros, triggers, ticket fields and forms, SLAs, custom statuses and satisfaction ratings.
+
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Map, Value, json};
 
@@ -81,9 +83,8 @@ impl ZendeskClient {
     pub async fn list_views(&self) -> Result<Value> {
         async {
             let views = self.get_paged("views.json", "views").await?;
-            anyhow::Ok(pick_all(
-                &json!({ "views": views }),
-                "views",
+            anyhow::Ok(pick_each(
+                &views,
                 &["id", "title", "active", "position"],
                 &[],
             ))
@@ -101,7 +102,7 @@ impl ZendeskClient {
         sort_order: Option<&str>,
     ) -> Result<Value> {
         async {
-            let per_page = per_page.min(100);
+            let per_page = per_page.min(MAX_PAGE_SIZE);
             let mut params: Vec<(&str, &(dyn std::fmt::Display + Sync))> =
                 vec![("page", &page), ("per_page", &per_page)];
             if let Some(sort_by) = &sort_by {
@@ -180,9 +181,8 @@ impl ZendeskClient {
                 "macros.json"
             };
             let macros = self.get_paged(path, "macros").await?;
-            anyhow::Ok(pick_all(
-                &json!({ "macros": macros }),
-                "macros",
+            anyhow::Ok(pick_each(
+                &macros,
                 &["id", "title", "description", "active"],
                 &[],
             ))
@@ -201,7 +201,7 @@ impl ZendeskClient {
                 .await?;
             let result = &data["result"];
             anyhow::Ok(json!({
-                "ticket_changes": result.get("ticket").cloned().unwrap_or(json!({})),
+                "ticket_changes": result.get("ticket").cloned().unwrap_or_else(|| json!({})),
                 "comment": result["ticket"]["comment"],
             }))
         }
@@ -352,9 +352,8 @@ impl ZendeskClient {
                 params.push(("category_id", category_id));
             }
             let triggers = self.get_paged_with(path, &params, "triggers").await?;
-            anyhow::Ok(pick_all(
-                &json!({ "triggers": triggers }),
-                "triggers",
+            anyhow::Ok(pick_each(
+                &triggers,
                 &[
                     "id",
                     "title",
@@ -509,7 +508,7 @@ impl ZendeskClient {
                 .and_then(|d| chrono::Utc::now().checked_sub_signed(d))
                 .ok_or_else(|| anyhow!("days_back {days_back} is out of range"))?
                 .timestamp();
-            let per_page = per_page.min(100);
+            let per_page = per_page.min(MAX_PAGE_SIZE);
             let mut params: Vec<(&str, &(dyn Display + Sync))> = vec![
                 ("start_time", &start),
                 ("page", &page),
@@ -556,7 +555,7 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[tokio::test]
-    async fn view_counts_join_ids_and_reject_bad_sizes() {
+    async fn view_counts_join_ids() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/v2/views/count_many.json"))
@@ -577,8 +576,15 @@ mod tests {
             json!({"view_id": 25, "value": 719, "pretty": "~700", "fresh": true})
         );
         assert!(out[1]["value"].is_null());
+    }
+
+    #[tokio::test]
+    async fn view_counts_reject_bad_sizes_without_a_request() {
+        let server = MockServer::start().await;
+        let c = client(&server);
         assert!(c.get_view_counts(&[]).await.is_err());
         assert!(c.get_view_counts(&[1; 21]).await.is_err());
+        assert!(server.received_requests().await.unwrap().is_empty());
     }
 
     #[tokio::test]

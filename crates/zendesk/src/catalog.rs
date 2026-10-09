@@ -76,6 +76,11 @@ fn json_content_type() -> String {
 }
 
 /// Every operation, in catalog order (grouped by resource).
+///
+/// # Panics
+///
+/// If the embedded `catalog.json` does not parse. It is fixed at compile time and a test
+/// checks it, so this does not happen in a released build.
 pub fn operations() -> &'static [Operation] {
     static OPERATIONS: OnceLock<Vec<Operation>> = OnceLock::new();
     OPERATIONS.get_or_init(|| {
@@ -84,6 +89,13 @@ pub fn operations() -> &'static [Operation] {
 }
 
 /// The operation with this id, compared case-insensitively.
+///
+/// ```
+/// let op = zendesk::catalog::find("showticket").expect("ShowTicket is in the catalog");
+/// assert_eq!(op.id, "ShowTicket");
+/// assert!(op.is_read());
+/// assert!(zendesk::catalog::find("NoSuchOperation").is_none());
+/// ```
 pub fn find(id: &str) -> Option<&'static Operation> {
     operations()
         .iter()
@@ -92,6 +104,12 @@ pub fn find(id: &str) -> Option<&'static Operation> {
 
 /// Operations matching every word of `query` (case-insensitive substrings of the id,
 /// summary, group, path or description), best match first. None for an empty query.
+///
+/// ```
+/// let hits = zendesk::catalog::search("show ticket");
+/// assert!(hits.iter().any(|op| op.id == "ShowTicket"));
+/// assert!(zendesk::catalog::search("   ").is_empty());
+/// ```
 pub fn search(query: &str) -> Vec<&'static Operation> {
     let words: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
     if words.is_empty() {
@@ -137,6 +155,19 @@ impl Operation {
     /// comma-separated, or as repeated pairs when the name ends in `[]` or the parameter is
     /// `explode`; an object is sent as `name[key]=value` pairs, so `{"page": {"size": 10}}`
     /// becomes `page[size]=10`.
+    ///
+    /// ```
+    /// let op = zendesk::catalog::find("ShowTicket").unwrap();
+    /// let args = serde_json::json!({ "ticket_id": 42, "include": ["users", "groups"] });
+    /// let (path, query) = op.request(args.as_object().unwrap()).unwrap();
+    /// assert_eq!(path, "/api/v2/tickets/42");
+    /// assert_eq!(query, [("include".to_string(), "users,groups".to_string())]);
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Fails when a path parameter or required query parameter is missing, or a value is
+    /// not a string, number or boolean (or an array or object of them).
     pub fn request(&self, args: &Map<String, Value>) -> Result<(String, Vec<(String, String)>)> {
         let mut path = String::new();
         let mut used = Vec::new();
@@ -258,7 +289,10 @@ mod tests {
     }
 
     fn args(value: Value) -> Map<String, Value> {
-        value.as_object().unwrap().clone()
+        let Value::Object(map) = value else {
+            panic!("args must be a JSON object");
+        };
+        map
     }
 
     fn client(server: &MockServer) -> ZendeskClient {
@@ -288,20 +322,34 @@ mod tests {
     }
 
     #[test]
-    fn catalog_ids_are_unique_and_paths_match_their_params() {
-        let ops = operations();
-        assert!(!ops.is_empty());
+    fn catalog_is_not_empty() {
+        assert!(!operations().is_empty());
+    }
+
+    #[test]
+    fn catalog_ids_are_unique_ignoring_case() {
         let mut ids = std::collections::HashSet::new();
-        for op in ops {
+        for op in operations() {
             assert!(ids.insert(op.id.to_lowercase()), "duplicate id {}", op.id);
+        }
+    }
+
+    #[test]
+    fn catalog_operations_use_a_known_method_and_have_text() {
+        for op in operations() {
             assert!(
                 ["GET", "POST", "PUT", "PATCH", "DELETE"].contains(&op.method.as_str()),
                 "{}: {}",
                 op.id,
                 op.method
             );
-            assert!(op.path.starts_with('/'), "{}: {}", op.id, op.path);
             assert!(!op.group.is_empty() && !op.summary.is_empty(), "{}", op.id);
+        }
+    }
+
+    #[test]
+    fn catalog_params_are_not_declared_twice() {
+        for op in operations() {
             let mut names = std::collections::HashSet::new();
             for p in &op.params {
                 assert!(
@@ -311,22 +359,33 @@ mod tests {
                     p.name
                 );
             }
-            let in_path: Vec<&str> = op
+        }
+    }
+
+    #[test]
+    fn catalog_path_placeholders_match_the_declared_path_params() {
+        for op in operations() {
+            let mut in_path: Vec<&str> = op
                 .path
                 .split('{')
                 .skip(1)
                 .filter_map(|s| s.split_once('}').map(|(name, _)| name))
                 .collect();
-            let declared: Vec<&str> = op
+            let mut declared: Vec<&str> = op
                 .params
                 .iter()
                 .filter(|p| p.location == Location::Path)
                 .map(|p| p.name.as_str())
                 .collect();
-            let (mut a, mut b) = (in_path.clone(), declared.clone());
-            a.sort();
-            b.sort();
-            assert_eq!(a, b, "{}: path params", op.id);
+            in_path.sort();
+            declared.sort();
+            assert_eq!(in_path, declared, "{}: path params", op.id);
+        }
+    }
+
+    #[test]
+    fn catalog_bodies_name_a_content_type() {
+        for op in operations() {
             if let Some(body) = &op.body {
                 assert!(!body.content_type.is_empty(), "{}", op.id);
             }

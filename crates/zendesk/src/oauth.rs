@@ -341,12 +341,11 @@ impl OAuthProvider {
     pub async fn access_token(&self) -> Result<String> {
         let mut cached = self.tokens.lock().await;
         let tokens = match cached.as_ref() {
-            Some(tokens) => tokens.clone(),
+            Some(tokens) => tokens,
             None => {
                 let tokens = self.store.load()?;
                 self.check_stored_for_settings(&tokens)?;
-                *cached = Some(tokens.clone());
-                tokens
+                cached.insert(tokens)
             }
         };
         if tokens.access_token_expired() {
@@ -355,7 +354,7 @@ impl OAuthProvider {
                 .await?;
             return Ok(renewed.access_token);
         }
-        Ok(tokens.access_token)
+        Ok(tokens.access_token.clone())
     }
 
     /// Refresh the access token, persisting the rotated pair before returning.
@@ -472,9 +471,21 @@ mod tests {
             challenge_for("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
             "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
         );
+    }
+
+    #[test]
+    fn generated_pkce_verifier_has_the_minimum_length() {
+        assert_eq!(generate_pkce_pair().verifier.len(), 43);
+    }
+
+    #[test]
+    fn generated_pkce_challenge_is_derived_from_the_verifier() {
         let pair = generate_pkce_pair();
-        assert_eq!(pair.verifier.len(), 43);
         assert_eq!(pair.challenge, challenge_for(&pair.verifier));
+    }
+
+    #[test]
+    fn generated_states_differ() {
         assert_ne!(generate_state(), generate_state());
     }
 

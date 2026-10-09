@@ -363,7 +363,10 @@ mod tests {
     fn validate_returns_code_when_state_matches() {
         let ok = captured(&[("code", "abc"), ("state", "s")]);
         assert_eq!(validate_callback(&ok, "s").unwrap(), "abc");
-        // A bare code has no state to compare.
+    }
+
+    #[test]
+    fn validate_accepts_a_bare_code_without_state() {
         assert_eq!(
             validate_callback(&captured(&[("code", "abc")]), "s").unwrap(),
             "abc"
@@ -371,7 +374,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_errors_missing_code_and_state_mismatch() {
+    fn validate_reports_the_error_description_when_declined() {
         let declined = captured(&[
             ("error", "access_denied"),
             ("error_description", "No thanks"),
@@ -380,6 +383,10 @@ mod tests {
             validate_callback(&declined, "s").unwrap_err().to_string(),
             "Zendesk declined the authorization request: No thanks"
         );
+    }
+
+    #[test]
+    fn validate_reports_the_error_code_when_declined_without_description() {
         let declined = captured(&[("error", "access_denied")]);
         assert!(
             validate_callback(&declined, "s")
@@ -387,12 +394,20 @@ mod tests {
                 .to_string()
                 .ends_with("access_denied")
         );
+    }
+
+    #[test]
+    fn validate_rejects_a_redirect_without_a_code() {
         assert_eq!(
             validate_callback(&captured(&[("state", "s")]), "s")
                 .unwrap_err()
                 .to_string(),
             "The redirect did not include an authorization code."
         );
+    }
+
+    #[test]
+    fn validate_rejects_a_state_mismatch() {
         let forged = captured(&[("code", "abc"), ("state", "other")]);
         assert!(
             validate_callback(&forged, "s")

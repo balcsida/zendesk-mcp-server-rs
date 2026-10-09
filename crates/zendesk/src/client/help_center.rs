@@ -1,3 +1,5 @@
+//! Help Center: articles, categories, sections and translations.
+
 use std::collections::{BTreeSet, HashMap};
 
 use anyhow::{Context, Result, bail};
@@ -132,6 +134,11 @@ impl ZendeskClient {
 
     /// Search is capped by Zendesk at 1,000 results. Needs a query, category, section or
     /// label names.
+    ///
+    /// # Errors
+    ///
+    /// Fails without a request when none of those is given, or `sort_by` or `sort_order`
+    /// is not one Zendesk accepts.
     pub async fn search_articles(&self, search: &ArticleSearch<'_>) -> Result<Value> {
         async {
             let ArticleSearch {
@@ -166,7 +173,7 @@ impl ZendeskClient {
             {
                 bail!("Invalid sort_order '{sort_order}'. Allowed: asc, desc");
             }
-            let per_page = per_page.min(100);
+            let per_page = per_page.min(MAX_PAGE_SIZE);
             let labels = label_names.join(",");
             let mut params: Vec<(&str, &(dyn Display + Sync))> =
                 vec![("per_page", &per_page), ("page", &page)];
@@ -235,7 +242,7 @@ impl ZendeskClient {
                 "page": page,
                 "per_page": per_page,
                 "count": count,
-                "total_count": data.get("count").cloned().unwrap_or(json!(count)),
+                "total_count": data.get("count").cloned().unwrap_or_else(|| json!(count)),
                 "has_more": !data["next_page"].is_null(),
             }))
         }
@@ -252,7 +259,7 @@ impl ZendeskClient {
         per_page: u64,
     ) -> Result<Value> {
         async {
-            let per_page = per_page.min(100);
+            let per_page = per_page.min(MAX_PAGE_SIZE);
             let section = section_id
                 .map(|id| format!("/sections/{id}"))
                 .unwrap_or_default();
@@ -279,7 +286,7 @@ impl ZendeskClient {
                 "page": page,
                 "per_page": per_page,
                 "count": count,
-                "total_count": data.get("count").cloned().unwrap_or(json!(count)),
+                "total_count": data.get("count").cloned().unwrap_or_else(|| json!(count)),
                 "has_more": !data["next_page"].is_null(),
             }))
         }
@@ -301,9 +308,8 @@ impl ZendeskClient {
         async {
             let path = format!("{}/categories.json", help_center_path(locale)?);
             let categories = self.get_paged(&path, "categories").await?;
-            anyhow::Ok(pick_all(
-                &json!({ "categories": categories }),
-                "categories",
+            anyhow::Ok(pick_each(
+                &categories,
                 &[
                     "id",
                     "name",
@@ -331,9 +337,8 @@ impl ZendeskClient {
                 .unwrap_or_default();
             let path = format!("{}{category}/sections.json", help_center_path(locale)?);
             let sections = self.get_paged(&path, "sections").await?;
-            anyhow::Ok(pick_all(
-                &json!({ "sections": sections }),
-                "sections",
+            anyhow::Ok(pick_each(
+                &sections,
                 &[
                     "id",
                     "name",
@@ -361,9 +366,8 @@ impl ZendeskClient {
                     "translations",
                 )
                 .await?;
-            let mut out = pick_all(
-                &json!({ "translations": translations }),
-                "translations",
+            let mut out = pick_each(
+                &translations,
                 &["id", "locale", "title", "html_url", "updated_at"],
                 &[],
             );
@@ -405,6 +409,12 @@ impl ZendeskClient {
 
     /// Updates one locale's `translation` (title, body, draft; needs `locale`) and/or the
     /// article's own `article` fields, then returns the refreshed article.
+    ///
+    /// # Errors
+    ///
+    /// Fails without a request when both maps are empty or `locale` is missing while
+    /// `translation` is set. If the translation is saved but the article update then
+    /// fails, the error says so.
     pub async fn update_article(
         &self,
         article_id: u64,
@@ -562,11 +572,10 @@ mod tests {
     }
 
     fn cursor_articles(items: Value, next: Option<String>) -> ResponseTemplate {
-        ResponseTemplate::new(200).set_body_json(json!({
-            "articles": items,
-            "meta": { "has_more": next.is_some() },
-            "links": { "next": next },
-        }))
+        let mut body = json!({ "meta": { "has_more": next.is_some() } });
+        body["articles"] = items;
+        body["links"]["next"] = next.into();
+        ResponseTemplate::new(200).set_body_json(body)
     }
 
     #[tokio::test]
@@ -823,6 +832,11 @@ mod tests {
         assert_eq!(a["label_names"], json!(["a"]));
         assert_eq!(a["vote_sum"], 3);
         assert!(a.get("result_type").is_none());
+    }
+
+    #[tokio::test]
+    async fn search_articles_rejects_invalid_searches_without_a_request() {
+        let server = MockServer::start().await;
         for bad in [
             ArticleSearch {
                 per_page: 25,
@@ -840,8 +854,9 @@ mod tests {
                 ..Default::default()
             },
         ] {
-            assert!(c.search_articles(&bad).await.is_err());
+            assert!(client(&server).search_articles(&bad).await.is_err());
         }
+        assert!(server.received_requests().await.unwrap().is_empty());
     }
 
     #[tokio::test]

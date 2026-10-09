@@ -1,7 +1,7 @@
 //! Zendesk REST API client.
 //!
-//! Every method returns `serde_json::Value` shaped exactly like the Python server's
-//! output, so MCP clients see no difference after the rewrite.
+//! Every method returns `serde_json::Value` in a stable, trimmed shape that the MCP
+//! server and the CLI rely on and print as is.
 
 use std::collections::HashSet;
 use std::fmt::Display;
@@ -32,6 +32,8 @@ const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 /// Redirects followed per request.
 const MAX_REDIRECTS: usize = 10;
+/// Zendesk's cap on the page size of a listing.
+const MAX_PAGE_SIZE: u64 = 100;
 /// Largest `days_back` accepted by `get_sla_breaches` (100 years).
 const MAX_DAYS_BACK: u64 = 36_500;
 
@@ -40,6 +42,12 @@ const MAX_DAYS_BACK: u64 = 36_500;
 /// CommonMark plus tables and strikethrough; a single newline becomes `<br>` so plain
 /// text keeps its line breaks; raw HTML in the input is passed through for Zendesk to
 /// sanitize server-side, and input that is entirely HTML is returned unchanged.
+///
+/// ```
+/// use zendesk::client::markdown_to_html;
+/// assert_eq!(markdown_to_html("a\nb"), "<p>a<br />\nb</p>\n");
+/// assert_eq!(markdown_to_html("<p>done</p>"), "<p>done</p>");
+/// ```
 pub fn markdown_to_html(text: &str) -> String {
     // ponytail: text that starts with a tag and ends with `>` is taken to be HTML already
     // (e.g. a `get_article` body written back); Markdown that happens to look like that is
@@ -131,6 +139,11 @@ pub(super) fn pick_all(data: &Value, key: &str, keys: &[&str], array_keys: &[&st
         .get(key)
         .and_then(Value::as_array)
         .map_or(&[][..], |a| a);
+    pick_each(items, keys, array_keys)
+}
+
+/// `pick` applied to every element of `items`.
+pub(super) fn pick_each(items: &[Value], keys: &[&str], array_keys: &[&str]) -> Value {
     Value::Array(items.iter().map(|i| pick(i, keys, array_keys)).collect())
 }
 
@@ -652,10 +665,12 @@ impl ZendeskClient {
     ) -> Result<Vec<Value>> {
         let pages = self.get_pages(path, params).await?;
         Ok(pages
-            .iter()
-            .filter_map(|data| data.get(key).and_then(Value::as_array))
+            .into_iter()
+            .filter_map(|mut data| match data.get_mut(key)?.take() {
+                Value::Array(items) => Some(items),
+                _ => None,
+            })
             .flatten()
-            .cloned()
             .collect())
     }
 
@@ -681,7 +696,7 @@ impl ZendeskClient {
         Ok(pages)
     }
 
-    /// One page of a cursor-paginated listing; `page_size` is capped at 100.
+    /// One page of a cursor-paginated listing; `page_size` is capped at Zendesk's page-size limit.
     pub(super) async fn get_cursor_page(
         &self,
         path: &str,
@@ -689,7 +704,7 @@ impl ZendeskClient {
         page_size: u64,
         after: Option<&str>,
     ) -> Result<Value> {
-        let size = page_size.min(100);
+        let size = page_size.min(MAX_PAGE_SIZE);
         let mut all = params.to_vec();
         all.push(("page[size]", &size));
         if let Some(after) = &after {
@@ -709,13 +724,13 @@ impl ZendeskClient {
     ) -> Result<Vec<Value>> {
         let mut items = Vec::new();
         let mut first_params = params.to_vec();
-        first_params.push(("page[size]", &100u64));
+        first_params.push(("page[size]", &MAX_PAGE_SIZE));
         let first = self.url(path, &first_params)?;
         let mut seen = HashSet::from([first.to_string()]);
         let mut data = self.get_url(first).await?;
         loop {
-            if let Some(page) = data.get(key).and_then(Value::as_array) {
-                items.extend(page.iter().cloned());
+            if let Some(page) = data.get_mut(key).and_then(Value::as_array_mut) {
+                items.append(page);
             }
             if items.len() >= max_items {
                 items.truncate(max_items);
@@ -813,7 +828,10 @@ pub(super) mod test_support {
     }
 
     pub fn json_page(items_key: &str, items: Value, next: Option<String>) -> ResponseTemplate {
-        ResponseTemplate::new(200).set_body_json(json!({ items_key: items, "next_page": next }))
+        let mut body = json!({});
+        body[items_key] = items;
+        body["next_page"] = next.into();
+        ResponseTemplate::new(200).set_body_json(body)
     }
 }
 
@@ -1182,11 +1200,10 @@ mod tests {
     }
 
     fn cursor_page(items: Value, next: Option<String>) -> ResponseTemplate {
-        ResponseTemplate::new(200).set_body_json(json!({
-            "things": items,
-            "meta": { "has_more": next.is_some() },
-            "links": { "next": next },
-        }))
+        let mut body = json!({ "meta": { "has_more": next.is_some() } });
+        body["things"] = items;
+        body["links"]["next"] = next.into();
+        ResponseTemplate::new(200).set_body_json(body)
     }
 
     #[tokio::test]

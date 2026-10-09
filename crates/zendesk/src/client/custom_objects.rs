@@ -1,3 +1,5 @@
+//! Custom object schemas and records.
+
 use anyhow::{Context, Result};
 use serde_json::{Map, Value, json};
 
@@ -99,7 +101,7 @@ impl ZendeskClient {
                 params.push(("sort", sort));
             }
             let data = if let Some(filter) = filter {
-                let size = page_size.min(100);
+                let size = page_size.min(MAX_PAGE_SIZE);
                 params.push(("page[size]", &size));
                 if let Some(after) = &after_cursor {
                     params.push(("page[after]", after));

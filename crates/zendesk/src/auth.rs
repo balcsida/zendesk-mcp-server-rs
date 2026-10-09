@@ -11,8 +11,6 @@ use base64::Engine;
 use crate::config::Credentials;
 use crate::oauth::OAuthProvider;
 
-// `OAuth` is the protocol's name, not a stutter of the enum's.
-#[allow(clippy::enum_variant_names)]
 #[derive(Clone)]
 pub enum Auth {
     /// Deprecated email + API token, sent as HTTP Basic.
