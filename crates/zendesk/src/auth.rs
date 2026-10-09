@@ -91,23 +91,23 @@ impl Auth {
     }
 
     /// Build the credential described by the environment, with the subdomain to talk to.
-    pub fn from_credentials(creds: &Credentials, http: &reqwest::Client) -> (String, Auth) {
+    pub fn from_credentials(creds: Credentials, http: &reqwest::Client) -> (String, Auth) {
         match creds {
             Credentials::OAuth { settings } => (
                 settings.subdomain.clone(),
-                Auth::OAuth(Arc::new(OAuthProvider::new(settings.clone(), http.clone()))),
+                Auth::OAuth(Arc::new(OAuthProvider::new(settings, http.clone()))),
             ),
             Credentials::Bearer {
                 subdomain,
                 access_token,
-            } => (subdomain.clone(), Auth::bearer(access_token)),
+            } => (subdomain, Auth::bearer(&access_token)),
             Credentials::ApiToken {
                 subdomain,
                 email,
                 token,
-            } => (subdomain.clone(), Auth::api_token(email, token)),
+            } => (subdomain, Auth::api_token(&email, &token)),
             Credentials::SessionCookie { subdomain, cookie } => {
-                (subdomain.clone(), Auth::session_cookie(cookie))
+                (subdomain, Auth::session_cookie(&cookie))
             }
         }
     }

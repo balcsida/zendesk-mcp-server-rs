@@ -67,16 +67,18 @@ pub struct OAuthSettings {
     pub redirect_uri: String,
 }
 
+/// `https://{subdomain}.zendesk.com`, the account's web origin.
+pub fn origin(subdomain: &str) -> String {
+    format!("https://{subdomain}.zendesk.com")
+}
+
 impl OAuthSettings {
     pub fn token_endpoint(&self) -> String {
-        format!("https://{}.zendesk.com/oauth/tokens", self.subdomain)
+        format!("{}/oauth/tokens", origin(&self.subdomain))
     }
 
     pub fn authorize_endpoint(&self) -> String {
-        format!(
-            "https://{}.zendesk.com/oauth/authorizations/new",
-            self.subdomain
-        )
+        format!("{}/oauth/authorizations/new", origin(&self.subdomain))
     }
 }
 

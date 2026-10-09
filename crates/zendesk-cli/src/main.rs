@@ -270,7 +270,7 @@ fn print_json(value: &Value) -> Result<()> {
 /// The configured credentials, else the saved (or freshly signed-in) mobile token.
 async fn resolve_auth(http: &reqwest::Client, mobile: bool) -> Result<(String, Auth)> {
     if !mobile && let Some(creds) = config::load_credentials()? {
-        return Ok(Auth::from_credentials(&creds, http));
+        return Ok(Auth::from_credentials(creds, http));
     }
     let subdomain = config::load_subdomain().ok();
     let token = mobile_auth::ensure_auth(&login_client()?, subdomain.as_deref()).await?;

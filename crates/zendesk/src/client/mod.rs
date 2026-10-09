@@ -7,7 +7,7 @@ use std::collections::HashSet;
 use std::fmt::Display;
 use std::time::Duration;
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
 use pulldown_cmark::{Event, Options, Parser, html};
 use serde_json::{Map, Value, json};
@@ -250,11 +250,6 @@ pub(super) fn job_summary(job: &Value) -> Value {
     out
 }
 
-/// Prefix an error the way the Python server worded it.
-pub(super) fn ctx(prefix: impl Display) -> impl FnOnce(anyhow::Error) -> anyhow::Error {
-    move |e| anyhow!("{prefix}: {e:#}")
-}
-
 /// Read a response body, failing once more than `max` bytes have arrived. The reqwest
 /// error is stripped of its URL, which carries search terms and cursors.
 async fn read_body(mut resp: reqwest::Response, max: usize) -> Result<Vec<u8>> {
@@ -325,9 +320,22 @@ pub fn redirect_policy() -> reqwest::redirect::Policy {
     })
 }
 
+/// A non-success HTTP status from Zendesk. Reach it with `err.downcast_ref::<ApiError>()`.
+#[derive(Debug, thiserror::Error)]
+#[error("Zendesk API error HTTP {status} for {label}: {body}")]
+pub struct ApiError {
+    pub status: reqwest::StatusCode,
+    pub label: String,
+    /// The first 500 characters of the response body.
+    pub body: String,
+}
+
 pub(super) fn status_error(status: reqwest::StatusCode, label: &str, body: &[u8]) -> anyhow::Error {
-    let text: String = String::from_utf8_lossy(body).chars().take(500).collect();
-    anyhow!("Zendesk API error HTTP {status} for {label}: {text}")
+    anyhow::Error::new(ApiError {
+        status,
+        label: label.to_owned(),
+        body: String::from_utf8_lossy(body).chars().take(500).collect(),
+    })
 }
 
 /// A path segment that came from the model or from Zendesk: percent-encode everything but
@@ -363,7 +371,7 @@ impl ZendeskClient {
     }
 
     pub fn new(subdomain: &str, auth: Auth, http: reqwest::Client) -> Self {
-        let base_url = format!("https://{subdomain}.zendesk.com/api/v2");
+        let base_url = format!("{}/api/v2", crate::config::origin(subdomain));
         Self::with_base_url(subdomain, auth, http, base_url)
     }
 
@@ -729,10 +737,10 @@ impl ZendeskClient {
             let data = self
                 .api_get(&format!("job_statuses/{}.json", segment(job_id)?), &[])
                 .await?;
-            Ok(job_summary(object(&data, "job_status")?))
+            anyhow::Ok(job_summary(object(&data, "job_status")?))
         }
         .await
-        .map_err(ctx(format!("Failed to get job status {job_id}")))
+        .with_context(|| format!("Failed to get job status {job_id}"))
     }
 
     /// Poll the job in a Zendesk response (`{"job_status": {...}}`) every
@@ -825,10 +833,71 @@ mod tests {
             )
             .mount(&server)
             .await;
-        let err = client(&server).get_ticket(1).await.unwrap_err().to_string();
+        let err = client(&server).get_ticket(1).await.unwrap_err();
+        let err = format!("{err:#}");
         assert!(err.contains("Failed to get ticket 1: "), "{err}");
         assert!(err.contains("HTTP 401"), "{err}");
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn client_errors_keep_the_api_error_type() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("missing"))
+            .mount(&server)
+            .await;
+        let err = client(&server).get_ticket(1).await.unwrap_err();
+        let api = err.downcast_ref::<ApiError>().expect("ApiError");
+        assert_eq!(api.status, reqwest::StatusCode::NOT_FOUND);
+        assert_eq!(api.body, "missing");
+    }
+
+    #[tokio::test]
+    async fn client_errors_keep_the_reauth_required_type() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let settings = crate::config::OAuthSettings {
+            subdomain: "acme".into(),
+            client_id: "cid".into(),
+            token_file: dir.path().join("tokens.json"),
+            scopes: "tickets:read".into(),
+            redirect_uri: "http://localhost:4567/callback".into(),
+        };
+        let store = crate::tokens::TokenStore::new(settings.token_file.clone());
+        store
+            .save(&crate::tokens::TokenSet {
+                access_token: "old".into(),
+                refresh_token: None,
+                expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+                refresh_token_expires_at: None,
+                subdomain: "acme".into(),
+                client_id: "cid".into(),
+                scope: None,
+            })
+            .unwrap();
+        let provider =
+            crate::oauth::OAuthProvider::with_store(settings, store, reqwest::Client::new());
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(401).set_body_json(json!({"error": "invalid_token"})),
+            )
+            .mount(&server)
+            .await;
+        let client = ZendeskClient::with_base_url(
+            "acme",
+            Auth::OAuth(std::sync::Arc::new(provider)),
+            reqwest::Client::new(),
+            format!("{}/api/v2", server.uri()),
+        );
+        let err = client.get_current_user().await.unwrap_err();
+        assert!(
+            matches!(
+                err.downcast_ref::<crate::oauth::ReauthRequired>(),
+                Some(crate::oauth::ReauthRequired::CannotRefresh { .. })
+            ),
+            "{err:#}"
+        );
     }
 
     #[tokio::test]
@@ -838,7 +907,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(403).set_body_string("nope scope"))
             .mount(&server)
             .await;
-        let err = client(&server).list_views().await.unwrap_err().to_string();
+        let err = format!("{:#}", client(&server).list_views().await.unwrap_err());
         assert!(
             err.contains("HTTP 403 Forbidden for GET /api/v2/views.json: nope scope"),
             "{err}"
@@ -1007,8 +1076,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            err.to_string()
-                .contains("next_page link on another host: evil.example"),
+            format!("{err:#}").contains("next_page link on another host: evil.example"),
             "{err}"
         );
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
@@ -1036,8 +1104,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            err.to_string()
-                .contains("Zendesk pagination returned a page it already returned"),
+            format!("{err:#}").contains("Zendesk pagination returned a page it already returned"),
             "{err}"
         );
     }

@@ -157,14 +157,14 @@ mod workflows;
 impl ZendeskServer {
     /// A server acting with its own Zendesk login, described by `credentials`.
     pub fn new(credentials: Credentials, http: reqwest::Client) -> Self {
-        let (subdomain, auth) = Auth::from_credentials(&credentials, &http);
+        let (subdomain, auth) = Auth::from_credentials(credentials, &http);
         let client = Arc::new(ZendeskClient::new(&subdomain, auth, http.clone()));
         Self::with_login(Login::Shared(client), http)
     }
 
     /// A server acting as each caller, with the Zendesk token their request carries.
     pub fn per_user(subdomain: String, http: reqwest::Client) -> Self {
-        let base_url = format!("https://{subdomain}.zendesk.com/api/v2");
+        let base_url = format!("{}/api/v2", zendesk::config::origin(&subdomain));
         Self::with_login(
             Login::PerUser {
                 subdomain,

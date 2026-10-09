@@ -266,7 +266,7 @@ fn save_token_to(token: &MobileToken, path: &Path) -> Result<()> {
 }
 
 fn zendesk_base(subdomain: &str) -> String {
-    format!("https://{subdomain}.zendesk.com")
+    zendesk::config::origin(subdomain)
 }
 
 /// GET `/api/v2/users/me.json` with the token: the `user` object on 200, else `None`.
@@ -997,7 +997,7 @@ pub async fn auth_via_browser(
     let auth_url = if service == Some("zendesk") {
         Some(match login.get("url").and_then(Value::as_str) {
             Some(url) => url.to_string(),
-            None => format!("https://{subdomain}.zendesk.com/access/oauth_mobile"),
+            None => format!("{}/access/oauth_mobile", zendesk::config::origin(subdomain)),
         })
     } else {
         text("zendesk_url")

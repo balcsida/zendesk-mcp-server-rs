@@ -1,6 +1,6 @@
 use std::collections::{BTreeSet, HashMap};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use serde_json::{Map, Value, json};
 
 use super::*;
@@ -124,10 +124,10 @@ impl ZendeskClient {
                     }),
                 );
             }
-            Ok((Value::Object(kb), truncated))
+            anyhow::Ok((Value::Object(kb), truncated))
         }
         .await
-        .map_err(ctx("Failed to fetch knowledge base"))
+        .context("Failed to fetch knowledge base")
     }
 
     /// Search is capped by Zendesk at 1,000 results. Needs a query, category, section or
@@ -229,7 +229,7 @@ impl ZendeskClient {
                 article["label_names"] = raw.get("label_names").cloned().unwrap_or(json!([]));
             }
             let count = articles.as_array().map_or(0, Vec::len);
-            Ok(json!({
+            anyhow::Ok(json!({
                 "articles": articles,
                 "query": query,
                 "page": page,
@@ -240,7 +240,7 @@ impl ZendeskClient {
             }))
         }
         .await
-        .map_err(ctx("Failed to search articles"))
+        .context("Failed to search articles")
     }
 
     /// One page of articles, from the whole help center or one section, without bodies.
@@ -274,7 +274,7 @@ impl ZendeskClient {
                 &[],
             );
             let count = articles.as_array().map_or(0, Vec::len);
-            Ok(json!({
+            anyhow::Ok(json!({
                 "articles": articles,
                 "page": page,
                 "per_page": per_page,
@@ -284,24 +284,24 @@ impl ZendeskClient {
             }))
         }
         .await
-        .map_err(ctx("Failed to list articles"))
+        .context("Failed to list articles")
     }
 
     pub async fn get_article(&self, article_id: u64, locale: Option<&str>) -> Result<Value> {
         async {
             let path = format!("{}/articles/{article_id}.json", help_center_path(locale)?);
             let data = self.api_get(&path, &[]).await?;
-            Ok(article_detail(object(&data, "article")?))
+            anyhow::Ok(article_detail(object(&data, "article")?))
         }
         .await
-        .map_err(ctx(format!("Failed to get article {article_id}")))
+        .with_context(|| format!("Failed to get article {article_id}"))
     }
 
     pub async fn list_categories(&self, locale: Option<&str>) -> Result<Value> {
         async {
             let path = format!("{}/categories.json", help_center_path(locale)?);
             let categories = self.get_paged(&path, "categories").await?;
-            Ok(pick_all(
+            anyhow::Ok(pick_all(
                 &json!({ "categories": categories }),
                 "categories",
                 &[
@@ -317,7 +317,7 @@ impl ZendeskClient {
             ))
         }
         .await
-        .map_err(ctx("Failed to list categories"))
+        .context("Failed to list categories")
     }
 
     pub async fn list_sections(
@@ -331,7 +331,7 @@ impl ZendeskClient {
                 .unwrap_or_default();
             let path = format!("{}{category}/sections.json", help_center_path(locale)?);
             let sections = self.get_paged(&path, "sections").await?;
-            Ok(pick_all(
+            anyhow::Ok(pick_all(
                 &json!({ "sections": sections }),
                 "sections",
                 &[
@@ -349,7 +349,7 @@ impl ZendeskClient {
             ))
         }
         .await
-        .map_err(ctx("Failed to list sections"))
+        .context("Failed to list sections")
     }
 
     /// Every locale version of an article, without bodies.
@@ -372,12 +372,10 @@ impl ZendeskClient {
                     t[key] = raw.get(key).cloned().unwrap_or(json!(false));
                 }
             }
-            Ok(out)
+            anyhow::Ok(out)
         }
         .await
-        .map_err(ctx(format!(
-            "Failed to list translations of article {article_id}"
-        )))
+        .with_context(|| format!("Failed to list translations of article {article_id}"))
     }
 
     /// Creates an article in `section_id`. `article` holds the article fields; a Markdown
@@ -399,12 +397,10 @@ impl ZendeskClient {
                     &json!({"article": article, "notify_subscribers": notify_subscribers}),
                 )
                 .await?;
-            Ok(article_detail(object(&data, "article")?))
+            anyhow::Ok(article_detail(object(&data, "article")?))
         }
         .await
-        .map_err(ctx(format!(
-            "Failed to create article in section {section_id}"
-        )))
+        .with_context(|| format!("Failed to create article in section {section_id}"))
     }
 
     /// Updates one locale's `translation` (title, body, draft; needs `locale`) and/or the
@@ -429,6 +425,7 @@ impl ZendeskClient {
             if let Some(body) = translation.get("body").and_then(Value::as_str) {
                 translation.insert("body".into(), markdown_to_html(body).into());
             }
+            let mut translated = false;
             if let Some(locale) = locale
                 && !translation.is_empty()
             {
@@ -438,18 +435,26 @@ impl ZendeskClient {
                 );
                 self.api_put(&path, &json!({ "translation": translation }))
                     .await?;
+                translated = true;
             }
             if !article.is_empty() {
                 self.api_put(
                     &format!("help_center/articles/{article_id}.json"),
                     &json!({ "article": article }),
                 )
-                .await?;
+                .await
+                .map_err(|e| {
+                    if translated {
+                        e.context("the translation was updated, but updating the article failed")
+                    } else {
+                        e
+                    }
+                })?;
             }
             self.get_article(article_id, locale).await
         }
         .await
-        .map_err(ctx(format!("Failed to update article {article_id}")))
+        .with_context(|| format!("Failed to update article {article_id}"))
     }
 }
 
@@ -741,12 +746,43 @@ mod tests {
             .update_article(9, None, map(json!({"title": "x"})), Map::new())
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("locale is required"), "{err}");
+        assert!(format!("{err:#}").contains("locale is required"), "{err}");
         let err = c
             .update_article(9, Some("fr"), Map::new(), Map::new())
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("Nothing to update"), "{err}");
+        assert!(format!("{err:#}").contains("Nothing to update"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn update_article_says_when_only_the_translation_was_written() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/api/v2/help_center/articles/9/translations/fr.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"translation": {}})))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/api/v2/help_center/articles/9.json"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+        let map = |v: Value| v.as_object().unwrap().clone();
+        let err = client(&server)
+            .update_article(
+                9,
+                Some("fr"),
+                map(json!({"title": "New"})),
+                map(json!({"promoted": true})),
+            )
+            .await
+            .unwrap_err();
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("the translation was updated, but updating the article failed"),
+            "{text}"
+        );
+        assert!(text.contains("HTTP 500"), "{text}");
     }
 
     #[tokio::test]
@@ -816,7 +852,7 @@ mod tests {
             .mount(&server)
             .await;
         let err = client(&server).get_article(1, None).await.unwrap_err();
-        assert!(err.to_string().contains("no 'article' object"), "{err}");
+        assert!(format!("{err:#}").contains("no 'article' object"), "{err}");
     }
 
     #[tokio::test]

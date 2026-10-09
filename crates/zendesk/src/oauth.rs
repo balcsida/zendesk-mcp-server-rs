@@ -8,7 +8,9 @@
 //! carries their identity and Zendesk applies the same role, group and ticket
 //! permissions it applies in the UI.
 
-use anyhow::{Result, anyhow, bail};
+use std::path::PathBuf;
+
+use anyhow::{Result, anyhow};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::Utc;
@@ -103,17 +105,45 @@ async fn post_token_request(
     })
 }
 
+/// What to tell the operator when only signing in again helps.
+pub const REAUTH_HINT: &str = "Run zendesk-mcp-server auth (or zendesk auth) to authorize again.";
+
 /// The stored login cannot be renewed; only signing in again helps.
-#[derive(Debug)]
-pub struct ReauthRequired(pub String);
-
-impl std::fmt::Display for ReauthRequired {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
+#[derive(Debug, thiserror::Error)]
+pub enum ReauthRequired {
+    /// Zendesk answered `invalid_grant` to a code exchange or refresh.
+    #[error(
+        "{message}\nThe authorization code or refresh token is expired, revoked or already used. {hint}",
+        hint = REAUTH_HINT
+    )]
+    InvalidGrant { message: String },
+    /// The stored tokens were issued for another subdomain or client than the configured ones.
+    #[error(
+        "The stored Zendesk tokens were issued for subdomain {stored_subdomain} and client \
+         {stored_client}, not the configured {subdomain} and {client}. {hint} Or point \
+         ZENDESK_TOKEN_FILE at the right file.",
+        hint = REAUTH_HINT
+    )]
+    WrongAccount {
+        stored_subdomain: String,
+        stored_client: String,
+        subdomain: String,
+        client: String,
+    },
+    /// There is no usable refresh token, so the access token cannot be renewed.
+    #[error("{reason} {hint}", hint = REAUTH_HINT)]
+    CannotRefresh { reason: String },
+    /// The token file does not exist.
+    #[error("No Zendesk OAuth tokens found at {}. {hint}", .path.display(), hint = REAUTH_HINT)]
+    NoTokens { path: PathBuf },
+    /// The token file exists but cannot be parsed.
+    #[error(
+        "Token store at {} is not valid JSON or is missing a field ({detail}). {hint}",
+        .path.display(),
+        hint = REAUTH_HINT
+    )]
+    CorruptTokens { path: PathBuf, detail: String },
 }
-
-impl std::error::Error for ReauthRequired {}
 
 /// Translate an error body into an error, without echoing credentials.
 fn token_error(status: u16, body: &[u8]) -> anyhow::Error {
@@ -133,10 +163,7 @@ fn token_error(status: u16, body: &[u8]) -> anyhow::Error {
     };
     let message = format!("Zendesk rejected the token request (HTTP {status}). {detail}");
     match error {
-        Some("invalid_grant") => anyhow::Error::new(ReauthRequired(format!(
-            "{message}\nThe authorization code or refresh token is expired, revoked or already \
-             used. Run zendesk-mcp-server auth (or zendesk auth) to authorize again."
-        ))),
+        Some("invalid_grant") => anyhow::Error::new(ReauthRequired::InvalidGrant { message }),
         Some("invalid_scope") => anyhow!(
             "{message}\nThe requested scopes exceed the OAuth client's allowed scopes. Widen \
              them in Admin Center or narrow ZENDESK_OAUTH_SCOPES."
@@ -205,10 +232,9 @@ async fn refresh_at(
     tokens: &TokenSet,
 ) -> Result<TokenSet> {
     let Some(refresh_token) = tokens.refresh_token.as_deref() else {
-        bail!(
-            "No refresh token is stored, so the access token cannot be renewed. Run \
-             zendesk-mcp-server auth (or zendesk auth) to authorize again."
-        );
+        return Err(anyhow::Error::new(ReauthRequired::CannotRefresh {
+            reason: "No refresh token is stored, so the access token cannot be renewed.".into(),
+        }));
     };
     let issued_at = Utc::now();
     let access_ttl = ACCESS_TOKEN_TTL_SECONDS.to_string();
@@ -299,15 +325,12 @@ impl OAuthProvider {
         if tokens.subdomain != self.settings.subdomain
             || tokens.client_id != self.settings.client_id
         {
-            return Err(anyhow::Error::new(ReauthRequired(format!(
-                "The stored Zendesk tokens were issued for subdomain {} and client {}, \
-                 not the configured {} and {}. Run zendesk-mcp-server auth (or zendesk auth) \
-                 to authorize the configured account, or point ZENDESK_TOKEN_FILE at the right file.",
-                tokens.subdomain,
-                tokens.client_id,
-                self.settings.subdomain,
-                self.settings.client_id
-            ))));
+            return Err(anyhow::Error::new(ReauthRequired::WrongAccount {
+                stored_subdomain: tokens.subdomain.clone(),
+                stored_client: tokens.client_id.clone(),
+                subdomain: self.settings.subdomain.clone(),
+                client: self.settings.client_id.clone(),
+            }));
         }
         Ok(())
     }
@@ -373,10 +396,11 @@ impl OAuthProvider {
             return Ok(stored);
         }
         if !stored.can_refresh() {
-            return Err(anyhow::Error::new(ReauthRequired(format!(
-                "The Zendesk refresh token is missing or expired, so access cannot be renewed \
-                 ({reason}). Run zendesk-mcp-server auth (or zendesk auth) to authorize this machine again."
-            ))));
+            return Err(anyhow::Error::new(ReauthRequired::CannotRefresh {
+                reason: format!(
+                    "The Zendesk refresh token is missing or expired, so access cannot be renewed ({reason})."
+                ),
+            }));
         }
 
         tracing::info!("Renewing the Zendesk access token because {reason}.");

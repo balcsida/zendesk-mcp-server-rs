@@ -123,7 +123,7 @@ impl SignIn {
         let Some(Credentials::OAuth { settings }) = config::load_credentials()? else {
             bail!(NEEDS_OAUTH);
         };
-        let zendesk = format!("https://{}.zendesk.com", settings.subdomain);
+        let zendesk = config::origin(&settings.subdomain);
         let sign_in = SignIn::new(public, settings, zendesk, http);
         tracing::info!("Zendesk logins are kept in {}", sign_in.grants().display());
         sign_in.sweep_grants();
@@ -632,7 +632,7 @@ async fn authorize_paste(
             let reason = if err.is::<ReauthRequired>() {
                 "Zendesk did not accept the code: it expired (codes last 2 minutes) or was already used.".to_string()
             } else {
-                format!("Signing in to Zendesk failed: {err}.")
+                format!("Signing in to Zendesk failed: {err:#}.")
             };
             return error_page(StatusCode::BAD_REQUEST, &format!("{reason} {next}"));
         }
@@ -786,7 +786,7 @@ async fn cli_login_finish(
             let reason = if err.is::<ReauthRequired>() {
                 "Zendesk did not accept the code: it expired (codes last 2 minutes) or was already used.".to_string()
             } else {
-                format!("Signing in to Zendesk failed: {err}.")
+                format!("Signing in to Zendesk failed: {err:#}.")
             };
             return bad_request("invalid_grant", &format!("{reason} {next}"));
         }

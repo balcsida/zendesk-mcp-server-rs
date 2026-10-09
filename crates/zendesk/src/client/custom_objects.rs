@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde_json::{Map, Value, json};
 
 use super::*;
@@ -50,10 +50,10 @@ impl ZendeskClient {
     pub async fn list_custom_objects(&self) -> Result<Value> {
         async {
             let data = self.api_get("custom_objects.json", &[]).await?;
-            Ok(pick_all(&data, "custom_objects", &OBJECT_KEYS, &[]))
+            anyhow::Ok(pick_all(&data, "custom_objects", &OBJECT_KEYS, &[]))
         }
         .await
-        .map_err(ctx("Failed to list custom objects"))
+        .context("Failed to list custom objects")
     }
 
     pub async fn get_custom_object(&self, key: &str) -> Result<Value> {
@@ -68,13 +68,13 @@ impl ZendeskClient {
                     "custom_object_fields",
                 )
                 .await?;
-            Ok(json!({
+            anyhow::Ok(json!({
                 "object": pick(object(&data, "custom_object")?, &OBJECT_KEYS, &[]),
                 "fields": fields.iter().map(field_detail).collect::<Vec<_>>(),
             }))
         }
         .await
-        .map_err(ctx(format!("Failed to get custom object {key}")))
+        .with_context(|| format!("Failed to get custom object {key}"))
     }
 
     /// One cursor page of records. Without `query` and `filter` this lists the records;
@@ -128,12 +128,10 @@ impl ZendeskClient {
             if let Some(count) = data.get("count").filter(|c| !c.is_null()) {
                 out["count"] = count.clone();
             }
-            Ok(out)
+            anyhow::Ok(out)
         }
         .await
-        .map_err(ctx(format!(
-            "Failed to search records of custom object {key}"
-        )))
+        .with_context(|| format!("Failed to search records of custom object {key}"))
     }
 
     pub async fn get_custom_object_record(&self, key: &str, record_id: &str) -> Result<Value> {
@@ -144,16 +142,14 @@ impl ZendeskClient {
                 segment(record_id)?
             );
             let data = self.api_get(&path, &[]).await?;
-            Ok(pick(
+            anyhow::Ok(pick(
                 object(&data, "custom_object_record")?,
                 &RECORD_KEYS,
                 &[],
             ))
         }
         .await
-        .map_err(ctx(format!(
-            "Failed to get record {record_id} of custom object {key}"
-        )))
+        .with_context(|| format!("Failed to get record {record_id} of custom object {key}"))
     }
 }
 
