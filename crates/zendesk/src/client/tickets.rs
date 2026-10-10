@@ -1,4 +1,6 @@
-use anyhow::{Result, anyhow, bail};
+//! Tickets: reading, searching, creating and updating, comments and attachments.
+
+use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Map, Value, json};
 
 use super::*;
@@ -89,10 +91,10 @@ impl ZendeskClient {
                         .cloned()
                 });
             out["group_name"] = group_name.unwrap_or(Value::Null);
-            Ok(out)
+            anyhow::Ok(out)
         }
         .await
-        .map_err(ctx(format!("Failed to get ticket {ticket_id}")))
+        .with_context(|| format!("Failed to get ticket {ticket_id}"))
     }
 
     /// `sort_order` must be `asc` or `desc`.
@@ -141,14 +143,19 @@ impl ZendeskClient {
                 }
                 out
             });
-            Ok(Value::Array(out.collect()))
+            anyhow::Ok(Value::Array(out.collect()))
         }
         .await
-        .map_err(ctx(format!(
-            "Failed to get comments for ticket {ticket_id}"
-        )))
+        .with_context(|| format!("Failed to get comments for ticket {ticket_id}"))
     }
 
+    /// Fetches an attachment as an allowed image type, at most [`MAX_ATTACHMENT_BYTES`].
+    ///
+    /// # Errors
+    ///
+    /// Fails when `content_url` is not an https URL without credentials on the account's
+    /// `/attachments/` route or a `*.zdusercontent.com` host, or the response is not an
+    /// allowed image type or exceeds the size cap.
     pub async fn get_ticket_attachment(&self, content_url: &str) -> Result<Attachment> {
         let (url, send_credentials) = self.validate_attachment_url(content_url)?;
         self.fetch_attachment(url, send_credentials).await
@@ -185,9 +192,10 @@ impl ZendeskClient {
     }
 
     async fn fetch_attachment(&self, url: url::Url, send_credentials: bool) -> Result<Attachment> {
-        // Zendesk attachment URLs redirect to the zdusercontent.com CDN. reqwest follows
-        // redirects by default and strips Authorization and Cookie when the host changes,
-        // which the CDN requires (it answers 403 to a request carrying credentials).
+        // Zendesk attachment URLs redirect to the zdusercontent.com CDN. `redirect_policy`
+        // follows redirects only over https to Zendesk hosts, and reqwest strips
+        // Authorization and Cookie when the host changes, which the CDN requires (it
+        // answers 403 to a request carrying credentials).
         let mut resp = if send_credentials {
             self.send(|| self.http.get(url.clone())).await?
         } else {
@@ -271,14 +279,19 @@ impl ZendeskClient {
             if let Some(status) = status {
                 out["status"] = json!(status);
             }
-            Ok(out)
+            anyhow::Ok(out)
         }
         .await
-        .map_err(ctx(format!("Failed to post comment on ticket {ticket_id}")))
+        .with_context(|| format!("Failed to post comment on ticket {ticket_id}"))
     }
 
     /// Uploads a file for attaching to a comment; returns the token (valid for 60 minutes)
     /// to pass as `upload_tokens`.
+    ///
+    /// # Errors
+    ///
+    /// Fails without a request when `filename` or `content_type` is empty, or the data is
+    /// not valid base64, is empty, or exceeds [`MAX_ATTACHMENT_BYTES`] once decoded.
     pub async fn upload_attachment(
         &self,
         filename: &str,
@@ -316,7 +329,7 @@ impl ZendeskClient {
                 )
                 .await?;
             let upload = object(&data, "upload")?;
-            Ok(json!({
+            anyhow::Ok(json!({
                 "token": upload["token"],
                 "attachment": pick(
                     &upload["attachment"],
@@ -326,7 +339,7 @@ impl ZendeskClient {
             }))
         }
         .await
-        .map_err(ctx("Failed to upload attachment"))
+        .context("Failed to upload attachment")
     }
 
     pub async fn get_tickets(
@@ -337,7 +350,7 @@ impl ZendeskClient {
         sort_order: &str,
     ) -> Result<Value> {
         async {
-            let per_page = per_page.min(100);
+            let per_page = per_page.min(MAX_PAGE_SIZE);
             let data = self
                 .api_get(
                     "tickets.json",
@@ -353,7 +366,7 @@ impl ZendeskClient {
             let tickets = ticket_rows(&data);
             let has_next = !data["next_page"].is_null();
             let has_previous = !data["previous_page"].is_null() && page > 1;
-            Ok(json!({
+            anyhow::Ok(json!({
                 "count": tickets.len(),
                 "tickets": tickets,
                 "page": page,
@@ -366,9 +379,14 @@ impl ZendeskClient {
             }))
         }
         .await
-        .map_err(ctx("Failed to get latest tickets"))
+        .context("Failed to get latest tickets")
     }
 
+    /// Creates a ticket and returns it in the shape `update_ticket` uses.
+    ///
+    /// # Errors
+    ///
+    /// Fails without a request when both `requester` and `requester_id` are given.
     pub async fn create_ticket(&self, ticket: CreateTicket) -> Result<Value> {
         async {
             if ticket.requester.is_some() && ticket.requester_id.is_some() {
@@ -423,12 +441,17 @@ impl ZendeskClient {
             full_ticket(&data)
         }
         .await
-        .map_err(ctx("Failed to create ticket"))
+        .context("Failed to create ticket")
     }
 
     /// `fields` are the ticket attributes to set (subject, status, priority, type,
     /// assignee_id, requester_id, tags, custom_fields, due_at, ...). Null values are skipped.
     /// `safe_update: true` requires `updated_stamp`; Zendesk answers 409 on a collision.
+    ///
+    /// # Errors
+    ///
+    /// Fails without a request when no non-null field is given, an `email_ccs` entry has
+    /// neither `user_id` nor `user_email`, or `safe_update` is set without `updated_stamp`.
     pub async fn update_ticket(&self, ticket_id: u64, fields: Map<String, Value>) -> Result<Value> {
         async {
             let fields: Map<String, Value> =
@@ -457,7 +480,7 @@ impl ZendeskClient {
             full_ticket(&data)
         }
         .await
-        .map_err(ctx(format!("Failed to update ticket {ticket_id}")))
+        .with_context(|| format!("Failed to update ticket {ticket_id}"))
     }
 
     pub async fn search(
@@ -469,7 +492,7 @@ impl ZendeskClient {
         sort_order: &str,
     ) -> Result<Value> {
         async {
-            let per_page = per_page.min(100);
+            let per_page = per_page.min(MAX_PAGE_SIZE);
             let mut params: Vec<(&str, &(dyn Display + Sync))> = vec![
                 ("query", &query),
                 ("page", &page),
@@ -483,10 +506,9 @@ impl ZendeskClient {
             }
             let data = self.api_get("search.json", &params).await?;
             let names = side_loaded_user_names(&data);
-            let results = data
-                .get("results")
-                .and_then(Value::as_array)
-                .map(|results| {
+            let results = data.get("results").and_then(Value::as_array).map_or_else(
+                || json!([]),
+                |results| {
                     results
                         .iter()
                         .map(|r| match r.get("result_type").and_then(Value::as_str) {
@@ -494,18 +516,18 @@ impl ZendeskClient {
                             _ => r.clone(),
                         })
                         .collect()
-                })
-                .unwrap_or_else(|| json!([]));
-            Ok(json!({
+                },
+            );
+            anyhow::Ok(json!({
                 "results": results,
-                "count": data.get("count").cloned().unwrap_or(json!(0)),
+                "count": data.get("count").cloned().unwrap_or_else(|| json!(0)),
                 "page": page,
                 "per_page": per_page,
                 "has_more": !data["next_page"].is_null(),
             }))
         }
         .await
-        .map_err(ctx("Search failed"))
+        .context("Search failed")
     }
 
     /// Every ticket matching `query`, instead of one page like `search`. Zendesk search
@@ -528,7 +550,7 @@ impl ZendeskClient {
                         &[
                             ("query", &query),
                             ("page", &page),
-                            ("per_page", &100u64),
+                            ("per_page", &MAX_PAGE_SIZE),
                             ("sort_by", &sort_by),
                             ("sort_order", &sort_order),
                             ("include", &"tickets(users)"),
@@ -549,10 +571,12 @@ impl ZendeskClient {
                     break;
                 }
             }
-            Ok(json!({ "count": tickets.len(), "truncated": truncated, "tickets": tickets }))
+            anyhow::Ok(
+                json!({ "count": tickets.len(), "truncated": truncated, "tickets": tickets }),
+            )
         }
         .await
-        .map_err(ctx("Search failed"))
+        .context("Search failed")
     }
 
     /// Fetches in chunks of 100 ids, the `show_many` limit.
@@ -575,14 +599,19 @@ impl ZendeskClient {
                     tickets.extend(page);
                 }
             }
-            Ok(Value::Array(tickets))
+            anyhow::Ok(Value::Array(tickets))
         }
         .await
-        .map_err(ctx("Bulk ticket fetch failed"))
+        .context("Bulk ticket fetch failed")
     }
 
     /// Merges and waits up to 20 seconds for Zendesk's background job; returns its
     /// trimmed status (`pending` is true if the merge is still running).
+    ///
+    /// # Errors
+    ///
+    /// Fails without a request when `source_ids` is empty, has more than 100 entries or a
+    /// duplicate, or contains `target_id`.
     pub async fn merge_tickets(
         &self,
         target_id: u64,
@@ -622,7 +651,7 @@ impl ZendeskClient {
             self.wait_for_job(&job, Duration::from_secs(20)).await
         }
         .await
-        .map_err(ctx(format!("Failed to merge tickets into {target_id}")))
+        .with_context(|| format!("Failed to merge tickets into {target_id}"))
     }
 
     /// `role` must be one of `requested`, `assigned`, `ccd`, `followed`.
@@ -639,7 +668,7 @@ impl ZendeskClient {
                     "Invalid role '{role}'. Allowed: [\"assigned\", \"ccd\", \"followed\", \"requested\"]"
                 );
             }
-            let per_page = per_page.min(100);
+            let per_page = per_page.min(MAX_PAGE_SIZE);
             let data = self
                 .api_get(
                     &format!("users/{user_id}/tickets/{role}.json"),
@@ -652,20 +681,20 @@ impl ZendeskClient {
                 &["id", "subject", "status", "priority", "created_at", "updated_at"],
                 &[],
             );
-            Ok(json!({
+            anyhow::Ok(json!({
                 "count": tickets.as_array().map_or(0, Vec::len),
                 "tickets": tickets,
                 "has_more": !data["next_page"].is_null(),
             }))
         }
         .await
-        .map_err(ctx(format!("Failed to get tickets for user {user_id}")))
+        .with_context(|| format!("Failed to get tickets for user {user_id}"))
     }
 
     pub async fn delete_ticket(&self, ticket_id: u64) -> Result<()> {
         self.api_delete(&format!("tickets/{ticket_id}.json"))
             .await
-            .map_err(ctx(format!("Failed to delete ticket {ticket_id}")))
+            .with_context(|| format!("Failed to delete ticket {ticket_id}"))
     }
 
     pub async fn get_ticket_metrics(&self, ticket_id: u64) -> Result<Value> {
@@ -673,10 +702,10 @@ impl ZendeskClient {
             let data = self
                 .api_get(&format!("tickets/{ticket_id}/metrics.json"), &[])
                 .await?;
-            Ok(object(&data, "ticket_metric")?.clone())
+            anyhow::Ok(object(&data, "ticket_metric")?.clone())
         }
         .await
-        .map_err(ctx(format!("Failed to get metrics for ticket {ticket_id}")))
+        .with_context(|| format!("Failed to get metrics for ticket {ticket_id}"))
     }
 
     /// `events` are trimmed to the fields relevant across event types: `type`, `body`,
@@ -722,10 +751,10 @@ impl ZendeskClient {
                     out
                 })
                 .collect();
-            Ok(json!({ "count": audits.len(), "audits": audits }))
+            anyhow::Ok(json!({ "count": audits.len(), "audits": audits }))
         }
         .await
-        .map_err(ctx(format!("Failed to get audits for ticket {ticket_id}")))
+        .with_context(|| format!("Failed to get audits for ticket {ticket_id}"))
     }
 
     /// Incident tickets linked to a problem ticket (`GET /tickets/{ticket_id}/incidents.json`).
@@ -738,12 +767,10 @@ impl ZendeskClient {
                 .iter()
                 .map(|t| pick(t, &TICKET_SUMMARY_KEYS, &[]))
                 .collect::<Vec<_>>();
-            Ok(json!({ "count": incidents.len(), "incidents": incidents }))
+            anyhow::Ok(json!({ "count": incidents.len(), "incidents": incidents }))
         }
         .await
-        .map_err(ctx(format!(
-            "Failed to get linked incidents for ticket {ticket_id}"
-        )))
+        .with_context(|| format!("Failed to get linked incidents for ticket {ticket_id}"))
     }
 
     /// Size a result set with `search/count`. Without a query this counts `type:ticket`:
@@ -755,10 +782,10 @@ impl ZendeskClient {
             let data = self
                 .api_get("search/count.json", &[("query", &query)])
                 .await?;
-            Ok(json!({ "count": data["count"], "query": query }))
+            anyhow::Ok(json!({ "count": data["count"], "query": query }))
         }
         .await
-        .map_err(ctx("Failed to count tickets"))
+        .context("Failed to count tickets")
     }
 
     /// Followers and email CCs of a ticket; both need the CCs and followers feature.
@@ -768,29 +795,36 @@ impl ZendeskClient {
             let followers = self
                 .api_get(&format!("tickets/{ticket_id}/followers.json"), &[])
                 .await?;
-            // Without the CCs feature the email_ccs endpoint fails; Zendesk then keeps the
-            // CCs under the older collaborators endpoint.
+            // Without the CCs feature the email_ccs endpoint answers 403 or 404; Zendesk
+            // then keeps the CCs under the older collaborators endpoint. Any other error
+            // is a real failure.
             let (email_ccs, source) = match self
                 .api_get(&format!("tickets/{ticket_id}/email_ccs.json"), &[])
                 .await
             {
                 Ok(data) => (data, "email_ccs"),
-                Err(_) => (
-                    self.api_get(&format!("tickets/{ticket_id}/collaborators.json"), &[])
-                        .await?,
-                    "collaborators",
-                ),
+                Err(err)
+                    if err
+                        .downcast_ref::<ApiError>()
+                        .is_some_and(|e| matches!(e.status.as_u16(), 403 | 404)) =>
+                {
+                    tracing::debug!("email_ccs unavailable, using collaborators: {err:#}");
+                    (
+                        self.api_get(&format!("tickets/{ticket_id}/collaborators.json"), &[])
+                            .await?,
+                        "collaborators",
+                    )
+                }
+                Err(err) => return Err(err),
             };
-            Ok(json!({
+            anyhow::Ok(json!({
                 "followers": pick_all(&followers, "users", &keys, &[]),
                 "email_ccs": pick_all(&email_ccs, "users", &keys, &[]),
                 "source": source,
             }))
         }
         .await
-        .map_err(ctx(format!(
-            "Failed to get collaborators for ticket {ticket_id}"
-        )))
+        .with_context(|| format!("Failed to get collaborators for ticket {ticket_id}"))
     }
 
     /// Problem tickets whose subject contains `text`, or the 100 most recently updated.
@@ -802,15 +836,17 @@ impl ZendeskClient {
                         .await?
                 }
                 None => {
-                    self.api_get("problems.json", &[("per_page", &100u64)])
+                    self.api_get("problems.json", &[("per_page", &MAX_PAGE_SIZE)])
                         .await?
                 }
             };
             let tickets = pick_all(&data, "tickets", &TICKET_SUMMARY_KEYS, &[]);
-            Ok(json!({ "count": tickets.as_array().map_or(0, Vec::len), "tickets": tickets }))
+            anyhow::Ok(
+                json!({ "count": tickets.as_array().map_or(0, Vec::len), "tickets": tickets }),
+            )
         }
         .await
-        .map_err(ctx("Failed to search problem tickets"))
+        .context("Failed to search problem tickets")
     }
 
     pub async fn get_organization_tickets(
@@ -820,7 +856,7 @@ impl ZendeskClient {
         per_page: u64,
     ) -> Result<Value> {
         async {
-            let per_page = per_page.min(100);
+            let per_page = per_page.min(MAX_PAGE_SIZE);
             let data = self
                 .api_get(
                     &format!("organizations/{organization_id}/tickets.json"),
@@ -832,7 +868,7 @@ impl ZendeskClient {
                 )
                 .await?;
             let tickets = ticket_rows(&data);
-            Ok(json!({
+            anyhow::Ok(json!({
                 "count": tickets.len(),
                 "tickets": tickets,
                 "page": page,
@@ -841,12 +877,14 @@ impl ZendeskClient {
             }))
         }
         .await
-        .map_err(ctx(format!(
-            "Failed to get tickets for organization {organization_id}"
-        )))
+        .with_context(|| format!("Failed to get tickets for organization {organization_id}"))
     }
 
     /// Adds then removes specific tags; returns the ticket's tags after the last call.
+    ///
+    /// # Errors
+    ///
+    /// Fails without a request when both lists are empty or a tag to remove contains a comma.
     pub async fn update_ticket_tags(
         &self,
         ticket_id: u64,
@@ -873,14 +911,14 @@ impl ZendeskClient {
                         if add.is_empty() {
                             e
                         } else {
-                            anyhow!("tags added but removing failed: {e:#}")
+                            e.context("tags added but removing failed")
                         }
                     })?;
             }
-            Ok(json!({ "tags": data.get("tags").cloned().unwrap_or(json!([])) }))
+            anyhow::Ok(json!({ "tags": data.get("tags").cloned().unwrap_or(json!([])) }))
         }
         .await
-        .map_err(ctx(format!("Failed to update tags on ticket {ticket_id}")))
+        .with_context(|| format!("Failed to update tags on ticket {ticket_id}"))
     }
 }
 
@@ -971,6 +1009,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn collaborators_do_not_fall_back_on_a_server_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/tickets/4/followers.json"))
+            .respond_with(json_page("users", json!([]), None))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/tickets/4/email_ccs.json"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/tickets/4/collaborators.json"))
+            .respond_with(json_page("users", json!([]), None))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let err = client(&server)
+            .get_ticket_collaborators(4)
+            .await
+            .unwrap_err();
+        let api = err.downcast_ref::<ApiError>().expect("ApiError");
+        assert_eq!(api.status.as_u16(), 500);
+    }
+
+    #[tokio::test]
     async fn problem_search_posts_text_and_listing_gets_one_page_of_100() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -1046,7 +1111,7 @@ mod tests {
         let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
         assert_eq!(body, json!({"tags": ["a"]}));
         let err = c.update_ticket_tags(3, &[], &[]).await.unwrap_err();
-        assert!(err.to_string().contains("at least one tag"), "{err}");
+        assert!(format!("{err:#}").contains("at least one tag"), "{err}");
         assert_eq!(server.received_requests().await.unwrap().len(), 2);
     }
 
@@ -1260,7 +1325,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_ticket_comments_adds_author_names_and_rejects_bad_sort_order() {
+    async fn get_ticket_comments_adds_author_names() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/v2/tickets/5/comments.json"))
@@ -1275,8 +1340,20 @@ mod tests {
         let out = c.get_ticket_comments(5, "asc").await.unwrap();
         assert_eq!(out[0]["author_name"], "Ann");
         assert!(out[1].get("author_name").is_none());
-        let err = c.get_ticket_comments(5, "up").await.unwrap_err();
-        assert!(err.to_string().contains("Invalid sort_order 'up'"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn get_ticket_comments_rejects_a_bad_sort_order_without_a_request() {
+        let server = MockServer::start().await;
+        let err = client(&server)
+            .get_ticket_comments(5, "up")
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("Invalid sort_order 'up'"),
+            "{err}"
+        );
+        assert!(server.received_requests().await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -1362,14 +1439,14 @@ mod tests {
             .upload_attachment("a.png", "image/png", "!!!")
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("not valid base64"), "{err}");
+        assert!(format!("{err:#}").contains("not valid base64"), "{err}");
         let big =
             base64::engine::general_purpose::STANDARD.encode(vec![0u8; MAX_ATTACHMENT_BYTES + 1]);
         let err = c
             .upload_attachment("a.bin", "application/octet-stream", &big)
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("size limit"), "{err}");
+        assert!(format!("{err:#}").contains("size limit"), "{err}");
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 
@@ -1449,7 +1526,7 @@ mod tests {
             })
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("not both"), "{err}");
+        assert!(format!("{err:#}").contains("not both"), "{err}");
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 
@@ -1483,14 +1560,17 @@ mod tests {
             .update_ticket(4, fields(json!({"safe_update": true})))
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("requires updated_stamp"), "{err}");
+        assert!(
+            format!("{err:#}").contains("requires updated_stamp"),
+            "{err}"
+        );
     }
 
     #[tokio::test]
     async fn update_ticket_rejects_empty_updates_and_cc_entries_without_a_user() {
         let c = offline_client();
         let err = c.update_ticket(4, Map::new()).await.unwrap_err();
-        assert!(err.to_string().contains("at least one field"), "{err}");
+        assert!(format!("{err:#}").contains("at least one field"), "{err}");
         let err = c
             .update_ticket(
                 4,
@@ -1501,7 +1581,10 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("user_id or a user_email"), "{err}");
+        assert!(
+            format!("{err:#}").contains("user_id or a user_email"),
+            "{err}"
+        );
     }
 
     #[tokio::test]
@@ -1545,8 +1628,9 @@ mod tests {
         let err = c
             .update_ticket_tags(3, &["a".into()], &["b".into()])
             .await
-            .unwrap_err()
-            .to_string();
+            .unwrap_err();
+        assert!(err.downcast_ref::<ApiError>().is_some(), "{err:#}");
+        let err = format!("{err:#}");
         assert!(err.contains("tags added but removing failed"), "{err}");
         let err = c
             .update_ticket_tags(3, &[], &["b".into()])
@@ -1613,13 +1697,13 @@ mod tests {
     async fn bulk_and_merge_inputs_are_capped() {
         let c = offline_client();
         let ids: Vec<u64> = (1..=1001).collect();
-        let err = c.get_tickets_bulk(&ids).await.unwrap_err().to_string();
+        let err = format!("{:#}", c.get_tickets_bulk(&ids).await.unwrap_err());
         assert!(err.contains("at most 1000 ids per call"), "{err}");
         let err = c
             .merge_tickets(9999, &ids[..101], "t", "s", None, None)
             .await
-            .unwrap_err()
-            .to_string();
+            .unwrap_err();
+        let err = format!("{err:#}");
         assert!(err.contains("at most 100 source tickets"), "{err}");
     }
 
@@ -1711,7 +1795,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            err.to_string().contains(
+            format!("{err:#}").contains(
                 "Invalid role 'foo'. Allowed: [\"assigned\", \"ccd\", \"followed\", \"requested\"]"
             ),
             "{err}"

@@ -1,4 +1,6 @@
-use anyhow::{Result, bail};
+//! Users, organizations, groups, brands and account settings.
+
+use anyhow::{Context, Result, bail};
 use serde_json::{Map, Value, json};
 
 use super::*;
@@ -64,16 +66,16 @@ impl ZendeskClient {
     pub async fn get_user(&self, user_id: u64) -> Result<Value> {
         async {
             let data = self.api_get(&format!("users/{user_id}.json"), &[]).await?;
-            Ok(user_detail(object(&data, "user")?))
+            anyhow::Ok(user_detail(object(&data, "user")?))
         }
         .await
-        .map_err(ctx(format!("Failed to get user {user_id}")))
+        .with_context(|| format!("Failed to get user {user_id}"))
     }
 
     pub async fn get_current_user(&self) -> Result<Value> {
         async {
             let data = self.api_get("users/me.json", &[]).await?;
-            Ok(pick(
+            anyhow::Ok(pick(
                 object(&data, "user")?,
                 &[
                     "id",
@@ -95,7 +97,7 @@ impl ZendeskClient {
             ))
         }
         .await
-        .map_err(ctx("Failed to get current user"))
+        .context("Failed to get current user")
     }
 
     /// At least one of `query` and `external_id` is required. Returns the first page of up
@@ -132,14 +134,14 @@ impl ZendeskClient {
                 ],
                 &[],
             );
-            Ok(json!({
+            anyhow::Ok(json!({
                 "count": users.as_array().map_or(0, Vec::len),
                 "users": users,
                 "has_more": !data["next_page"].is_null(),
             }))
         }
         .await
-        .map_err(ctx("User search failed"))
+        .context("User search failed")
     }
 
     pub async fn get_organization(&self, organization_id: u64) -> Result<Value> {
@@ -147,10 +149,10 @@ impl ZendeskClient {
             let data = self
                 .api_get(&format!("organizations/{organization_id}.json"), &[])
                 .await?;
-            Ok(organization_detail(object(&data, "organization")?))
+            anyhow::Ok(organization_detail(object(&data, "organization")?))
         }
         .await
-        .map_err(ctx(format!("Failed to get organization {organization_id}")))
+        .with_context(|| format!("Failed to get organization {organization_id}"))
     }
 
     /// Organizations whose name starts with `query`: the first page only; `has_more`
@@ -166,28 +168,23 @@ impl ZendeskClient {
                 &["id", "name", "domain_names"],
                 &["domain_names"],
             );
-            Ok(json!({
+            anyhow::Ok(json!({
                 "count": organizations.as_array().map_or(0, Vec::len),
                 "organizations": organizations,
                 "has_more": !data["next_page"].is_null(),
             }))
         }
         .await
-        .map_err(ctx("Organization search failed"))
+        .context("Organization search failed")
     }
 
     pub async fn list_groups(&self) -> Result<Value> {
         async {
             let groups = self.get_paged("groups/assignable.json", "groups").await?;
-            Ok(pick_all(
-                &json!({ "groups": groups }),
-                "groups",
-                &["id", "name", "description"],
-                &[],
-            ))
+            anyhow::Ok(pick_each(&groups, &["id", "name", "description"], &[]))
         }
         .await
-        .map_err(ctx("Failed to list groups"))
+        .context("Failed to list groups")
     }
 
     /// Fetches in chunks of 100 ids, the `show_many` limit.
@@ -226,10 +223,10 @@ impl ZendeskClient {
                     users.extend(page);
                 }
             }
-            Ok(Value::Array(users))
+            anyhow::Ok(Value::Array(users))
         }
         .await
-        .map_err(ctx("Bulk user fetch failed"))
+        .context("Bulk user fetch failed")
     }
 
     pub async fn get_user_identities(&self, user_id: u64) -> Result<Value> {
@@ -253,10 +250,10 @@ impl ZendeskClient {
                 ],
                 &[],
             );
-            Ok(json!({ "count": items.len(), "identities": identities }))
+            anyhow::Ok(json!({ "count": items.len(), "identities": identities }))
         }
         .await
-        .map_err(ctx(format!("Failed to get identities of user {user_id}")))
+        .with_context(|| format!("Failed to get identities of user {user_id}"))
     }
 
     pub async fn get_user_organizations(&self, user_id: u64) -> Result<Value> {
@@ -279,12 +276,10 @@ impl ZendeskClient {
                     })
                 })
                 .collect();
-            Ok(json!({ "organizations": organizations }))
+            anyhow::Ok(json!({ "organizations": organizations }))
         }
         .await
-        .map_err(ctx(format!(
-            "Failed to get organizations of user {user_id}"
-        )))
+        .with_context(|| format!("Failed to get organizations of user {user_id}"))
     }
 
     /// `fields` is the `user` body; it must hold `name` and `email`.
@@ -293,10 +288,10 @@ impl ZendeskClient {
             let data = self
                 .api_post("users/create_or_update.json", &json!({ "user": fields }))
                 .await?;
-            Ok(user_detail(object(&data, "user")?))
+            anyhow::Ok(user_detail(object(&data, "user")?))
         }
         .await
-        .map_err(ctx("Failed to create or update user"))
+        .context("Failed to create or update user")
     }
 
     pub async fn update_user(&self, user_id: u64, fields: Map<String, Value>) -> Result<Value> {
@@ -307,10 +302,10 @@ impl ZendeskClient {
             let data = self
                 .api_put(&format!("users/{user_id}.json"), &json!({ "user": fields }))
                 .await?;
-            Ok(user_detail(object(&data, "user")?))
+            anyhow::Ok(user_detail(object(&data, "user")?))
         }
         .await
-        .map_err(ctx(format!("Failed to update user {user_id}")))
+        .with_context(|| format!("Failed to update user {user_id}"))
     }
 
     pub async fn list_organization_users(
@@ -320,7 +315,7 @@ impl ZendeskClient {
         per_page: u64,
     ) -> Result<Value> {
         async {
-            let per_page = per_page.min(100);
+            let per_page = per_page.min(MAX_PAGE_SIZE);
             let data = self
                 .api_get(
                     &format!("organizations/{organization_id}/users.json"),
@@ -342,7 +337,7 @@ impl ZendeskClient {
                 ],
                 &[],
             );
-            Ok(json!({
+            anyhow::Ok(json!({
                 "count": users.as_array().map_or(0, Vec::len),
                 "users": users,
                 "page": page,
@@ -351,9 +346,7 @@ impl ZendeskClient {
             }))
         }
         .await
-        .map_err(ctx(format!(
-            "Failed to list users of organization {organization_id}"
-        )))
+        .with_context(|| format!("Failed to list users of organization {organization_id}"))
     }
 
     pub async fn update_organization(
@@ -371,12 +364,10 @@ impl ZendeskClient {
                     &json!({ "organization": fields }),
                 )
                 .await?;
-            Ok(organization_detail(object(&data, "organization")?))
+            anyhow::Ok(organization_detail(object(&data, "organization")?))
         }
         .await
-        .map_err(ctx(format!(
-            "Failed to update organization {organization_id}"
-        )))
+        .with_context(|| format!("Failed to update organization {organization_id}"))
     }
 
     pub async fn get_group_members(&self, group_id: u64) -> Result<Value> {
@@ -384,16 +375,15 @@ impl ZendeskClient {
             let items = self
                 .get_paged(&format!("groups/{group_id}/users.json"), "users")
                 .await?;
-            let users = pick_all(
-                &json!({ "users": items }),
-                "users",
+            let users = pick_each(
+                &items,
                 &["id", "name", "email", "role", "active", "suspended"],
                 &[],
             );
-            Ok(json!({ "count": items.len(), "users": users }))
+            anyhow::Ok(json!({ "count": items.len(), "users": users }))
         }
         .await
-        .map_err(ctx(format!("Failed to get members of group {group_id}")))
+        .with_context(|| format!("Failed to get members of group {group_id}"))
     }
 
     /// Brands use cursor pagination only; at most 1000 are returned.
@@ -402,9 +392,8 @@ impl ZendeskClient {
             let brands = self
                 .get_cursor_paged("brands.json", &[], "brands", 1000)
                 .await?;
-            Ok(pick_all(
-                &json!({ "brands": brands }),
-                "brands",
+            anyhow::Ok(pick_each(
+                &brands,
                 &[
                     "id",
                     "name",
@@ -420,7 +409,7 @@ impl ZendeskClient {
             ))
         }
         .await
-        .map_err(ctx("Failed to list brands"))
+        .context("Failed to list brands")
     }
 
     pub async fn get_account_settings(&self) -> Result<Value> {
@@ -446,10 +435,10 @@ impl ZendeskClient {
                 .find(|v| !v.is_null())
                 .cloned()
                 .unwrap_or(Value::Null);
-            Ok(out)
+            anyhow::Ok(out)
         }
         .await
-        .map_err(ctx("Failed to get account settings"))
+        .context("Failed to get account settings")
     }
 }
 
@@ -498,7 +487,10 @@ mod tests {
         assert_eq!(out["users"][0]["suspended"], false);
         assert!(out["users"][0].get("extra").is_none());
         let err = c.search_users(None, None).await.unwrap_err();
-        assert!(err.to_string().contains("query or an external_id"), "{err}");
+        assert!(
+            format!("{err:#}").contains("query or an external_id"),
+            "{err}"
+        );
     }
 
     #[tokio::test]
@@ -628,7 +620,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_user_puts_the_body_and_rejects_empty_updates() {
+    async fn update_user_puts_the_body() {
         let server = MockServer::start().await;
         Mock::given(method("PUT"))
             .and(path("/api/v2/users/4.json"))
@@ -643,8 +635,13 @@ mod tests {
         let requests = server.received_requests().await.unwrap();
         let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
         assert_eq!(body, json!({"user": {"notes": "n"}}));
-        assert!(c.update_user(4, Map::new()).await.is_err());
-        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn update_user_rejects_empty_updates_without_a_request() {
+        let server = MockServer::start().await;
+        assert!(client(&server).update_user(4, Map::new()).await.is_err());
+        assert!(server.received_requests().await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -672,7 +669,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_organization_puts_the_body_and_rejects_empty_updates() {
+    async fn update_organization_puts_the_body() {
         let server = MockServer::start().await;
         Mock::given(method("PUT"))
             .and(path("/api/v2/organizations/7.json"))
@@ -695,8 +692,18 @@ mod tests {
             body,
             json!({"organization": {"domain_names": ["a.com"], "shared_tickets": true}})
         );
-        assert!(c.update_organization(7, Map::new()).await.is_err());
-        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn update_organization_rejects_empty_updates_without_a_request() {
+        let server = MockServer::start().await;
+        assert!(
+            client(&server)
+                .update_organization(7, Map::new())
+                .await
+                .is_err()
+        );
+        assert!(server.received_requests().await.unwrap().is_empty());
     }
 
     #[tokio::test]

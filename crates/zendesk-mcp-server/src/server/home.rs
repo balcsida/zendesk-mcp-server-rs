@@ -31,7 +31,7 @@ pub(super) async fn page(State(home): State<Arc<Home>>, uri: Uri, headers: Heade
         Access::SignIn { public } => Some(public.clone()),
         _ => request_origin(&uri, &headers),
     };
-    let endpoint = origin.map_or("/mcp".to_string(), |origin| format!("{origin}/mcp"));
+    let endpoint = origin.map_or_else(|| "/mcp".to_string(), |origin| format!("{origin}/mcp"));
     html(StatusCode::OK, home.render(&endpoint))
 }
 
@@ -176,7 +176,7 @@ mod tests {
             server(),
             Some("right-token"),
             None,
-            CancellationToken::new(),
+            &CancellationToken::new(),
         )
     }
 
@@ -224,7 +224,7 @@ mod tests {
             per_user_server().read_only(true),
             None,
             None,
-            CancellationToken::new(),
+            &CancellationToken::new(),
         );
         let (response, addr) = get_root(router, &[]).await;
         let body = response.text().await.unwrap();
@@ -258,7 +258,7 @@ mod tests {
             per_user_server(),
             None,
             Some(sign_in),
-            CancellationToken::new(),
+            &CancellationToken::new(),
         );
         let (response, _) = get_root(router, &[("Host", "other.example")]).await;
         let body = response.text().await.unwrap();

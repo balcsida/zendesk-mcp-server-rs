@@ -1,3 +1,5 @@
+//! Views, macros, triggers, SLA data, custom statuses and satisfaction ratings.
+
 use super::*;
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -66,7 +68,10 @@ struct TriggerParams {
 
 #[derive(Debug, Clone, Copy, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
-#[allow(clippy::enum_variant_names)]
+#[expect(
+    clippy::enum_variant_names,
+    reason = "the variants are Zendesk's SLA metric names, which all end in Time"
+)]
 enum SlaMetric {
     ReplyTime,
     FirstReplyTime,
@@ -180,7 +185,7 @@ impl ZendeskServer {
     async fn apply_macro(&self, Parameters(p): Parameters<ApplyMacroParams>) -> CallToolResult {
         self.call_json(|c| async move {
             let result = c.apply_macro(p.ticket_id, p.macro_id).await?;
-            Ok(wrapped("Macro preview (not saved)", "result", result))
+            Ok(wrapped("Macro preview (not saved)", "result", &result))
         })
         .await
     }
@@ -219,7 +224,7 @@ impl ZendeskServer {
     async fn execute_macro(&self, Parameters(p): Parameters<ApplyMacroParams>) -> CallToolResult {
         self.call_json(|c| async move {
             let ticket = c.execute_macro(p.ticket_id, p.macro_id).await?;
-            Ok(wrapped("Macro applied", "ticket", ticket))
+            Ok(wrapped("Macro applied", "ticket", &ticket))
         })
         .await
     }
@@ -294,5 +299,83 @@ impl ZendeskServer {
                 .await
         })
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::tests::{args, assert_tool_ok, sent, server_on};
+    use super::*;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn execute_macro_saves_what_the_preview_changes() {
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/tickets/7.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "ticket": {
+                "id": 7, "status": "open", "updated_at": "2026-01-02T03:04:05Z"
+            } })))
+            .mount(&mock)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/tickets/7/macros/25/apply.json"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "result": { "ticket": { "status": "solved" } } })),
+            )
+            .mount(&mock)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/api/v2/tickets/7.json"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "ticket": { "id": 7, "status": "solved" } })),
+            )
+            .mount(&mock)
+            .await;
+        let result = server_on(&mock)
+            .execute_macro(args(json!({ "ticket_id": 7, "macro_id": 25 })))
+            .await;
+        assert_tool_ok(&result);
+        let puts: Vec<_> = sent(&mock)
+            .await
+            .into_iter()
+            .filter(|(method, ..)| method == "PUT")
+            .collect();
+        assert_eq!(
+            puts,
+            [(
+                "PUT".to_string(),
+                "/api/v2/tickets/7.json".to_string(),
+                json!({ "ticket": {
+                    "status": "solved",
+                    "macro_ids": [25],
+                    "safe_update": true,
+                    "updated_stamp": "2026-01-02T03:04:05Z",
+                } })
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_macro_only_previews() {
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/tickets/7/macros/25/apply.json"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "result": { "ticket": { "status": "solved" } } })),
+            )
+            .mount(&mock)
+            .await;
+        let result = server_on(&mock)
+            .apply_macro(args(json!({ "ticket_id": 7, "macro_id": 25 })))
+            .await;
+        assert_tool_ok(&result);
+        let requests = sent(&mock).await;
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].0, "GET");
     }
 }

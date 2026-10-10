@@ -1,3 +1,5 @@
+//! Help Center tools: categories, sections, articles and their translations.
+
 use super::*;
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -221,18 +223,19 @@ impl ZendeskServer {
         Parameters(p): Parameters<CreateArticleParams>,
     ) -> CallToolResult {
         self.call_json(|c| async move {
-            let mut article = serde_json::Map::new();
-            article.insert("title".into(), p.title.into());
-            article.insert("body".into(), p.body.into());
-            article.insert("locale".into(), p.locale.into());
-            article.insert("draft".into(), p.draft.into());
-            article.insert("permission_group_id".into(), json!(p.permission_group_id));
-            article.insert("user_segment_id".into(), json!(p.user_segment_id));
-            article.insert("label_names".into(), json!(p.label_names));
+            let article = set_fields([
+                ("title", json!(p.title)),
+                ("body", json!(p.body)),
+                ("locale", json!(p.locale)),
+                ("draft", json!(p.draft)),
+                ("permission_group_id", json!(p.permission_group_id)),
+                ("user_segment_id", json!(p.user_segment_id)),
+                ("label_names", json!(p.label_names)),
+            ]);
             let created = c
                 .create_article(p.section_id, article, p.notify_subscribers)
                 .await?;
-            Ok(wrapped("Article created", "article", created))
+            Ok(wrapped("Article created", "article", &created))
         })
         .await
     }
@@ -246,27 +249,115 @@ impl ZendeskServer {
         Parameters(p): Parameters<UpdateArticleParams>,
     ) -> CallToolResult {
         self.call_json(|c| async move {
-            let translation = serde_json::Map::from_iter([
-                ("title".to_string(), json!(p.title)),
-                ("body".to_string(), json!(p.body)),
-                ("draft".to_string(), json!(p.draft)),
+            let translation = set_fields([
+                ("title", json!(p.title)),
+                ("body", json!(p.body)),
+                ("draft", json!(p.draft)),
             ]);
-            let article = serde_json::Map::from_iter([
-                ("section_id".to_string(), json!(p.section_id)),
-                ("promoted".to_string(), json!(p.promoted)),
-                ("position".to_string(), json!(p.position)),
-                ("label_names".to_string(), json!(p.label_names)),
-                ("user_segment_id".to_string(), json!(p.user_segment_id)),
-                (
-                    "permission_group_id".to_string(),
-                    json!(p.permission_group_id),
-                ),
+            let article = set_fields([
+                ("section_id", json!(p.section_id)),
+                ("promoted", json!(p.promoted)),
+                ("position", json!(p.position)),
+                ("label_names", json!(p.label_names)),
+                ("user_segment_id", json!(p.user_segment_id)),
+                ("permission_group_id", json!(p.permission_group_id)),
             ]);
             let updated = c
                 .update_article(p.article_id, p.locale.as_deref(), translation, article)
                 .await?;
-            Ok(wrapped("Article updated", "article", updated))
+            Ok(wrapped("Article updated", "article", &updated))
         })
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::tests::{args, assert_tool_ok, sent, server_on};
+    use super::*;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn create_article_sends_html_and_omits_unset_fields() {
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v2/help_center/sections/4/articles.json"))
+            .respond_with(
+                ResponseTemplate::new(201).set_body_json(json!({ "article": { "id": 77 } })),
+            )
+            .mount(&mock)
+            .await;
+        let result = server_on(&mock)
+            .create_article(args(json!({
+                "section_id": 4,
+                "title": "T",
+                "body": "**hi**",
+                "locale": "en-us",
+                "label_names": ["a"],
+            })))
+            .await;
+        assert_tool_ok(&result);
+        let (_, target, body) = sent(&mock).await.remove(0);
+        assert_eq!(target, "/api/v2/help_center/sections/4/articles.json");
+        assert_eq!(body["notify_subscribers"], false);
+        let article = body["article"].as_object().unwrap();
+        assert!(
+            article["body"]
+                .as_str()
+                .unwrap()
+                .contains("<strong>hi</strong>")
+        );
+        let mut keys: Vec<_> = article.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["body", "draft", "label_names", "locale", "title"]);
+        assert_eq!(article["draft"], true);
+    }
+
+    #[tokio::test]
+    async fn update_article_splits_translation_and_metadata() {
+        let mock = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .mount(&mock)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/help_center/fr/articles/9.json"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({ "article": { "id": 9 } })),
+            )
+            .mount(&mock)
+            .await;
+        let result = server_on(&mock)
+            .update_article(args(json!({
+                "article_id": 9,
+                "locale": "fr",
+                "title": "New",
+                "draft": false,
+                "promoted": true,
+                "position": 0,
+            })))
+            .await;
+        assert_tool_ok(&result);
+        let puts: Vec<_> = sent(&mock)
+            .await
+            .into_iter()
+            .filter(|(method, ..)| method == "PUT")
+            .collect();
+        assert_eq!(
+            puts,
+            [
+                (
+                    "PUT".to_string(),
+                    "/api/v2/help_center/articles/9/translations/fr.json".to_string(),
+                    json!({ "translation": { "title": "New", "draft": false } })
+                ),
+                (
+                    "PUT".to_string(),
+                    "/api/v2/help_center/articles/9.json".to_string(),
+                    json!({ "article": { "promoted": true, "position": 0 } })
+                ),
+            ]
+        );
     }
 }

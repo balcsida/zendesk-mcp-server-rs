@@ -1,4 +1,6 @@
-use anyhow::{Result, anyhow, bail};
+//! Views, macros, triggers, ticket fields and forms, SLAs, custom statuses and satisfaction ratings.
+
+use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Map, Value, json};
 
 use super::*;
@@ -81,15 +83,14 @@ impl ZendeskClient {
     pub async fn list_views(&self) -> Result<Value> {
         async {
             let views = self.get_paged("views.json", "views").await?;
-            Ok(pick_all(
-                &json!({ "views": views }),
-                "views",
+            anyhow::Ok(pick_each(
+                &views,
                 &["id", "title", "active", "position"],
                 &[],
             ))
         }
         .await
-        .map_err(ctx("Failed to list views"))
+        .context("Failed to list views")
     }
 
     pub async fn execute_view(
@@ -101,7 +102,7 @@ impl ZendeskClient {
         sort_order: Option<&str>,
     ) -> Result<Value> {
         async {
-            let per_page = per_page.min(100);
+            let per_page = per_page.min(MAX_PAGE_SIZE);
             let mut params: Vec<(&str, &(dyn std::fmt::Display + Sync))> =
                 vec![("page", &page), ("per_page", &per_page)];
             if let Some(sort_by) = &sort_by {
@@ -114,14 +115,14 @@ impl ZendeskClient {
                 .api_get(&format!("views/{view_id}/tickets.json"), &params)
                 .await?;
             let tickets = pick_all(&data, "tickets", &TICKET_SUMMARY_KEYS, &[]);
-            Ok(json!({
+            anyhow::Ok(json!({
                 "count": tickets.as_array().map_or(0, Vec::len),
                 "tickets": tickets,
                 "has_more": !data["next_page"].is_null(),
             }))
         }
         .await
-        .map_err(ctx(format!("Failed to execute view {view_id}")))
+        .with_context(|| format!("Failed to execute view {view_id}"))
     }
 
     pub async fn list_ticket_fields(&self) -> Result<Value> {
@@ -145,16 +146,16 @@ impl ZendeskClient {
                     _ => Value::Null,
                 };
             }
-            Ok(fields)
+            anyhow::Ok(fields)
         }
         .await
-        .map_err(ctx("Failed to list ticket fields"))
+        .context("Failed to list ticket fields")
     }
 
     pub async fn list_ticket_forms(&self) -> Result<Value> {
         async {
             let data = self.api_get("ticket_forms.json", &[]).await?;
-            Ok(pick_all(
+            anyhow::Ok(pick_all(
                 &data,
                 "ticket_forms",
                 &[
@@ -169,7 +170,7 @@ impl ZendeskClient {
             ))
         }
         .await
-        .map_err(ctx("Failed to list ticket forms"))
+        .context("Failed to list ticket forms")
     }
 
     pub async fn list_macros(&self, active_only: bool) -> Result<Value> {
@@ -180,15 +181,14 @@ impl ZendeskClient {
                 "macros.json"
             };
             let macros = self.get_paged(path, "macros").await?;
-            Ok(pick_all(
-                &json!({ "macros": macros }),
-                "macros",
+            anyhow::Ok(pick_each(
+                &macros,
                 &["id", "title", "description", "active"],
                 &[],
             ))
         }
         .await
-        .map_err(ctx("Failed to list macros"))
+        .context("Failed to list macros")
     }
 
     pub async fn apply_macro(&self, ticket_id: u64, macro_id: u64) -> Result<Value> {
@@ -200,15 +200,13 @@ impl ZendeskClient {
                 )
                 .await?;
             let result = &data["result"];
-            Ok(json!({
-                "ticket_changes": result.get("ticket").cloned().unwrap_or(json!({})),
+            anyhow::Ok(json!({
+                "ticket_changes": result.get("ticket").cloned().unwrap_or_else(|| json!({})),
                 "comment": result["ticket"]["comment"],
             }))
         }
         .await
-        .map_err(ctx(format!(
-            "Failed to apply macro {macro_id} to ticket {ticket_id}"
-        )))
+        .with_context(|| format!("Failed to apply macro {macro_id} to ticket {ticket_id}"))
     }
 
     pub async fn get_view_counts(&self, view_ids: &[u64]) -> Result<Value> {
@@ -227,7 +225,7 @@ impl ZendeskClient {
             let data = self
                 .api_get("views/count_many.json", &[("ids", &ids)])
                 .await?;
-            Ok(pick_all(
+            anyhow::Ok(pick_all(
                 &data,
                 "view_counts",
                 &["view_id", "value", "pretty", "fresh"],
@@ -235,7 +233,7 @@ impl ZendeskClient {
             ))
         }
         .await
-        .map_err(ctx("Failed to get view counts"))
+        .context("Failed to get view counts")
     }
 
     pub async fn get_macro(&self, macro_id: u64) -> Result<Value> {
@@ -243,14 +241,14 @@ impl ZendeskClient {
             let data = self
                 .api_get(&format!("macros/{macro_id}.json"), &[])
                 .await?;
-            Ok(pick(
+            anyhow::Ok(pick(
                 object(&data, "macro")?,
                 &MACRO_DETAIL_KEYS,
                 &["actions"],
             ))
         }
         .await
-        .map_err(ctx(format!("Failed to get macro {macro_id}")))
+        .with_context(|| format!("Failed to get macro {macro_id}"))
     }
 
     /// One page (up to 100) of macros whose title matches `query`; the endpoint is
@@ -263,7 +261,7 @@ impl ZendeskClient {
                     &[("query", &query), ("per_page", &100)],
                 )
                 .await?;
-            Ok(pick_all(
+            anyhow::Ok(pick_all(
                 &data,
                 "macros",
                 &["id", "title", "description", "active", "actions"],
@@ -271,7 +269,7 @@ impl ZendeskClient {
             ))
         }
         .await
-        .map_err(ctx("Failed to search macros"))
+        .context("Failed to search macros")
     }
 
     /// Applies a macro for real. The preview endpoint returns the whole ticket as it would
@@ -330,9 +328,7 @@ impl ZendeskClient {
             full_ticket(&data)
         }
         .await
-        .map_err(ctx(format!(
-            "Failed to execute macro {macro_id} on ticket {ticket_id}"
-        )))
+        .with_context(|| format!("Failed to execute macro {macro_id} on ticket {ticket_id}"))
     }
 
     /// Triggers, active ones only by default. Zendesk lists `category_id` only on the
@@ -356,9 +352,8 @@ impl ZendeskClient {
                 params.push(("category_id", category_id));
             }
             let triggers = self.get_paged_with(path, &params, "triggers").await?;
-            Ok(pick_all(
-                &json!({ "triggers": triggers }),
-                "triggers",
+            anyhow::Ok(pick_each(
+                &triggers,
                 &[
                     "id",
                     "title",
@@ -372,7 +367,7 @@ impl ZendeskClient {
             ))
         }
         .await
-        .map_err(ctx("Failed to list triggers"))
+        .context("Failed to list triggers")
     }
 
     pub async fn get_trigger(&self, trigger_id: u64) -> Result<Value> {
@@ -380,7 +375,7 @@ impl ZendeskClient {
             let data = self
                 .api_get(&format!("triggers/{trigger_id}.json"), &[])
                 .await?;
-            Ok(pick(
+            anyhow::Ok(pick(
                 object(&data, "trigger")?,
                 &[
                     "id",
@@ -398,7 +393,7 @@ impl ZendeskClient {
             ))
         }
         .await
-        .map_err(ctx(format!("Failed to get trigger {trigger_id}")))
+        .with_context(|| format!("Failed to get trigger {trigger_id}"))
     }
 
     pub async fn get_sla_breaches(&self, days_back: u64, metric: Option<&str>) -> Result<Value> {
@@ -444,7 +439,7 @@ impl ZendeskClient {
                 let count = by_metric.get(&name).and_then(Value::as_u64).unwrap_or(0);
                 by_metric.insert(name, json!(count + 1));
             }
-            Ok(json!({
+            anyhow::Ok(json!({
                 "total_breaches": breaches.len(),
                 "unique_tickets": tickets.len(),
                 "breaches": breaches,
@@ -453,16 +448,16 @@ impl ZendeskClient {
             }))
         }
         .await
-        .map_err(ctx("Failed to get SLA breaches"))
+        .context("Failed to get SLA breaches")
     }
 
     pub async fn get_sla_policies(&self) -> Result<Value> {
         async {
             let policies = self.get_paged("slas/policies.json", "sla_policies").await?;
-            Ok(Value::Array(policies))
+            anyhow::Ok(Value::Array(policies))
         }
         .await
-        .map_err(ctx("Failed to get SLA policies"))
+        .context("Failed to get SLA policies")
     }
 
     /// Custom ticket statuses; `status` on a ticket is only the category.
@@ -474,7 +469,7 @@ impl ZendeskClient {
                 &[]
             };
             let data = self.api_get("custom_statuses.json", params).await?;
-            Ok(pick_all(
+            anyhow::Ok(pick_all(
                 &data,
                 "custom_statuses",
                 &[
@@ -490,7 +485,7 @@ impl ZendeskClient {
             ))
         }
         .await
-        .map_err(ctx("Failed to list custom statuses"))
+        .context("Failed to list custom statuses")
     }
 
     /// One page of satisfaction ratings from the last `days_back` days, optionally
@@ -513,7 +508,7 @@ impl ZendeskClient {
                 .and_then(|d| chrono::Utc::now().checked_sub_signed(d))
                 .ok_or_else(|| anyhow!("days_back {days_back} is out of range"))?
                 .timestamp();
-            let per_page = per_page.min(100);
+            let per_page = per_page.min(MAX_PAGE_SIZE);
             let mut params: Vec<(&str, &(dyn Display + Sync))> = vec![
                 ("start_time", &start),
                 ("page", &page),
@@ -541,14 +536,14 @@ impl ZendeskClient {
                 ],
                 &[],
             );
-            Ok(json!({
+            anyhow::Ok(json!({
                 "count": ratings.as_array().map_or(0, Vec::len),
                 "ratings": ratings,
                 "has_more": !data["next_page"].is_null(),
             }))
         }
         .await
-        .map_err(ctx("Failed to list satisfaction ratings"))
+        .context("Failed to list satisfaction ratings")
     }
 }
 
@@ -560,7 +555,7 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[tokio::test]
-    async fn view_counts_join_ids_and_reject_bad_sizes() {
+    async fn view_counts_join_ids() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/v2/views/count_many.json"))
@@ -581,8 +576,15 @@ mod tests {
             json!({"view_id": 25, "value": 719, "pretty": "~700", "fresh": true})
         );
         assert!(out[1]["value"].is_null());
+    }
+
+    #[tokio::test]
+    async fn view_counts_reject_bad_sizes_without_a_request() {
+        let server = MockServer::start().await;
+        let c = client(&server);
         assert!(c.get_view_counts(&[]).await.is_err());
         assert!(c.get_view_counts(&[1; 21]).await.is_err());
+        assert!(server.received_requests().await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -886,7 +888,10 @@ mod tests {
             .list_satisfaction_ratings(Some("great"), 30, 1, 25)
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("Invalid score 'great'"), "{err}");
+        assert!(
+            format!("{err:#}").contains("Invalid score 'great'"),
+            "{err}"
+        );
     }
 
     #[tokio::test]

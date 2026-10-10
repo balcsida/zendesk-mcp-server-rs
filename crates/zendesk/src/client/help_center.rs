@@ -1,6 +1,8 @@
+//! Help Center: articles, categories, sections and translations.
+
 use std::collections::{BTreeSet, HashMap};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use serde_json::{Map, Value, json};
 
 use super::*;
@@ -124,14 +126,19 @@ impl ZendeskClient {
                     }),
                 );
             }
-            Ok((Value::Object(kb), truncated))
+            anyhow::Ok((Value::Object(kb), truncated))
         }
         .await
-        .map_err(ctx("Failed to fetch knowledge base"))
+        .context("Failed to fetch knowledge base")
     }
 
     /// Search is capped by Zendesk at 1,000 results. Needs a query, category, section or
     /// label names.
+    ///
+    /// # Errors
+    ///
+    /// Fails without a request when none of those is given, or `sort_by` or `sort_order`
+    /// is not one Zendesk accepts.
     pub async fn search_articles(&self, search: &ArticleSearch<'_>) -> Result<Value> {
         async {
             let ArticleSearch {
@@ -166,7 +173,7 @@ impl ZendeskClient {
             {
                 bail!("Invalid sort_order '{sort_order}'. Allowed: asc, desc");
             }
-            let per_page = per_page.min(100);
+            let per_page = per_page.min(MAX_PAGE_SIZE);
             let labels = label_names.join(",");
             let mut params: Vec<(&str, &(dyn Display + Sync))> =
                 vec![("per_page", &per_page), ("page", &page)];
@@ -229,18 +236,18 @@ impl ZendeskClient {
                 article["label_names"] = raw.get("label_names").cloned().unwrap_or(json!([]));
             }
             let count = articles.as_array().map_or(0, Vec::len);
-            Ok(json!({
+            anyhow::Ok(json!({
                 "articles": articles,
                 "query": query,
                 "page": page,
                 "per_page": per_page,
                 "count": count,
-                "total_count": data.get("count").cloned().unwrap_or(json!(count)),
+                "total_count": data.get("count").cloned().unwrap_or_else(|| json!(count)),
                 "has_more": !data["next_page"].is_null(),
             }))
         }
         .await
-        .map_err(ctx("Failed to search articles"))
+        .context("Failed to search articles")
     }
 
     /// One page of articles, from the whole help center or one section, without bodies.
@@ -252,7 +259,7 @@ impl ZendeskClient {
         per_page: u64,
     ) -> Result<Value> {
         async {
-            let per_page = per_page.min(100);
+            let per_page = per_page.min(MAX_PAGE_SIZE);
             let section = section_id
                 .map(|id| format!("/sections/{id}"))
                 .unwrap_or_default();
@@ -274,36 +281,35 @@ impl ZendeskClient {
                 &[],
             );
             let count = articles.as_array().map_or(0, Vec::len);
-            Ok(json!({
+            anyhow::Ok(json!({
                 "articles": articles,
                 "page": page,
                 "per_page": per_page,
                 "count": count,
-                "total_count": data.get("count").cloned().unwrap_or(json!(count)),
+                "total_count": data.get("count").cloned().unwrap_or_else(|| json!(count)),
                 "has_more": !data["next_page"].is_null(),
             }))
         }
         .await
-        .map_err(ctx("Failed to list articles"))
+        .context("Failed to list articles")
     }
 
     pub async fn get_article(&self, article_id: u64, locale: Option<&str>) -> Result<Value> {
         async {
             let path = format!("{}/articles/{article_id}.json", help_center_path(locale)?);
             let data = self.api_get(&path, &[]).await?;
-            Ok(article_detail(object(&data, "article")?))
+            anyhow::Ok(article_detail(object(&data, "article")?))
         }
         .await
-        .map_err(ctx(format!("Failed to get article {article_id}")))
+        .with_context(|| format!("Failed to get article {article_id}"))
     }
 
     pub async fn list_categories(&self, locale: Option<&str>) -> Result<Value> {
         async {
             let path = format!("{}/categories.json", help_center_path(locale)?);
             let categories = self.get_paged(&path, "categories").await?;
-            Ok(pick_all(
-                &json!({ "categories": categories }),
-                "categories",
+            anyhow::Ok(pick_each(
+                &categories,
                 &[
                     "id",
                     "name",
@@ -317,7 +323,7 @@ impl ZendeskClient {
             ))
         }
         .await
-        .map_err(ctx("Failed to list categories"))
+        .context("Failed to list categories")
     }
 
     pub async fn list_sections(
@@ -331,9 +337,8 @@ impl ZendeskClient {
                 .unwrap_or_default();
             let path = format!("{}{category}/sections.json", help_center_path(locale)?);
             let sections = self.get_paged(&path, "sections").await?;
-            Ok(pick_all(
-                &json!({ "sections": sections }),
-                "sections",
+            anyhow::Ok(pick_each(
+                &sections,
                 &[
                     "id",
                     "name",
@@ -349,7 +354,7 @@ impl ZendeskClient {
             ))
         }
         .await
-        .map_err(ctx("Failed to list sections"))
+        .context("Failed to list sections")
     }
 
     /// Every locale version of an article, without bodies.
@@ -361,9 +366,8 @@ impl ZendeskClient {
                     "translations",
                 )
                 .await?;
-            let mut out = pick_all(
-                &json!({ "translations": translations }),
-                "translations",
+            let mut out = pick_each(
+                &translations,
                 &["id", "locale", "title", "html_url", "updated_at"],
                 &[],
             );
@@ -372,12 +376,10 @@ impl ZendeskClient {
                     t[key] = raw.get(key).cloned().unwrap_or(json!(false));
                 }
             }
-            Ok(out)
+            anyhow::Ok(out)
         }
         .await
-        .map_err(ctx(format!(
-            "Failed to list translations of article {article_id}"
-        )))
+        .with_context(|| format!("Failed to list translations of article {article_id}"))
     }
 
     /// Creates an article in `section_id`. `article` holds the article fields; a Markdown
@@ -399,16 +401,20 @@ impl ZendeskClient {
                     &json!({"article": article, "notify_subscribers": notify_subscribers}),
                 )
                 .await?;
-            Ok(article_detail(object(&data, "article")?))
+            anyhow::Ok(article_detail(object(&data, "article")?))
         }
         .await
-        .map_err(ctx(format!(
-            "Failed to create article in section {section_id}"
-        )))
+        .with_context(|| format!("Failed to create article in section {section_id}"))
     }
 
     /// Updates one locale's `translation` (title, body, draft; needs `locale`) and/or the
     /// article's own `article` fields, then returns the refreshed article.
+    ///
+    /// # Errors
+    ///
+    /// Fails without a request when both maps are empty or `locale` is missing while
+    /// `translation` is set. The error says so when the translation was saved but the
+    /// article update failed, or when everything was saved but reading it back failed.
     pub async fn update_article(
         &self,
         article_id: u64,
@@ -416,19 +422,20 @@ impl ZendeskClient {
         mut translation: Map<String, Value>,
         mut article: Map<String, Value>,
     ) -> Result<Value> {
+        let locale = locale.filter(|l| !l.is_empty());
         async {
             translation.retain(|_, v| !v.is_null());
             article.retain(|_, v| !v.is_null());
             if translation.is_empty() && article.is_empty() {
                 bail!("Nothing to update: give at least one field to change");
             }
-            let locale = locale.filter(|l| !l.is_empty());
             if !translation.is_empty() && locale.is_none() {
                 bail!("locale is required to change title, body or draft");
             }
             if let Some(body) = translation.get("body").and_then(Value::as_str) {
                 translation.insert("body".into(), markdown_to_html(body).into());
             }
+            let mut translated = false;
             if let Some(locale) = locale
                 && !translation.is_empty()
             {
@@ -438,18 +445,29 @@ impl ZendeskClient {
                 );
                 self.api_put(&path, &json!({ "translation": translation }))
                     .await?;
+                translated = true;
             }
             if !article.is_empty() {
                 self.api_put(
                     &format!("help_center/articles/{article_id}.json"),
                     &json!({ "article": article }),
                 )
-                .await?;
+                .await
+                .map_err(|e| {
+                    if translated {
+                        e.context("the translation was updated, but updating the article failed")
+                    } else {
+                        e
+                    }
+                })?;
             }
-            self.get_article(article_id, locale).await
+            anyhow::Ok(())
         }
         .await
-        .map_err(ctx(format!("Failed to update article {article_id}")))
+        .with_context(|| format!("Failed to update article {article_id}"))?;
+        self.get_article(article_id, locale)
+            .await
+            .context("The article was updated, but reading it back failed")
     }
 }
 
@@ -557,11 +575,10 @@ mod tests {
     }
 
     fn cursor_articles(items: Value, next: Option<String>) -> ResponseTemplate {
-        ResponseTemplate::new(200).set_body_json(json!({
-            "articles": items,
-            "meta": { "has_more": next.is_some() },
-            "links": { "next": next },
-        }))
+        let mut body = json!({ "meta": { "has_more": next.is_some() } });
+        body["articles"] = items;
+        body["links"]["next"] = next.into();
+        ResponseTemplate::new(200).set_body_json(body)
     }
 
     #[tokio::test]
@@ -737,16 +754,82 @@ mod tests {
             json!({"translation": {"title": "New", "draft": false}})
         );
         assert_eq!(bodies[1], json!({"article": {"promoted": true}}));
-        let err = c
+    }
+
+    #[tokio::test]
+    async fn update_article_needs_a_locale_for_translation_fields() {
+        let server = MockServer::start().await;
+        let map = |v: Value| v.as_object().unwrap().clone();
+        let err = client(&server)
             .update_article(9, None, map(json!({"title": "x"})), Map::new())
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("locale is required"), "{err}");
-        let err = c
+        assert!(format!("{err:#}").contains("locale is required"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn update_article_needs_something_to_update() {
+        let server = MockServer::start().await;
+        let err = client(&server)
             .update_article(9, Some("fr"), Map::new(), Map::new())
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("Nothing to update"), "{err}");
+        assert!(format!("{err:#}").contains("Nothing to update"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn update_article_says_when_only_the_translation_was_written() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/api/v2/help_center/articles/9/translations/fr.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"translation": {}})))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/api/v2/help_center/articles/9.json"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+        let map = |v: Value| v.as_object().unwrap().clone();
+        let err = client(&server)
+            .update_article(
+                9,
+                Some("fr"),
+                map(json!({"title": "New"})),
+                map(json!({"promoted": true})),
+            )
+            .await
+            .unwrap_err();
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("the translation was updated, but updating the article failed"),
+            "{text}"
+        );
+        assert!(text.contains("HTTP 500"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn update_article_says_when_only_reading_it_back_failed() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/api/v2/help_center/articles/9.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"article": {}})))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+        let map = |v: Value| v.as_object().unwrap().clone();
+        let err = client(&server)
+            .update_article(9, None, Map::new(), map(json!({"promoted": true})))
+            .await
+            .unwrap_err();
+        let text = format!("{err:#}");
+        assert!(
+            text.starts_with("The article was updated, but reading it back failed"),
+            "{text}"
+        );
     }
 
     #[tokio::test]
@@ -787,6 +870,11 @@ mod tests {
         assert_eq!(a["label_names"], json!(["a"]));
         assert_eq!(a["vote_sum"], 3);
         assert!(a.get("result_type").is_none());
+    }
+
+    #[tokio::test]
+    async fn search_articles_rejects_invalid_searches_without_a_request() {
+        let server = MockServer::start().await;
         for bad in [
             ArticleSearch {
                 per_page: 25,
@@ -804,8 +892,9 @@ mod tests {
                 ..Default::default()
             },
         ] {
-            assert!(c.search_articles(&bad).await.is_err());
+            assert!(client(&server).search_articles(&bad).await.is_err());
         }
+        assert!(server.received_requests().await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -816,7 +905,7 @@ mod tests {
             .mount(&server)
             .await;
         let err = client(&server).get_article(1, None).await.unwrap_err();
-        assert!(err.to_string().contains("no 'article' object"), "{err}");
+        assert!(format!("{err:#}").contains("no 'article' object"), "{err}");
     }
 
     #[tokio::test]

@@ -1,3 +1,5 @@
+//! Ticket tools: reading and searching tickets and comments, creating and updating them, and attachments.
+
 use serde::Serialize;
 
 use super::*;
@@ -331,7 +333,7 @@ impl ZendeskServer {
                 upload_tokens: p.upload_tokens,
             };
             let created = c.create_ticket(ticket).await?;
-            Ok(wrapped("Ticket created successfully", "ticket", created))
+            Ok(wrapped("Ticket created successfully", "ticket", &created))
         })
         .await
     }
@@ -378,7 +380,7 @@ impl ZendeskServer {
                     &p.upload_tokens.unwrap_or_default(),
                 )
                 .await?;
-            Ok(wrapped("Comment created", "comment", comment))
+            Ok(wrapped("Comment created", "comment", &comment))
         })
         .await
     }
@@ -419,35 +421,27 @@ impl ZendeskServer {
     )]
     async fn update_ticket(&self, Parameters(p): Parameters<UpdateTicketParams>) -> CallToolResult {
         self.call_json(|c| async move {
-            let mut fields = serde_json::Map::new();
-            let mut set = |key: &str, value: Option<Value>| {
-                if let Some(v) = value {
-                    fields.insert(key.to_string(), v);
-                }
-            };
-            set("subject", p.subject.map(Value::from));
-            set("status", p.status.map(|v| v.as_str().into()));
-            set("priority", p.priority.map(|v| v.as_str().into()));
-            set("type", p.ticket_type.map(|v| v.as_str().into()));
-            set("assignee_id", p.assignee_id.map(Value::from));
-            set("requester_id", p.requester_id.map(Value::from));
-            set("tags", p.tags.map(Value::from));
-            set(
-                "custom_fields",
-                p.custom_fields
-                    .map(|f| Value::Array(f.into_iter().map(Value::Object).collect())),
-            );
-            set("due_at", p.due_at.map(Value::from));
-            set("group_id", p.group_id.map(Value::from));
-            set("custom_status_id", p.custom_status_id.map(Value::from));
-            set("problem_id", p.problem_id.map(Value::from));
-            set("external_id", p.external_id.map(Value::from));
-            set("email_ccs", p.email_ccs.map(|v| json!(v)));
-            set("followers", p.followers.map(|v| json!(v)));
-            set("safe_update", p.safe_update.map(Value::from));
-            set("updated_stamp", p.updated_stamp.map(Value::from));
+            let fields = set_fields([
+                ("subject", json!(p.subject)),
+                ("status", json!(p.status.map(|v| v.as_str()))),
+                ("priority", json!(p.priority.map(|v| v.as_str()))),
+                ("type", json!(p.ticket_type.map(|v| v.as_str()))),
+                ("assignee_id", json!(p.assignee_id)),
+                ("requester_id", json!(p.requester_id)),
+                ("tags", json!(p.tags)),
+                ("custom_fields", json!(p.custom_fields)),
+                ("due_at", json!(p.due_at)),
+                ("group_id", json!(p.group_id)),
+                ("custom_status_id", json!(p.custom_status_id)),
+                ("problem_id", json!(p.problem_id)),
+                ("external_id", json!(p.external_id)),
+                ("email_ccs", json!(p.email_ccs)),
+                ("followers", json!(p.followers)),
+                ("safe_update", json!(p.safe_update)),
+                ("updated_stamp", json!(p.updated_stamp)),
+            ]);
             let updated = c.update_ticket(p.ticket_id, fields).await?;
-            Ok(wrapped("Ticket updated successfully", "ticket", updated))
+            Ok(wrapped("Ticket updated successfully", "ticket", &updated))
         })
         .await
     }
@@ -514,7 +508,7 @@ impl ZendeskServer {
                 )
                 .await?;
             let message = job_message(&result, "Merge", "Tickets merged successfully");
-            Ok(wrapped(&message, "result", result))
+            Ok(wrapped(&message, "result", &result))
         })
         .await
     }
@@ -653,5 +647,93 @@ impl ZendeskServer {
             .await
         })
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::tests::{args, assert_tool_ok, sent, server_on};
+    use super::*;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn update_ticket_sends_each_given_field() {
+        let mock = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/api/v2/tickets/5.json"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({ "ticket": { "id": 5 } })),
+            )
+            .mount(&mock)
+            .await;
+        let result = server_on(&mock)
+            .update_ticket(args(json!({
+                "ticket_id": 5,
+                "subject": "New subject",
+                "status": "solved",
+                "priority": "high",
+                "type": "incident",
+                "assignee_id": 11,
+                "requester_id": 12,
+                "tags": ["a", "b"],
+                "custom_fields": [{ "id": 1, "value": "x" }],
+                "due_at": "2026-02-03T04:05:06Z",
+                "group_id": 13,
+                "custom_status_id": 14,
+                "problem_id": 15,
+                "external_id": "ext-1",
+                "email_ccs": [{ "user_email": "cc@example.com", "action": "put" }],
+                "followers": [{ "user_id": 3, "action": "delete" }],
+                "safe_update": true,
+                "updated_stamp": "2026-01-02T03:04:05Z",
+            })))
+            .await;
+        assert_tool_ok(&result);
+        assert_eq!(
+            sent(&mock).await,
+            [(
+                "PUT".to_string(),
+                "/api/v2/tickets/5.json".to_string(),
+                json!({ "ticket": {
+                    "subject": "New subject",
+                    "status": "solved",
+                    "priority": "high",
+                    "type": "incident",
+                    "assignee_id": 11,
+                    "requester_id": 12,
+                    "tags": ["a", "b"],
+                    "custom_fields": [{ "id": 1, "value": "x" }],
+                    "due_at": "2026-02-03T04:05:06Z",
+                    "group_id": 13,
+                    "custom_status_id": 14,
+                    "problem_id": 15,
+                    "external_id": "ext-1",
+                    "email_ccs": [{ "user_email": "cc@example.com", "action": "put" }],
+                    "followers": [{ "user_id": 3, "action": "delete" }],
+                    "safe_update": true,
+                    "updated_stamp": "2026-01-02T03:04:05Z",
+                } })
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn update_ticket_omits_unset_fields() {
+        let mock = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({ "ticket": { "id": 5 } })),
+            )
+            .mount(&mock)
+            .await;
+        let result = server_on(&mock)
+            .update_ticket(args(json!({ "ticket_id": 5, "status": "open" })))
+            .await;
+        assert_tool_ok(&result);
+        assert_eq!(
+            sent(&mock).await[0].2,
+            json!({ "ticket": { "status": "open" } })
+        );
     }
 }

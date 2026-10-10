@@ -1,13 +1,13 @@
 //! Zendesk REST API client.
 //!
-//! Every method returns `serde_json::Value` shaped exactly like the Python server's
-//! output, so MCP clients see no difference after the rewrite.
+//! Every method returns `serde_json::Value` in a stable, trimmed shape that the MCP
+//! server and the CLI rely on and print as is.
 
 use std::collections::HashSet;
 use std::fmt::Display;
 use std::time::Duration;
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
 use pulldown_cmark::{Event, Options, Parser, html};
 use serde_json::{Map, Value, json};
@@ -32,6 +32,8 @@ const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 /// Redirects followed per request.
 const MAX_REDIRECTS: usize = 10;
+/// Zendesk's cap on the page size of a listing.
+const MAX_PAGE_SIZE: u64 = 100;
 /// Largest `days_back` accepted by `get_sla_breaches` (100 years).
 const MAX_DAYS_BACK: u64 = 36_500;
 
@@ -40,6 +42,12 @@ const MAX_DAYS_BACK: u64 = 36_500;
 /// CommonMark plus tables and strikethrough; a single newline becomes `<br>` so plain
 /// text keeps its line breaks; raw HTML in the input is passed through for Zendesk to
 /// sanitize server-side, and input that is entirely HTML is returned unchanged.
+///
+/// ```
+/// use zendesk::client::markdown_to_html;
+/// assert_eq!(markdown_to_html("a\nb"), "<p>a<br />\nb</p>\n");
+/// assert_eq!(markdown_to_html("<p>done</p>"), "<p>done</p>");
+/// ```
 pub fn markdown_to_html(text: &str) -> String {
     // ponytail: text that starts with a tag and ends with `>` is taken to be HTML already
     // (e.g. a `get_article` body written back); Markdown that happens to look like that is
@@ -131,6 +139,11 @@ pub(super) fn pick_all(data: &Value, key: &str, keys: &[&str], array_keys: &[&st
         .get(key)
         .and_then(Value::as_array)
         .map_or(&[][..], |a| a);
+    pick_each(items, keys, array_keys)
+}
+
+/// `pick` applied to every element of `items`.
+pub(super) fn pick_each(items: &[Value], keys: &[&str], array_keys: &[&str]) -> Value {
     Value::Array(items.iter().map(|i| pick(i, keys, array_keys)).collect())
 }
 
@@ -250,11 +263,6 @@ pub(super) fn job_summary(job: &Value) -> Value {
     out
 }
 
-/// Prefix an error the way the Python server worded it.
-pub(super) fn ctx(prefix: impl Display) -> impl FnOnce(anyhow::Error) -> anyhow::Error {
-    move |e| anyhow!("{prefix}: {e:#}")
-}
-
 /// Read a response body, failing once more than `max` bytes have arrived. The reqwest
 /// error is stripped of its URL, which carries search terms and cursors.
 async fn read_body(mut resp: reqwest::Response, max: usize) -> Result<Vec<u8>> {
@@ -325,9 +333,24 @@ pub fn redirect_policy() -> reqwest::redirect::Policy {
     })
 }
 
+/// A non-success HTTP status from Zendesk. Reach it with `err.downcast_ref::<ApiError>()`.
+#[derive(Debug, thiserror::Error)]
+#[error("Zendesk API error HTTP {status} for {label}: {body}")]
+pub struct ApiError {
+    /// The status Zendesk answered with.
+    pub status: reqwest::StatusCode,
+    /// The request, as `METHOD /path`.
+    pub label: String,
+    /// The first 500 characters of the response body.
+    pub body: String,
+}
+
 pub(super) fn status_error(status: reqwest::StatusCode, label: &str, body: &[u8]) -> anyhow::Error {
-    let text: String = String::from_utf8_lossy(body).chars().take(500).collect();
-    anyhow!("Zendesk API error HTTP {status} for {label}: {text}")
+    anyhow::Error::new(ApiError {
+        status,
+        label: label.to_owned(),
+        body: String::from_utf8_lossy(body).chars().take(500).collect(),
+    })
 }
 
 /// A path segment that came from the model or from Zendesk: percent-encode everything but
@@ -363,7 +386,7 @@ impl ZendeskClient {
     }
 
     pub fn new(subdomain: &str, auth: Auth, http: reqwest::Client) -> Self {
-        let base_url = format!("https://{subdomain}.zendesk.com/api/v2");
+        let base_url = format!("{}/api/v2", crate::config::origin(subdomain));
         Self::with_base_url(subdomain, auth, http, base_url)
     }
 
@@ -644,10 +667,12 @@ impl ZendeskClient {
     ) -> Result<Vec<Value>> {
         let pages = self.get_pages(path, params).await?;
         Ok(pages
-            .iter()
-            .filter_map(|data| data.get(key).and_then(Value::as_array))
+            .into_iter()
+            .filter_map(|mut data| match data.get_mut(key)?.take() {
+                Value::Array(items) => Some(items),
+                _ => None,
+            })
             .flatten()
-            .cloned()
             .collect())
     }
 
@@ -673,7 +698,7 @@ impl ZendeskClient {
         Ok(pages)
     }
 
-    /// One page of a cursor-paginated listing; `page_size` is capped at 100.
+    /// One page of a cursor-paginated listing; `page_size` is capped at Zendesk's page-size limit.
     pub(super) async fn get_cursor_page(
         &self,
         path: &str,
@@ -681,7 +706,7 @@ impl ZendeskClient {
         page_size: u64,
         after: Option<&str>,
     ) -> Result<Value> {
-        let size = page_size.min(100);
+        let size = page_size.min(MAX_PAGE_SIZE);
         let mut all = params.to_vec();
         all.push(("page[size]", &size));
         if let Some(after) = &after {
@@ -701,13 +726,13 @@ impl ZendeskClient {
     ) -> Result<Vec<Value>> {
         let mut items = Vec::new();
         let mut first_params = params.to_vec();
-        first_params.push(("page[size]", &100u64));
+        first_params.push(("page[size]", &MAX_PAGE_SIZE));
         let first = self.url(path, &first_params)?;
         let mut seen = HashSet::from([first.to_string()]);
         let mut data = self.get_url(first).await?;
         loop {
-            if let Some(page) = data.get(key).and_then(Value::as_array) {
-                items.extend(page.iter().cloned());
+            if let Some(page) = data.get_mut(key).and_then(Value::as_array_mut) {
+                items.append(page);
             }
             if items.len() >= max_items {
                 items.truncate(max_items);
@@ -729,10 +754,10 @@ impl ZendeskClient {
             let data = self
                 .api_get(&format!("job_statuses/{}.json", segment(job_id)?), &[])
                 .await?;
-            Ok(job_summary(object(&data, "job_status")?))
+            anyhow::Ok(job_summary(object(&data, "job_status")?))
         }
         .await
-        .map_err(ctx(format!("Failed to get job status {job_id}")))
+        .with_context(|| format!("Failed to get job status {job_id}"))
     }
 
     /// Poll the job in a Zendesk response (`{"job_status": {...}}`) every
@@ -805,7 +830,10 @@ pub(super) mod test_support {
     }
 
     pub fn json_page(items_key: &str, items: Value, next: Option<String>) -> ResponseTemplate {
-        ResponseTemplate::new(200).set_body_json(json!({ items_key: items, "next_page": next }))
+        let mut body = json!({});
+        body[items_key] = items;
+        body["next_page"] = next.into();
+        ResponseTemplate::new(200).set_body_json(body)
     }
 }
 
@@ -825,10 +853,71 @@ mod tests {
             )
             .mount(&server)
             .await;
-        let err = client(&server).get_ticket(1).await.unwrap_err().to_string();
+        let err = client(&server).get_ticket(1).await.unwrap_err();
+        let err = format!("{err:#}");
         assert!(err.contains("Failed to get ticket 1: "), "{err}");
         assert!(err.contains("HTTP 401"), "{err}");
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn client_errors_keep_the_api_error_type() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("missing"))
+            .mount(&server)
+            .await;
+        let err = client(&server).get_ticket(1).await.unwrap_err();
+        let api = err.downcast_ref::<ApiError>().expect("ApiError");
+        assert_eq!(api.status, reqwest::StatusCode::NOT_FOUND);
+        assert_eq!(api.body, "missing");
+    }
+
+    #[tokio::test]
+    async fn client_errors_keep_the_reauth_required_type() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let settings = crate::config::OAuthSettings {
+            subdomain: "acme".into(),
+            client_id: "cid".into(),
+            token_file: dir.path().join("tokens.json"),
+            scopes: "tickets:read".into(),
+            redirect_uri: "http://localhost:4567/callback".into(),
+        };
+        let store = crate::tokens::TokenStore::new(settings.token_file.clone());
+        store
+            .save(&crate::tokens::TokenSet {
+                access_token: "old".into(),
+                refresh_token: None,
+                expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+                refresh_token_expires_at: None,
+                subdomain: "acme".into(),
+                client_id: "cid".into(),
+                scope: None,
+            })
+            .unwrap();
+        let provider =
+            crate::oauth::OAuthProvider::with_store(settings, store, reqwest::Client::new());
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(401).set_body_json(json!({"error": "invalid_token"})),
+            )
+            .mount(&server)
+            .await;
+        let client = ZendeskClient::with_base_url(
+            "acme",
+            Auth::OAuth(std::sync::Arc::new(provider)),
+            reqwest::Client::new(),
+            format!("{}/api/v2", server.uri()),
+        );
+        let err = client.get_current_user().await.unwrap_err();
+        assert!(
+            matches!(
+                err.downcast_ref::<crate::oauth::ReauthRequired>(),
+                Some(crate::oauth::ReauthRequired::CannotRefresh { .. })
+            ),
+            "{err:#}"
+        );
     }
 
     #[tokio::test]
@@ -838,7 +927,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(403).set_body_string("nope scope"))
             .mount(&server)
             .await;
-        let err = client(&server).list_views().await.unwrap_err().to_string();
+        let err = format!("{:#}", client(&server).list_views().await.unwrap_err());
         assert!(
             err.contains("HTTP 403 Forbidden for GET /api/v2/views.json: nope scope"),
             "{err}"
@@ -1007,8 +1096,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            err.to_string()
-                .contains("next_page link on another host: evil.example"),
+            format!("{err:#}").contains("next_page link on another host: evil.example"),
             "{err}"
         );
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
@@ -1036,8 +1124,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            err.to_string()
-                .contains("Zendesk pagination returned a page it already returned"),
+            format!("{err:#}").contains("Zendesk pagination returned a page it already returned"),
             "{err}"
         );
     }
@@ -1115,11 +1202,10 @@ mod tests {
     }
 
     fn cursor_page(items: Value, next: Option<String>) -> ResponseTemplate {
-        ResponseTemplate::new(200).set_body_json(json!({
-            "things": items,
-            "meta": { "has_more": next.is_some() },
-            "links": { "next": next },
-        }))
+        let mut body = json!({ "meta": { "has_more": next.is_some() } });
+        body["things"] = items;
+        body["links"]["next"] = next.into();
+        ResponseTemplate::new(200).set_body_json(body)
     }
 
     #[tokio::test]

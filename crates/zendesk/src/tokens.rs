@@ -35,6 +35,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, NaiveDateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::oauth::ReauthRequired;
+
 /// Refresh slightly early so a request is never sent with a token that expires in
 /// flight, and to absorb modest clock drift against Zendesk.
 pub const DEFAULT_EXPIRY_SKEW: Duration = Duration::from_secs(60);
@@ -260,63 +262,74 @@ impl TokenStore {
         }
     }
 
-    /// Read and parse the token file. The error for a missing file tells the operator
-    /// to run `zendesk-mcp-server auth` (or `zendesk auth`).
+    /// Read and parse the token file. A missing or unparsable file is a
+    /// [`ReauthRequired`], whose message tells the operator to run
+    /// `zendesk-mcp-server auth` (or `zendesk auth`).
     pub fn load(&self) -> Result<TokenSet> {
-        let path = self.path.display();
-        #[cfg(unix)]
-        if let Ok(meta) = fs::metadata(&self.path) {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = meta.permissions().mode() & 0o777;
-            if mode & 0o077 != 0 {
-                tracing::warn!(
-                    "{path} has mode {mode:o}, so it is readable by other users; run chmod 600 on it."
-                );
-            }
-        }
-        let raw = fs::read_to_string(&self.path).map_err(|err| {
+        let raw = read_private(&self.path).map_err(|err| {
             if err.kind() == std::io::ErrorKind::NotFound {
-                anyhow!(
-                    "No Zendesk OAuth tokens found at {path}. Run zendesk-mcp-server auth (or zendesk auth) to \
-                     authorize this machine."
-                )
+                anyhow::Error::new(ReauthRequired::NoTokens {
+                    path: self.path.clone(),
+                })
             } else {
-                anyhow!("Could not read {path}: {err}")
+                anyhow!("Could not read {}: {err}", self.path.display())
             }
         })?;
         serde_json::from_str(&raw).map_err(|err| {
-            anyhow!(
-                "Token store at {path} is not valid JSON or is missing a field ({err}). \
-                 Re-run zendesk-mcp-server auth (or zendesk auth) to recreate it."
-            )
+            anyhow::Error::new(ReauthRequired::CorruptTokens {
+                path: self.path.clone(),
+                detail: err.to_string(),
+            })
         })
     }
 
-    /// Write tokens atomically, replacing any existing file: temp file in the same
-    /// directory with mode 0600, write, fsync, rename. Ensures the directory exists
-    /// with mode 0700 first.
+    /// Write tokens atomically, replacing any existing file: see [`save_guarded`].
     pub fn save(&self, tokens: &TokenSet) -> Result<()> {
-        ensure_directory(&self.path)?;
-        match fs::read(&self.path) {
-            Ok(existing) => {
-                let is_token_file = serde_json::from_slice::<serde_json::Value>(&existing)
-                    .is_ok_and(|v| v.get("access_token").is_some());
-                if !is_token_file {
-                    bail!(
-                        "refusing to overwrite {}: it is not a Zendesk token file",
-                        self.path.display()
-                    );
-                }
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => bail!("Could not read {}: {err}", self.path.display()),
-        }
         let mut payload = serde_json::to_string_pretty(&serde_json::to_value(tokens)?)?;
         payload.push('\n');
-        write_private(&self.path, payload.as_bytes())?;
+        save_guarded(&self.path, payload.as_bytes())?;
         tracing::debug!("Stored Zendesk OAuth tokens at {}", self.path.display());
         Ok(())
     }
+}
+
+/// Read a private file, warning when other users can read it (unix).
+pub fn read_private(path: &Path) -> std::io::Result<String> {
+    #[cfg(unix)]
+    if let Ok(meta) = fs::metadata(path) {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = meta.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            tracing::warn!(
+                "{} has mode {mode:o}, so it is readable by other users; run chmod 600 on it.",
+                path.display()
+            );
+        }
+    }
+    fs::read_to_string(path)
+}
+
+/// Write a token file atomically with mode 0600 ([`write_private`]), creating its
+/// directory with mode 0700 first. Refuses to replace an existing file that is not a
+/// JSON object with `access_token`, so a wrong `ZENDESK_TOKEN_FILE` cannot clobber
+/// another file; an existing file that cannot be read is an error.
+pub fn save_guarded(path: &Path, contents: &[u8]) -> Result<()> {
+    ensure_directory(path)?;
+    match fs::read(path) {
+        Ok(existing) => {
+            let is_token_file = serde_json::from_slice::<serde_json::Value>(&existing)
+                .is_ok_and(|v| v.get("access_token").is_some());
+            if !is_token_file {
+                bail!(
+                    "refusing to overwrite {}: it is not a Zendesk token file",
+                    path.display()
+                );
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => bail!("Could not read {}: {err}", path.display()),
+    }
+    write_private(path, contents)
 }
 
 /// Write `contents` to `path` atomically with mode 0600: a random-named temp file beside
@@ -384,6 +397,7 @@ fn ensure_directory(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::oauth::REAUTH_HINT;
     use chrono::TimeZone;
     use serde_json::json;
 
@@ -562,25 +576,23 @@ mod tests {
     fn load_errors_name_the_remedy() {
         let dir = tempfile::tempdir().unwrap();
         let store = TokenStore::new(dir.path().join("tokens.json"));
-        let missing = store.load().unwrap_err().to_string();
-        assert!(missing.contains("No Zendesk OAuth tokens found") && missing.contains("auth"));
+        let missing = store.load().unwrap_err();
+        assert!(matches!(
+            missing.downcast_ref::<ReauthRequired>(),
+            Some(ReauthRequired::NoTokens { .. })
+        ));
+        let missing = missing.to_string();
+        assert!(missing.contains("No Zendesk OAuth tokens found") && missing.contains(REAUTH_HINT));
 
-        fs::write(&store.path, "{not json").unwrap();
-        assert!(
-            store
-                .load()
-                .unwrap_err()
-                .to_string()
-                .contains("Re-run zendesk-mcp-server auth")
-        );
-        fs::write(&store.path, r#"{"access_token": "a"}"#).unwrap();
-        assert!(
-            store
-                .load()
-                .unwrap_err()
-                .to_string()
-                .contains("Re-run zendesk-mcp-server auth")
-        );
+        for contents in ["{not json", r#"{"access_token": "a"}"#] {
+            fs::write(&store.path, contents).unwrap();
+            let err = store.load().unwrap_err();
+            assert!(matches!(
+                err.downcast_ref::<ReauthRequired>(),
+                Some(ReauthRequired::CorruptTokens { .. })
+            ));
+            assert!(err.to_string().contains(REAUTH_HINT), "{err}");
+        }
     }
 
     #[test]

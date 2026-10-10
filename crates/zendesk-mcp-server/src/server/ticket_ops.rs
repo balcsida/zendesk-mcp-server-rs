@@ -1,3 +1,5 @@
+//! Ticket operations: bulk updates, merging, deletion, spam, redaction, audits, metrics and suspended tickets.
+
 use super::*;
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -135,7 +137,7 @@ impl ZendeskServer {
     ) -> CallToolResult {
         self.call_json(|c| async move {
             let ticket = c.recover_suspended_ticket(p.suspended_ticket_id).await?;
-            Ok(wrapped("Suspended ticket recovered", "ticket", ticket))
+            Ok(wrapped("Suspended ticket recovered", "ticket", &ticket))
         })
         .await
     }
@@ -164,7 +166,7 @@ impl ZendeskServer {
             let comment = c
                 .redact_comment_text(p.ticket_id, p.comment_id, &p.text)
                 .await?;
-            Ok(wrapped("Text redacted", "comment", comment))
+            Ok(wrapped("Text redacted", "comment", &comment))
         })
         .await
     }
@@ -190,30 +192,76 @@ impl ZendeskServer {
         Parameters(p): Parameters<UpdateTicketsBulkParams>,
     ) -> CallToolResult {
         self.call_json(|c| async move {
-            let mut fields = serde_json::Map::new();
-            let mut set = |key: &str, value: Option<Value>| {
-                if let Some(v) = value {
-                    fields.insert(key.to_string(), v);
-                }
-            };
-            set("status", p.status.map(|v| v.as_str().into()));
-            set("priority", p.priority.map(|v| v.as_str().into()));
-            set("type", p.ticket_type.map(|v| v.as_str().into()));
-            set("assignee_id", p.assignee_id.map(Value::from));
-            set("group_id", p.group_id.map(Value::from));
-            set("custom_status_id", p.custom_status_id.map(Value::from));
-            set("tags", p.tags.map(Value::from));
-            set("additional_tags", p.additional_tags.map(Value::from));
-            set("remove_tags", p.remove_tags.map(Value::from));
-            set(
-                "custom_fields",
-                p.custom_fields
-                    .map(|f| Value::Array(f.into_iter().map(Value::Object).collect())),
-            );
+            let fields = set_fields([
+                ("status", json!(p.status.map(|v| v.as_str()))),
+                ("priority", json!(p.priority.map(|v| v.as_str()))),
+                ("type", json!(p.ticket_type.map(|v| v.as_str()))),
+                ("assignee_id", json!(p.assignee_id)),
+                ("group_id", json!(p.group_id)),
+                ("custom_status_id", json!(p.custom_status_id)),
+                ("tags", json!(p.tags)),
+                ("additional_tags", json!(p.additional_tags)),
+                ("remove_tags", json!(p.remove_tags)),
+                ("custom_fields", json!(p.custom_fields)),
+            ]);
             let job = c.update_tickets_bulk(&p.ticket_ids, fields).await?;
             let message = job_message(&job, "Bulk update", "Tickets updated");
-            Ok(wrapped(&message, "job", job))
+            Ok(wrapped(&message, "job", &job))
         })
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::tests::{args, assert_tool_ok, sent, server_on};
+    use super::*;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn update_tickets_bulk_sends_ids_in_the_query_and_fields_in_the_body() {
+        let mock = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/api/v2/tickets/update_many.json"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "job_status": { "id": "j1", "status": "completed" } })),
+            )
+            .mount(&mock)
+            .await;
+        let result = server_on(&mock)
+            .update_tickets_bulk(args(json!({
+                "ticket_ids": [1, 2, 3],
+                "status": "pending",
+                "priority": "low",
+                "type": "task",
+                "assignee_id": 11,
+                "group_id": 12,
+                "custom_status_id": 13,
+                "additional_tags": ["x"],
+                "remove_tags": ["y"],
+                "custom_fields": [{ "id": 1, "value": "v" }],
+            })))
+            .await;
+        assert_tool_ok(&result);
+        assert_eq!(
+            sent(&mock).await,
+            [(
+                "PUT".to_string(),
+                "/api/v2/tickets/update_many.json?ids=1,2,3".to_string(),
+                json!({ "ticket": {
+                    "status": "pending",
+                    "priority": "low",
+                    "type": "task",
+                    "assignee_id": 11,
+                    "group_id": 12,
+                    "custom_status_id": 13,
+                    "additional_tags": ["x"],
+                    "remove_tags": ["y"],
+                    "custom_fields": [{ "id": 1, "value": "v" }],
+                } })
+            )]
+        );
     }
 }

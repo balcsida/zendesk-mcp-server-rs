@@ -67,16 +67,22 @@ pub struct OAuthSettings {
     pub redirect_uri: String,
 }
 
+/// `https://{subdomain}.zendesk.com`, the account's web origin.
+///
+/// ```
+/// assert_eq!(zendesk::config::origin("acme"), "https://acme.zendesk.com");
+/// ```
+pub fn origin(subdomain: &str) -> String {
+    format!("https://{subdomain}.zendesk.com")
+}
+
 impl OAuthSettings {
     pub fn token_endpoint(&self) -> String {
-        format!("https://{}.zendesk.com/oauth/tokens", self.subdomain)
+        format!("{}/oauth/tokens", origin(&self.subdomain))
     }
 
     pub fn authorize_endpoint(&self) -> String {
-        format!(
-            "https://{}.zendesk.com/oauth/authorizations/new",
-            self.subdomain
-        )
+        format!("{}/oauth/authorizations/new", origin(&self.subdomain))
     }
 }
 
@@ -154,15 +160,17 @@ pub fn default_token_file() -> PathBuf {
 /// Expand a leading `~/` so operators can write `ZENDESK_TOKEN_FILE=~/x/tokens.json`.
 pub fn expand_home(path: &str) -> PathBuf {
     match path.strip_prefix("~/") {
-        Some(rest) => std::env::home_dir()
-            .map(|h| h.join(rest))
-            .unwrap_or_else(|| PathBuf::from(path)),
+        Some(rest) => std::env::home_dir().map_or_else(|| PathBuf::from(path), |h| h.join(rest)),
         None => PathBuf::from(path),
     }
 }
 
 /// Trim `raw` and check that it is one DNS label, so it cannot redirect the URLs built
 /// from it (`acme/x#`, `evil.example/#`) to another host.
+///
+/// # Errors
+///
+/// Fails unless the trimmed value is 1 to 63 letters, digits and inner hyphens.
 pub fn validate_subdomain(raw: &str) -> Result<String> {
     let value = raw.trim();
     let alnum = |c: char| c.is_ascii_alphanumeric();
@@ -224,8 +232,7 @@ pub fn load_credentials_from(get: impl Fn(&str) -> Option<String>) -> Result<Opt
             subdomain: require_subdomain()?,
             client_id,
             token_file: clean("ZENDESK_TOKEN_FILE")
-                .map(|p| expand_home(&p))
-                .unwrap_or_else(default_token_file),
+                .map_or_else(default_token_file, |p| expand_home(&p)),
             scopes: clean("ZENDESK_OAUTH_SCOPES").unwrap_or_else(|| scopes.to_string()),
             redirect_uri: clean("ZENDESK_OAUTH_REDIRECT_URI")
                 .unwrap_or_else(|| redirect_uri.to_string()),
@@ -341,25 +348,33 @@ mod tests {
         assert_eq!(load_credentials_from(env(&[])).unwrap(), None);
     }
 
-    #[test]
-    fn subdomain_alone_signs_in_with_zcli_client() {
-        let settings_for = |pairs: &[(&str, &str)]| match load_credentials_from(env(pairs)).unwrap()
-        {
+    fn zcli_settings(pairs: &[(&str, &str)]) -> OAuthSettings {
+        match load_credentials_from(env(pairs)).unwrap() {
             Some(Credentials::OAuth { settings }) => settings,
             other => panic!("expected OAuth, got {other:?}"),
-        };
-        let zcli = settings_for(&[("ZENDESK_SUBDOMAIN", " acme ")]);
+        }
+    }
+
+    #[test]
+    fn subdomain_alone_signs_in_with_zcli_client() {
+        let zcli = zcli_settings(&[("ZENDESK_SUBDOMAIN", " acme ")]);
         assert_eq!(zcli.subdomain, "acme");
         assert_eq!(zcli.client_id, "zdg-zcli-oauth");
         assert_eq!(zcli.redirect_uri, "http://localhost:19186/");
         assert_eq!(zcli.scopes, "read write");
-        // Naming zcli's client explicitly gets its defaults too.
-        let named = settings_for(&[
+    }
+
+    #[test]
+    fn naming_the_zcli_client_explicitly_gets_its_defaults() {
+        let named = zcli_settings(&[
             ("ZENDESK_SUBDOMAIN", "acme"),
             ("ZENDESK_CLIENT_ID", "zdg-zcli-oauth"),
         ]);
-        assert_eq!(named, zcli);
-        // An explicit credential wins over the fallback.
+        assert_eq!(named, zcli_settings(&[("ZENDESK_SUBDOMAIN", "acme")]));
+    }
+
+    #[test]
+    fn an_explicit_credential_wins_over_the_zcli_fallback() {
         let bearer = load_credentials_from(env(&[
             ("ZENDESK_SUBDOMAIN", "acme"),
             ("ZENDESK_OAUTH_TOKEN", "t"),

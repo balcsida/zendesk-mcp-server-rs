@@ -221,15 +221,34 @@ fn token_path_from(get: impl Fn(&str) -> Option<String>) -> PathBuf {
     }
 }
 
-/// Saved token, if the file exists, parses, and has a subdomain and access token.
-pub fn load_token() -> Option<MobileToken> {
+/// Saved token: `None` if there is no file, an error if it cannot be read, is incomplete or
+/// names something other than a Zendesk subdomain.
+pub fn load_token() -> Result<Option<MobileToken>> {
     load_token_from(&token_path())
 }
 
-fn load_token_from(path: &Path) -> Option<MobileToken> {
-    let text = std::fs::read_to_string(path).ok()?;
-    let token: MobileToken = serde_json::from_str(&text).ok()?;
-    (!token.subdomain.is_empty() && !token.access_token.is_empty()).then_some(token)
+fn load_token_from(path: &Path) -> Result<Option<MobileToken>> {
+    let text = match zendesk::tokens::read_private(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(unusable_token_file(path, &e)),
+    };
+    let mut token: MobileToken =
+        serde_json::from_str(&text).map_err(|e| unusable_token_file(path, &e))?;
+    // A file naming a host instead of a subdomain must not send the token there.
+    token.subdomain = zendesk::config::validate_subdomain(&token.subdomain)
+        .map_err(|_| unusable_token_file(path, &"its subdomain is not a Zendesk subdomain"))?;
+    if token.access_token.is_empty() {
+        return Err(unusable_token_file(path, &"access_token is empty"));
+    }
+    Ok(Some(token))
+}
+
+fn unusable_token_file(path: &Path, cause: &dyn std::fmt::Display) -> anyhow::Error {
+    anyhow!(
+        "Could not use the saved token in {}: {cause}. Delete the file and sign in again.",
+        path.display()
+    )
 }
 
 /// Write the token (mode 0600, directory 0700). Returns the path written.
@@ -241,54 +260,45 @@ pub fn save_token(token: &MobileToken) -> Result<PathBuf> {
 
 fn save_token_to(token: &MobileToken, path: &Path) -> Result<()> {
     let payload = serde_json::to_string_pretty(token)?;
-    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
-        let mut builder = std::fs::DirBuilder::new();
-        builder.recursive(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            builder.mode(0o700);
-        }
-        builder
-            .create(dir)
-            .with_context(|| format!("Could not create {}", dir.display()))?;
-    }
-
-    if let Ok(existing) = std::fs::read_to_string(path)
-        && !serde_json::from_str::<Value>(&existing).is_ok_and(|v| v.get("access_token").is_some())
-    {
-        bail!(
-            "refusing to overwrite {}: it is not a Zendesk token file",
-            path.display()
-        );
-    }
-    zendesk::tokens::write_private(path, payload.as_bytes())
+    zendesk::tokens::save_guarded(path, payload.as_bytes())
 }
 
-fn zendesk_base(subdomain: &str) -> String {
-    format!("https://{subdomain}.zendesk.com")
-}
-
-/// GET `/api/v2/users/me.json` with the token: the `user` object on 200, else `None`.
+/// GET `/api/v2/users/me.json` with the token: the `user` object on 200, `None` on 401
+/// (token rejected), an error for anything else so an outage is not taken for a bad token.
 pub async fn verify_token(
     http: &reqwest::Client,
     subdomain: &str,
     access_token: &str,
-) -> Option<Value> {
-    verify_token_at(http, &zendesk_base(subdomain), access_token).await
+) -> Result<Option<Value>> {
+    verify_token_at(http, &zendesk::config::origin(subdomain), access_token).await
 }
 
-async fn verify_token_at(http: &reqwest::Client, base: &str, access_token: &str) -> Option<Value> {
+async fn verify_token_at(
+    http: &reqwest::Client,
+    base: &str,
+    access_token: &str,
+) -> Result<Option<Value>> {
     let resp = http
         .get(format!("{base}/api/v2/users/me.json"))
         .bearer_auth(access_token)
         .timeout(Duration::from_secs(10))
         .send()
         .await
-        .ok()
-        .filter(|resp| resp.status() == reqwest::StatusCode::OK)?;
-    let mut body: Value = resp.json().await.ok()?;
-    Some(body.get_mut("user")?.take())
+        .context("Could not verify the token")?;
+    match resp.status() {
+        reqwest::StatusCode::OK => {
+            let mut body: Value = resp
+                .json()
+                .await
+                .context("Could not verify the token: unexpected answer")?;
+            let user = body
+                .get_mut("user")
+                .ok_or_else(|| anyhow!("Could not verify the token: no 'user' object"))?;
+            Ok(Some(user.take()))
+        }
+        reqwest::StatusCode::UNAUTHORIZED => Ok(None),
+        status => bail!("Could not verify the token: HTTP {status}"),
+    }
 }
 
 /// Tell the user whose token is about to be used; the token is only checked for a 200.
@@ -303,7 +313,7 @@ fn announce_signed_in(subdomain: &str, user: &Value) {
 
 /// The `lookup` object from `/api/mobile/account/lookup.json` (sent with `USER_AGENT`).
 pub async fn lookup_subdomain(http: &reqwest::Client, subdomain: &str) -> Result<Value> {
-    lookup_at(http, &zendesk_base(subdomain), subdomain).await
+    lookup_at(http, &zendesk::config::origin(subdomain), subdomain).await
 }
 
 /// `subdomain` only words the error messages.
@@ -335,14 +345,18 @@ async fn lookup_at(http: &reqwest::Client, base: &str, subdomain: &str) -> Resul
 
 /// Machine name sent to Zendesk as the device name.
 fn device_name() -> String {
-    let from_file = std::fs::read_to_string("/etc/hostname").ok();
-    let from_command = || {
-        let out = Command::new("/bin/hostname").output().ok()?;
-        String::from_utf8(out.stdout).ok()
-    };
-    [from_file, std::env::var("HOSTNAME").ok(), from_command()]
+    let sources: [&dyn Fn() -> Option<String>; 4] = [
+        &|| std::fs::read_to_string("/etc/hostname").ok(),
+        &|| std::env::var("HOSTNAME").ok(),
+        &|| std::env::var("COMPUTERNAME").ok(),
+        &|| {
+            let out = Command::new("/bin/hostname").output().ok()?;
+            String::from_utf8(out.stdout).ok()
+        },
+    ];
+    sources
         .into_iter()
-        .flatten()
+        .filter_map(|source| source())
         .map(|name| name.trim().to_string())
         .find(|name| !name.is_empty())
         .unwrap_or_else(|| "zendesk-cli".to_string())
@@ -355,7 +369,14 @@ pub async fn auth_email_password(
     email: &str,
     password: &str,
 ) -> Result<MobileToken> {
-    auth_email_password_at(http, &zendesk_base(subdomain), subdomain, email, password).await
+    auth_email_password_at(
+        http,
+        &zendesk::config::origin(subdomain),
+        subdomain,
+        email,
+        password,
+    )
+    .await
 }
 
 async fn auth_email_password_at(
@@ -412,12 +433,9 @@ async fn auth_email_password_at(
 /// Parameters may be in the query or, failing that, the fragment.
 pub fn parse_oauth_callback(url: &str, subdomain: &str) -> Option<MobileToken> {
     tracing::info!("Parsing OAuth callback URL...");
-    let parsed = match url::Url::parse(url) {
-        Ok(parsed) => parsed,
-        Err(_) => {
-            tracing::error!("Callback URL is empty or not a valid URL");
-            return None;
-        }
+    let Ok(parsed) = url::Url::parse(url) else {
+        tracing::error!("Callback URL is empty or not a valid URL");
+        return None;
     };
     tracing::info!(scheme = parsed.scheme(), length = url.len(), "Callback URL");
 
@@ -676,8 +694,8 @@ fn run(command: &mut Command) -> Result<()> {
     Ok(())
 }
 
-/// Write a fresh file that only the current user can read and run.
-fn write_private(path: &Path, contents: &str) -> Result<()> {
+/// Write a fresh handler script that only the current user can read and run.
+fn write_private_script(path: &Path, contents: &str) -> Result<()> {
     let _ = std::fs::remove_file(path);
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -745,7 +763,7 @@ impl UrlSchemeHandler {
         // goes in a file to avoid shell-escaping trouble with `osacompile -e`.
         let script_file =
             std::env::temp_dir().join(format!("zendesk_auth_{}.applescript", std::process::id()));
-        write_private(
+        write_private_script(
             &script_file,
             &format!(
                 r#"on open location theURL
@@ -816,7 +834,7 @@ end open location
             "zendesk-cli-auth-handler-{}.sh",
             std::process::id()
         ));
-        write_private(
+        write_private_script(
             &script_path,
             &format!(
                 "#!/bin/sh\n\
@@ -875,9 +893,9 @@ end open location
         let script_path =
             std::env::temp_dir().join(format!("zendesk-cli-auth-{}.ps1", std::process::id()));
         let (script, command) = windows_handler(&script_path, &self.callback_url);
-        write_private(&script_path, &script)?;
+        write_private_script(&script_path, &script)?;
         let key = format!("HKCU\\Software\\Classes\\{URL_SCHEME}");
-        let cleanup_script = script_path.clone();
+        let cleanup_script = script_path;
         let cleanup_key = key.clone();
         self.cleanup.push(Box::new(move || {
             let _ = Command::new("reg")
@@ -997,7 +1015,7 @@ pub async fn auth_via_browser(
     let auth_url = if service == Some("zendesk") {
         Some(match login.get("url").and_then(Value::as_str) {
             Some(url) => url.to_string(),
-            None => format!("https://{subdomain}.zendesk.com/access/oauth_mobile"),
+            None => format!("{}/access/oauth_mobile", zendesk::config::origin(subdomain)),
         })
     } else {
         text("zendesk_url")
@@ -1055,16 +1073,24 @@ pub async fn auth_via_browser(
 /// verifies, else a fresh browser sign-in (saved before returning). `subdomain` may be
 /// `None` only when the saved token supplies it.
 pub async fn ensure_auth(http: &reqwest::Client, subdomain: Option<&str>) -> Result<MobileToken> {
+    ensure_auth_from(http, subdomain, &token_path()).await
+}
+
+/// [`ensure_auth`] with the saved token read from `path`.
+async fn ensure_auth_from(
+    http: &reqwest::Client,
+    subdomain: Option<&str>,
+    path: &Path,
+) -> Result<MobileToken> {
     let subdomain = subdomain
         .map(zendesk::config::validate_subdomain)
         .transpose()?;
     let subdomain = subdomain.as_deref();
-    // A token file naming a host rather than a subdomain is not sent anywhere.
-    let saved = load_token().filter(|t| zendesk::config::validate_subdomain(&t.subdomain).is_ok());
+    let saved = load_token_from(path)?;
     if let Some(token) = &saved {
         if subdomain.is_none_or(|s| s == token.subdomain) {
             if verify_token(http, &token.subdomain, &token.access_token)
-                .await
+                .await?
                 .is_some()
             {
                 tracing::info!("Existing OAuth token is valid");
@@ -1086,7 +1112,7 @@ pub async fn ensure_auth(http: &reqwest::Client, subdomain: Option<&str>) -> Res
         "No usable saved token. Signing in to {subdomain}.zendesk.com in your browser (waits up to 5 minutes). For the interactive flow run `zendesk mobile-auth`."
     );
     let token = auth_via_browser(http, &subdomain, BROWSER_TIMEOUT).await?;
-    let Some(user) = verify_token(http, &token.subdomain, &token.access_token).await else {
+    let Some(user) = verify_token(http, &token.subdomain, &token.access_token).await? else {
         bail!(REJECTED_TOKEN);
     };
     announce_signed_in(&subdomain, &user);
@@ -1193,9 +1219,9 @@ async fn auth_sso_browser_interactive(subdomain: &str, auth_url: &str) -> Result
 pub async fn run_auth_cli(http: reqwest::Client) -> Result<()> {
     println!("=== Zendesk mobile sign-in ===\n");
 
-    if let Some(existing) = load_token()
+    if let Some(existing) = load_token()?
         && verify_token(&http, &existing.subdomain, &existing.access_token)
-            .await
+            .await?
             .is_some()
     {
         println!("✓ Valid authentication already exists!");
@@ -1270,7 +1296,7 @@ pub async fn run_auth_cli(http: reqwest::Client) -> Result<()> {
             .ok_or_else(|| anyhow!("no authentication URL found."))?;
         auth_sso_browser_interactive(&subdomain, auth_url).await?
     };
-    let Some(user) = verify_token(&http, &token.subdomain, &token.access_token).await else {
+    let Some(user) = verify_token(&http, &token.subdomain, &token.access_token).await? else {
         bail!(REJECTED_TOKEN);
     };
     announce_signed_in(&subdomain, &user);
@@ -1459,7 +1485,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("nested").join("token.json");
         save_token_to(&token("abc"), &file).unwrap();
-        assert_eq!(load_token_from(&file), Some(token("abc")));
+        assert_eq!(load_token_from(&file).unwrap(), Some(token("abc")));
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -1470,23 +1496,40 @@ mod tests {
     }
 
     #[test]
+    fn load_token_rejects_a_host_as_subdomain() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("token.json");
+        std::fs::write(
+            &file,
+            r#"{"subdomain": "evil.example/#", "access_token": "t"}"#,
+        )
+        .unwrap();
+        let err = format!("{:#}", load_token_from(&file).unwrap_err());
+        assert!(err.contains("not a Zendesk subdomain"), "{err}");
+    }
+
+    #[test]
     fn load_token_rejects_incomplete_files() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("token.json");
-        assert_eq!(load_token_from(&file), None);
-        std::fs::write(&file, r#"{"subdomain": "acme"}"#).unwrap();
-        assert_eq!(load_token_from(&file), None);
-        std::fs::write(&file, r#"{"subdomain": "acme", "access_token": ""}"#).unwrap();
-        assert_eq!(load_token_from(&file), None);
-        std::fs::write(&file, "not json").unwrap();
-        assert_eq!(load_token_from(&file), None);
+        assert_eq!(load_token_from(&file).unwrap(), None);
+        for bad in [
+            r#"{"subdomain": "acme"}"#,
+            r#"{"subdomain": "acme", "access_token": ""}"#,
+            "not json",
+        ] {
+            std::fs::write(&file, bad).unwrap();
+            let err = format!("{:#}", load_token_from(&file).unwrap_err());
+            assert!(err.contains(&file.display().to_string()), "{err}");
+            assert!(err.contains("Delete the file"), "{err}");
+        }
         // The Python version's file format loads as-is.
         std::fs::write(
             &file,
             r#"{"subdomain": "acme", "access_token": "t", "username": "Ada"}"#,
         )
         .unwrap();
-        assert_eq!(load_token_from(&file).unwrap().access_token, "t");
+        assert_eq!(load_token_from(&file).unwrap().unwrap().access_token, "t");
     }
 
     #[tokio::test]
@@ -1507,8 +1550,37 @@ mod tests {
             .await;
         let http = reqwest::Client::new();
         let user = verify_token_at(&http, &server.uri(), "good").await;
-        assert_eq!(user, Some(json!({"name": "Ada"})));
-        assert_eq!(verify_token_at(&http, &server.uri(), "bad").await, None);
+        assert_eq!(user.unwrap(), Some(json!({"name": "Ada"})));
+        assert_eq!(
+            verify_token_at(&http, &server.uri(), "bad").await.unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_token_errors_on_other_statuses() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/users/me.json"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let err = verify_token_at(&reqwest::Client::new(), &server.uri(), "t")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("500"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn corrupt_token_file_stops_sign_in_before_it_starts() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("token.json");
+        std::fs::write(&file, "not json").unwrap();
+        let err = ensure_auth_from(&reqwest::Client::new(), Some("acme"), &file)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Delete the file"), "{err}");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "not json");
     }
 
     #[tokio::test]
@@ -1785,7 +1857,7 @@ mod tests {
         std::fs::write(&file, r#"{"access_token":"old"}"#).unwrap();
         save_token_to(&token("abc"), &file).unwrap();
         save_token_to(&token("def"), &file).unwrap();
-        assert_eq!(load_token_from(&file), Some(token("def")));
+        assert_eq!(load_token_from(&file).unwrap(), Some(token("def")));
         let names: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
             .map(|e| e.unwrap().file_name())

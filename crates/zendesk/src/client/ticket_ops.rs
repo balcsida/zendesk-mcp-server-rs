@@ -1,4 +1,6 @@
-use anyhow::{Result, bail};
+//! Deleted and suspended tickets, comment privacy and redaction, spam and bulk updates.
+
+use anyhow::{Context, Result, bail};
 use serde_json::{Map, Value, json};
 
 use super::*;
@@ -6,7 +8,7 @@ use super::*;
 impl ZendeskClient {
     pub async fn list_deleted_tickets(&self, page: u64, per_page: u64) -> Result<Value> {
         async {
-            let per_page = per_page.min(100);
+            let per_page = per_page.min(MAX_PAGE_SIZE);
             let data = self
                 .api_get(
                     "deleted_tickets.json",
@@ -19,14 +21,14 @@ impl ZendeskClient {
                 &["id", "subject", "deleted_at", "actor", "previous_state"],
                 &[],
             );
-            Ok(json!({
+            anyhow::Ok(json!({
                 "count": deleted.as_array().map_or(0, Vec::len),
                 "deleted_tickets": deleted,
                 "has_more": !data["next_page"].is_null(),
             }))
         }
         .await
-        .map_err(ctx("Failed to list deleted tickets"))
+        .context("Failed to list deleted tickets")
     }
 
     pub async fn restore_deleted_ticket(&self, ticket_id: u64) -> Result<()> {
@@ -36,7 +38,7 @@ impl ZendeskClient {
         )
         .await
         .map(drop)
-        .map_err(ctx(format!("Failed to restore ticket {ticket_id}")))
+        .with_context(|| format!("Failed to restore ticket {ticket_id}"))
     }
 
     /// One page of suspended tickets (cursor pagination only). `content` is untrusted
@@ -77,14 +79,14 @@ impl ZendeskClient {
                     out
                 })
                 .collect();
-            Ok(json!({
+            anyhow::Ok(json!({
                 "suspended_tickets": suspended,
                 "has_more": data["meta"]["has_more"].as_bool().unwrap_or(false),
                 "after_cursor": data["meta"]["after_cursor"],
             }))
         }
         .await
-        .map_err(ctx("Failed to list suspended tickets"))
+        .context("Failed to list suspended tickets")
     }
 
     /// Recovers one suspended ticket; a 422 (why it could not be recovered) is an error.
@@ -109,12 +111,10 @@ impl ZendeskClient {
                 .ok_or_else(|| anyhow!("Zendesk response has no recovered ticket"))?;
             let mut keys = TICKET_SUMMARY_KEYS.to_vec();
             keys.push("description");
-            Ok(pick(ticket, &keys, &[]))
+            anyhow::Ok(pick(ticket, &keys, &[]))
         }
         .await
-        .map_err(ctx(format!(
-            "Failed to recover suspended ticket {suspended_ticket_id}"
-        )))
+        .with_context(|| format!("Failed to recover suspended ticket {suspended_ticket_id}"))
     }
 
     pub async fn make_comment_private(&self, ticket_id: u64, comment_id: u64) -> Result<()> {
@@ -124,12 +124,16 @@ impl ZendeskClient {
         )
         .await
         .map(drop)
-        .map_err(ctx(format!(
-            "Failed to make comment {comment_id} on ticket {ticket_id} private"
-        )))
+        .with_context(|| {
+            format!("Failed to make comment {comment_id} on ticket {ticket_id} private")
+        })
     }
 
     /// Permanently replaces every occurrence of `text` in the comment with block characters.
+    ///
+    /// # Errors
+    ///
+    /// Fails without a request when `text` is blank.
     pub async fn redact_comment_text(
         &self,
         ticket_id: u64,
@@ -146,7 +150,7 @@ impl ZendeskClient {
                     &json!({ "text": text }),
                 )
                 .await?;
-            Ok(pick(
+            anyhow::Ok(pick(
                 object(&data, "comment")?,
                 &[
                     "id",
@@ -160,9 +164,7 @@ impl ZendeskClient {
             ))
         }
         .await
-        .map_err(ctx(format!(
-            "Failed to redact comment {comment_id} on ticket {ticket_id}"
-        )))
+        .with_context(|| format!("Failed to redact comment {comment_id} on ticket {ticket_id}"))
     }
 
     pub async fn mark_ticket_as_spam(&self, ticket_id: u64) -> Result<()> {
@@ -172,12 +174,17 @@ impl ZendeskClient {
         )
         .await
         .map(drop)
-        .map_err(ctx(format!("Failed to mark ticket {ticket_id} as spam")))
+        .with_context(|| format!("Failed to mark ticket {ticket_id} as spam"))
     }
 
     /// Applies `fields` (the ticket attributes to set) to 1 to 100 tickets and waits up to
     /// 30 seconds for Zendesk's background job; returns its trimmed status (`pending` is
     /// true if it is still running).
+    ///
+    /// # Errors
+    ///
+    /// Fails without a request when `ticket_ids` is empty or has more than 100 entries, or
+    /// `fields` is empty.
     pub async fn update_tickets_bulk(
         &self,
         ticket_ids: &[u64],
@@ -207,7 +214,7 @@ impl ZendeskClient {
             self.wait_for_job(&job, Duration::from_secs(30)).await
         }
         .await
-        .map_err(ctx("Failed to update tickets in bulk"))
+        .context("Failed to update tickets in bulk")
     }
 }
 
@@ -344,7 +351,7 @@ mod tests {
         assert_eq!(one["description"], "d");
         assert!(one.get("extra").is_none());
         assert_eq!(c.recover_suspended_ticket(2).await.unwrap()["id"], 10);
-        let err = c.recover_suspended_ticket(3).await.unwrap_err().to_string();
+        let err = format!("{:#}", c.recover_suspended_ticket(3).await.unwrap_err());
         assert!(
             err.contains("HTTP 422") && err.contains("Author is suspended"),
             "{err}"
